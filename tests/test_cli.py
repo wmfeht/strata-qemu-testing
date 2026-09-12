@@ -127,14 +127,28 @@ class CliHelpTests(unittest.TestCase):
                 args = parser.parse_args([name])
                 self.assertEqual(args.command, name)
 
-    def test_stub_subcommands_fail_closed(self) -> None:
-        for name in ("run-test", "vm-run"):
+    def test_run_test_and_vm_run_help_are_not_stubs(self) -> None:
+        for name, flag in (("run-test", "--session-only"), ("vm-run", "--graphical")):
+            buf = io.StringIO()
             err = io.StringIO()
-            with self.subTest(name=name), redirect_stderr(err):
-                code = main([name])
-            self.assertEqual(code, 2)
-            self.assertIn(name, err.getvalue())
-            self.assertIn("not implemented", err.getvalue())
+            with self.subTest(name=name), redirect_stdout(buf), redirect_stderr(err):
+                code = main([name, "--help"])
+            self.assertEqual(code, 0)
+            text = buf.getvalue() + err.getvalue()
+            self.assertIn(name, text)
+            self.assertIn(flag, text)
+            self.assertNotIn("not implemented", text)
+            self.assertNotIn("SystemExit", text)
+
+    def test_run_test_without_guest_is_not_stub(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            code = main(["run-test", "--session-only"])
+        self.assertEqual(code, 2)
+        text = buf.getvalue() + err.getvalue()
+        self.assertNotIn("not implemented", text)
+        self.assertIn("guest", text.lower())
 
     def test_image_build_help_is_not_exit2_stub(self) -> None:
         buf = io.StringIO()

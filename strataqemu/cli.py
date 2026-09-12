@@ -1,4 +1,4 @@
-"""Argparse CLI: check-host, image-build, image-prune, spike-wayland-ubuntu, later-PR stubs."""
+"""Argparse CLI: check-host, image-build, run-test, vm-run, image-prune, spike."""
 
 from __future__ import annotations
 
@@ -37,8 +37,6 @@ DEFAULT_FIRMWARE_SHARE_ROOTS: tuple[Path, ...] = (Path("/usr/share"),)
 
 # Generic floor when no guest is selected: 8 GiB guest + 1 GiB host slack.
 GENERIC_MEM_FLOOR_MIB = 9 * 1024
-
-STUB_COMMANDS = ("run-test", "vm-run")
 
 # Named when qemu-system-x86_64 is missing. Not a generic "install qemu".
 QEMU_BOOTSTRAP_HINT = """\
@@ -291,13 +289,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_test = sub.add_parser(
         "run-test",
-        help="Boot overlay and run smokes (later PR)",
+        help="Boot a throwaway overlay and run smokes. Fails if no golden.",
     )
     run_test.add_argument("guest", nargs="?", help="Guest id")
     run_test.add_argument(
         "--session-only",
         action="store_true",
-        help="Session/window smoke without install.sh",
+        help="Session and compositor smoke without installer or app launch",
     )
     run_test.add_argument(
         "--install-from",
@@ -312,7 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     vm_run = sub.add_parser(
         "vm-run",
-        help="Interactive throwaway overlay (later PR)",
+        help="Interactive throwaway overlay of an existing golden (no --maintain)",
     )
     vm_run.add_argument("guest", nargs="?", help="Guest id")
     vm_run.add_argument(
@@ -374,10 +372,16 @@ def _run_check_host() -> int:
     return 0
 
 
+def normalize_cli_argv(argv: Sequence[str]) -> list[str]:
+    """Drop lone ``--`` so ``run-test -- ubuntu-2404 --session-only`` works."""
+    return [a for a in argv if a != "--"]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+    raw = sys.argv[1:] if argv is None else argv
     try:
-        args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+        args = parser.parse_args(normalize_cli_argv(raw))
     except SystemExit as exc:
         code = exc.code
         if code is None:
@@ -407,12 +411,24 @@ def main(argv: list[str] | None = None) -> int:
 
         return run_image_build(args.guest, force=args.force)
 
-    if args.command in STUB_COMMANDS:
-        print(
-            f"{args.command}: not implemented yet (fail closed). See docs/design.md.",
-            file=sys.stderr,
+    if args.command == "run-test":
+        from strataqemu.run_test import run_run_test
+
+        return run_run_test(
+            args.guest,
+            session_only=args.session_only,
+            install_from=args.install_from,
+            keep=args.keep,
         )
-        return 2
+
+    if args.command == "vm-run":
+        from strataqemu.run_test import run_vm_run
+
+        return run_vm_run(
+            args.guest,
+            graphical=args.graphical,
+            keep=args.keep,
+        )
 
     parser.error(f"unknown command {args.command!r}")
     return 2
