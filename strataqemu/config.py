@@ -6,8 +6,20 @@ import os
 from pathlib import Path
 
 CACHE_ENV = "STRATA_QEMU_CACHE"
+INSTALL_SH_ENV = "STRATA_QEMU_INSTALL_SH"
 CACHE_DIRNAME = "strata-qemu-testing"
 SSH_KEY_NAME = "id_ed25519"
+
+
+def install_sh_from_env() -> Path | None:
+    """Host ``install.sh`` to upload instead of curling ``lgse/strata`` main.
+
+    Used to exercise a PR copy (for example lgse/strata#743) inside the guest.
+    """
+    raw = os.environ.get(INSTALL_SH_ENV)
+    if not raw:
+        return None
+    return Path(raw).expanduser()
 
 
 def cache_dir() -> Path:

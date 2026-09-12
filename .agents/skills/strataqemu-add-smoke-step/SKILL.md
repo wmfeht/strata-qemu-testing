@@ -3,10 +3,10 @@ name: strataqemu-add-smoke-step
 description: >-
   Add a new run-test step or guest-side smoke script to strata-qemu-testing
   (strataqemu/tests_spec.py and guest-tests/*.sh), wire it into the
-  session-only or install-from flows, record it in result.json, and test it
-  with fake SSH responders. Use when adding an assertion about the guest
-  desktop, the installed Strata app, or a new oracle such as an AT-SPI probe,
-  portal check, or file-manager test.
+  session-only, install-from, or omarchy-bindings flows, record it in
+  result.json, and test it with fake SSH responders. Use when adding an
+  assertion about the guest desktop, the installed Strata app, or a new
+  oracle such as an AT-SPI probe, portal check, or file-manager test.
 ---
 
 # Add a run-test smoke step
@@ -23,8 +23,12 @@ first.
 | --- | --- | --- |
 | `--session-only` | `run_session_only_steps` | `session`, `screenshot` |
 | `--install-from` | `run_install_from_release_steps` | `session`, `install`, `version`, `desktop-entry`, `window` |
+| `--omarchy-bindings` | `run_omarchy_bindings_steps` | `session`, `omarchy-detect`, `omarchy-bindings`, `screenshot` |
 
-Both receive a `Machine`, an injectable `run` callable (the fake
+`--omarchy-bindings` is Omarchy-only and exclusive with the other two.
+Do not add detect/bindings oracles to `--install-from`.
+
+Each flow receives a `Machine`, an injectable `run` callable (the fake
 `subprocess.run` in tests), and a `commands` list that records every
 guest command for the audit at the end of a session-only run.
 
@@ -81,8 +85,12 @@ fact. If your step belongs to session-only, do not use `install.sh`,
 name. If it is an install-flow step, add it to
 `run_install_from_release_steps` only.
 
-Update `SESSION_ONLY_STEPS` / `INSTALL_FROM_RELEASE_STEPS` when adding a
-step name; tests assert on them.
+If the step belongs to `--omarchy-bindings`, add it to
+`run_omarchy_bindings_steps` only (and `OMARCHY_BINDINGS_STEPS`). That
+flow must not install or launch Strata.
+
+Update `SESSION_ONLY_STEPS` / `INSTALL_FROM_RELEASE_STEPS` /
+`OMARCHY_BINDINGS_STEPS` when adding a step name; tests assert on them.
 
 ## Guest-side scripts
 
@@ -116,9 +124,11 @@ Branch on `compositor_process_name(guest)` returning `"gnome-shell"` or
 
 ## Wiring into run_test.py
 
-`run_run_test` calls the two step functions and merges the returned
-`steps` list and `extras` dict into `result.json`. Add new top-level
-result keys through `extras`, not by editing `run_run_test`.
+`run_run_test` calls the matching step function
+(`run_session_only_steps`, `run_install_from_release_steps`, or
+`run_omarchy_bindings_steps`) and merges the returned `steps` list and
+`extras` dict into `result.json`. Add new top-level result keys through
+`extras`, not by editing `run_run_test`.
 
 ## Tests
 
@@ -139,4 +149,5 @@ Hyprland guest:
 ```bash
 mise run run-test -- ubuntu-2404 --session-only
 mise run run-test -- arch --install-from release
+mise run run-test -- omarchy-4 --omarchy-bindings
 ```

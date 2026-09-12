@@ -57,7 +57,7 @@ nothing builds a golden implicitly.
 | --- | --- | --- |
 | `check-host` | `check-host` | Host capability check. Generates the SSH key on first success. |
 | `image-build` | `image-build [--force] <guest>` | Build or reuse a golden. Prints the golden path. |
-| `run-test` | `run-test <guest> (--session-only \| --install-from release \| --install-from local-archive PATH) [--keep]` | Boot an overlay and run smokes. |
+| `run-test` | `run-test <guest> (--session-only \| --install-from release \| --install-from local-archive PATH \| --omarchy-bindings) [--keep]` | Boot an overlay and run smokes. |
 | `vm-run` | `vm-run [--graphical] [--keep] <guest>` | Interactive throwaway overlay. |
 | `image-prune` | `image-prune [--images]` | Delete run dirs; with `--images` also goldens. Never `keys/`. |
 | `test` | `python -m unittest discover -s tests -t .` | Host unit tests. |
@@ -302,9 +302,14 @@ machine down and exits 130. Timeouts inside the wait loops capture
 
 Argument validation happens before anything touches the cache:
 
-- Exactly one of `--session-only` or `--install-from` is required.
+- Exactly one of `--session-only`, `--install-from`, or
+  `--omarchy-bindings` is required.
+- `--omarchy-bindings` is Omarchy-only (`omarchy-3`, `omarchy-4`) and
+  cannot be combined with the other two flows.
 - `--install-from local-archive` requires an existing host path;
   `--install-from release` refuses a path.
+- `--omarchy-bindings` optionally uploads `STRATA_QEMU_INSTALL_SH`
+  instead of curling `lgse/strata` `main`; a missing path fails closed.
 - A missing golden fails with `run \`mise run image-build -- <id>\` first`
   and never builds one. This check runs before `check-host`.
 
@@ -320,10 +325,10 @@ Then:
    `boot_timeout_s`.
 4. Run steps (see below). Each step records `name`, `status`, `seconds`,
    and step-specific fields into `result.json`.
-5. On success print `run-test: session ok (<id>)` or `run-test: ok (<id>)`
-   and the screenshot path, shut down, delete the overlay, vars copy, and
-   sockets (unless `--keep`), and print `run dir: <path>`. Logs,
-   `result.json`, and screenshots stay.
+5. On success print `run-test: session ok (<id>)`, `run-test: ok (<id>)`,
+   or `run-test: omarchy-bindings ok (<id>)` and the screenshot path, shut
+   down, delete the overlay, vars copy, and sockets (unless `--keep`), and
+   print `run dir: <path>`. Logs, `result.json`, and screenshots stay.
 6. On failure record `error` and the recorded guest commands in
    `result.json`, keep the whole run dir, print `kept run dir: <path>`,
    exit 1. Ctrl-C exits 130.
@@ -381,6 +386,27 @@ fails if the oracle timed out.
 `install_sh_sha256`, `intended_version`, `observed_version` (when the
 version step passed), and `archive_sha256` (for `local-archive`).
 
+`--install-from` on Omarchy guests is the same five-step sequence as on
+GNOME/Arch. It does not run Omarchy detection or rewrite Hyprland
+bindings.
+
+**omarchy-detect** (`--omarchy-bindings`): upload
+`guest-tests/smoke-omarchy-detect.sh` and a staged `install.sh`. The
+script sources the installer under `STRATA_INSTALLER_TESTING=1` and
+prints `DETECTED_MAJOR=`. The host checks the live major against the
+guest (4 or 3), then probes `omarchy_major_from` on the `#743` token
+matrix and `detect_omarchy_major` against a fake `omarchy version` of
+`dev (b280f130)` (must fall back to the version file, not hash-match 3).
+
+**omarchy-bindings** (`--omarchy-bindings`): upload
+`guest-tests/smoke-omarchy-bindings.sh`, source `configure_omarchy_bindings`
+for the detected major, and assert `bindings.lua` (4) or `bindings.conf`
+(3) carries the installer marker while the unused sibling does not. Then
+the same in-guest screenshot as session-only.
+
+`result.json` for this flow records `omarchy_major`, `omarchy_bindings`
+(`lua` or `conf`), and `omarchy_pr743_probes`.
+
 ## vm-run (`run_test.run_vm_run`)
 
 Same golden/overlay/host checks as `run-test`. QEMU inherits the
@@ -399,6 +425,11 @@ the run dir is deleted unless `--keep`; on error it is kept. There is no
 - `guest-tests/smoke-session.sh`: session selection and env export, as
   described above.
 - `guest-tests/smoke-install.sh`: `install.sh` download, digest, and run.
+- `guest-tests/smoke-omarchy-detect.sh`: source a staged `install.sh` and
+  print `DETECTED_MAJOR=` for live / token / fake-command cases
+  (lgse/strata#743). Used only by `--omarchy-bindings`.
+- `guest-tests/smoke-omarchy-bindings.sh`: write (optional) and assert
+  Hyprland file-manager bindings for major 3 vs 4.
 - `guest-tests/smoke-desktop.sh`: combined bus-name/hyprctl + screenshot
   oracle. Exercised by unit tests; the live `run-test` path uses the
   host-driven equivalents in `tests_spec.py` instead.

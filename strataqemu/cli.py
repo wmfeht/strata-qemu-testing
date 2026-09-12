@@ -306,6 +306,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep the overlay disk after a successful run",
     )
+    run_test.add_argument(
+        "--omarchy-bindings",
+        action="store_true",
+        help=(
+            "Omarchy-only: probe detect_omarchy_major and write/check "
+            "Hyprland file-manager bindings (lgse/strata#743). "
+            "Does not install or launch Strata. Optional STRATA_QEMU_INSTALL_SH "
+            "uploads a host install.sh instead of curling main."
+        ),
+    )
 
     vm_run = sub.add_parser(
         "vm-run",
@@ -456,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
             install_from=install_from,
             archive_path=archive_path,
             keep=args.keep,
+            omarchy_bindings=args.omarchy_bindings,
         )
 
     if args.command == "vm-run":

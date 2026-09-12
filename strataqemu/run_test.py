@@ -38,14 +38,19 @@ from strataqemu.ports import (
 from strataqemu.qemu import Machine, build_qemu_argv
 from strataqemu.tests_spec import (
     INSTALL_FROM_FAIL_CLOSED,
+    INSTALL_SH_MISSING_PATH,
     LOCAL_ARCHIVE_MISSING_PATH,
+    OMARCHY_BINDINGS_EXCLUSIVE,
+    OMARCHY_BINDINGS_FAIL_CLOSED,
     SESSION_TIMEOUT_S,
     SessionSmokeError,
     compositor_process_name,
     missing_golden_message,
     run_install_from_release_steps,
+    run_omarchy_bindings_steps,
     run_session_only_steps,
     supports_install_from_release,
+    supports_omarchy_bindings,
 )
 
 log = logging.getLogger("strataqemu")
@@ -339,7 +344,8 @@ def _load_or_usage(guest_id: str | None, command: str) -> Guest | int:
             print(
                 "usage: python -m strataqemu run-test "
                 "[--session-only | --install-from release | "
-                "--install-from local-archive PATH] [--keep] <guest>",
+                "--install-from local-archive PATH | --omarchy-bindings] "
+                "[--keep] <guest>",
                 file=sys.stderr,
             )
         return 2
@@ -365,6 +371,8 @@ def run_run_test(
     settle_s: float = SETTLE_S,
     intended_version: str | None = None,
     intended_version_fn: Callable[[], str] | None = None,
+    install_sh_path: Path | str | None = None,
+    omarchy_bindings: bool = False,
 ) -> int:
     """CLI body for ``run-test``. Never calls ``image-build``."""
     loaded = _load_or_usage(guest_id, "run-test")
@@ -372,10 +380,18 @@ def run_run_test(
         return loaded
     guest = loaded
 
+    if omarchy_bindings and (session_only or install_from):
+        print(OMARCHY_BINDINGS_EXCLUSIVE, file=sys.stderr)
+        return 2
+    if omarchy_bindings and not supports_omarchy_bindings(guest):
+        print(OMARCHY_BINDINGS_FAIL_CLOSED, file=sys.stderr)
+        return 2
+
     install_ok = (
         install_from in {"release", "local-archive"}
         and supports_install_from_release(guest)
         and not session_only
+        and not omarchy_bindings
     )
     if install_from and not session_only and not install_ok:
         print(INSTALL_FROM_FAIL_CLOSED, file=sys.stderr)
@@ -396,9 +412,21 @@ def run_run_test(
         if not archive.is_file():
             print(f"run-test: archive not found: {archive}", file=sys.stderr)
             return 2
-    if not session_only and not install_ok:
+    resolved_install_sh: Path | None = None
+    if omarchy_bindings:
+        if install_sh_path is not None:
+            resolved_install_sh = Path(install_sh_path)
+        else:
+            resolved_install_sh = config.install_sh_from_env()
+        if resolved_install_sh is not None and not resolved_install_sh.is_file():
+            print(
+                f"{INSTALL_SH_MISSING_PATH}: {resolved_install_sh}",
+                file=sys.stderr,
+            )
+            return 2
+    if not session_only and not install_ok and not omarchy_bindings:
         print(
-            "run-test: pass --session-only or "
+            "run-test: pass --session-only, --omarchy-bindings, or "
             "--install-from release|local-archive",
             file=sys.stderr,
         )
@@ -475,6 +503,17 @@ def run_run_test(
                 intended_version=intended_version,
                 intended_version_fn=intended_version_fn,
             )
+        elif omarchy_bindings:
+            steps, extras = run_omarchy_bindings_steps(
+                machine,
+                guest=guest,
+                screenshot_dest=shot,
+                qmp_dest=qmp_path,
+                session_timeout=SESSION_TIMEOUT_S,
+                run=run,
+                commands=recorded,
+                install_sh_path=resolved_install_sh,
+            )
         else:
             steps = run_session_only_steps(
                 machine,
@@ -497,6 +536,8 @@ def run_run_test(
         _write_result(arts.result_json, result)
         if install_ok:
             print(f"run-test: ok ({guest.id})")
+        elif omarchy_bindings:
+            print(f"run-test: omarchy-bindings ok ({guest.id})")
         else:
             print(f"run-test: session ok ({guest.id})")
         print(f"screenshot: {shot}")
