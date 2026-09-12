@@ -118,13 +118,31 @@ class CliHelpTests(unittest.TestCase):
                 self.assertEqual(args.command, name)
 
     def test_stub_subcommands_fail_closed(self) -> None:
-        for name in ("image-build", "run-test", "vm-run", "image-prune"):
+        for name in ("image-build", "run-test", "vm-run"):
             err = io.StringIO()
             with self.subTest(name=name), redirect_stderr(err):
                 code = main([name])
             self.assertEqual(code, 2)
             self.assertIn(name, err.getvalue())
             self.assertIn("not implemented", err.getvalue())
+
+    def test_image_prune_is_not_a_stub(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            old = os.environ.get(config.CACHE_ENV)
+            os.environ[config.CACHE_ENV] = td
+            err = io.StringIO()
+            try:
+                with redirect_stderr(err):
+                    code = main(["image-prune"])
+            finally:
+                if old is None:
+                    os.environ.pop(config.CACHE_ENV, None)
+                else:
+                    os.environ[config.CACHE_ENV] = old
+        self.assertEqual(code, 0)
+        self.assertNotIn("not implemented", err.getvalue())
 
 
 class MiseTomlTests(unittest.TestCase):
@@ -495,6 +513,87 @@ def _is_4m_name(path: Path) -> bool:
     return "4m" in path.name.lower()
 
 
+class ImagePruneTests(unittest.TestCase):
+    def test_prune_removes_runs_keeps_golden_and_key(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cache = tmp / "cache"
+            golden = cache / "images" / "fake.qcow2"
+            golden.parent.mkdir(parents=True)
+            golden.write_bytes(b"golden")
+            overlay = cache / "runs" / "r1" / "overlay.qcow2"
+            overlay.parent.mkdir(parents=True)
+            overlay.write_bytes(b"overlay")
+            key = cache / "keys" / "id_ed25519"
+            key.parent.mkdir(parents=True)
+            key.write_bytes(b"secret")
+            old = os.environ.get(config.CACHE_ENV)
+            os.environ[config.CACHE_ENV] = str(cache)
+            try:
+                code = main(["image-prune"])
+            finally:
+                if old is None:
+                    os.environ.pop(config.CACHE_ENV, None)
+                else:
+                    os.environ[config.CACHE_ENV] = old
+            self.assertEqual(code, 0)
+            self.assertFalse(overlay.exists())
+            self.assertFalse((cache / "runs" / "r1").exists())
+            self.assertTrue(golden.is_file())
+            self.assertEqual(golden.read_bytes(), b"golden")
+            self.assertTrue(key.is_file())
+            self.assertEqual(key.read_bytes(), b"secret")
+
+    def test_prune_images_removes_golden_keeps_key(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cache = tmp / "cache"
+            golden = cache / "images" / "fake.qcow2"
+            golden.parent.mkdir(parents=True)
+            golden.write_bytes(b"golden")
+            overlay = cache / "runs" / "r1" / "overlay.qcow2"
+            overlay.parent.mkdir(parents=True)
+            overlay.write_bytes(b"overlay")
+            key = cache / "keys" / "id_ed25519"
+            key.parent.mkdir(parents=True)
+            key.write_bytes(b"secret")
+            old = os.environ.get(config.CACHE_ENV)
+            os.environ[config.CACHE_ENV] = str(cache)
+            try:
+                code = main(["image-prune", "--images"])
+            finally:
+                if old is None:
+                    os.environ.pop(config.CACHE_ENV, None)
+                else:
+                    os.environ[config.CACHE_ENV] = old
+            self.assertEqual(code, 0)
+            self.assertFalse(overlay.exists())
+            self.assertFalse(golden.exists())
+            self.assertTrue(key.is_file())
+            self.assertEqual(key.read_bytes(), b"secret")
+
+    def test_prune_twice_on_empty_exits_zero(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "cache"
+            cache.mkdir()
+            old = os.environ.get(config.CACHE_ENV)
+            os.environ[config.CACHE_ENV] = str(cache)
+            try:
+                self.assertEqual(main(["image-prune"]), 0)
+                self.assertEqual(main(["image-prune"]), 0)
+            finally:
+                if old is None:
+                    os.environ.pop(config.CACHE_ENV, None)
+                else:
+                    os.environ[config.CACHE_ENV] = old
+
+
 class ShippedCliDoesNotSpawnQemuTests(unittest.TestCase):
     def test_check_host_does_not_exec_qemu(self) -> None:
         import tempfile
@@ -529,6 +628,25 @@ class ShippedCliDoesNotSpawnQemuTests(unittest.TestCase):
                     Path(str(cmd[0])).name.startswith("qemu"),
                     cmd,
                 )
+
+    def test_image_prune_does_not_exec_qemu(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "cache"
+            cache.mkdir()
+            old = os.environ.get(config.CACHE_ENV)
+            os.environ[config.CACHE_ENV] = str(cache)
+            try:
+                with patch("subprocess.run") as run:
+                    code = main(["image-prune"])
+            finally:
+                if old is None:
+                    os.environ.pop(config.CACHE_ENV, None)
+                else:
+                    os.environ[config.CACHE_ENV] = old
+        self.assertEqual(code, 0)
+        run.assert_not_called()
 
 
 if __name__ == "__main__":

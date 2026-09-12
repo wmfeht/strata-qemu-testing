@@ -1,4 +1,4 @@
-"""Argparse CLI: check-host and later-PR stubs."""
+"""Argparse CLI: check-host, image-prune, and later-PR stubs."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from strataqemu import config
+from strataqemu.overlay import prune
 
 log = logging.getLogger("strataqemu")
 
@@ -37,7 +38,7 @@ DEFAULT_FIRMWARE_SHARE_ROOTS: tuple[Path, ...] = (Path("/usr/share"),)
 # Generic floor when no guest is selected: 8 GiB guest + 1 GiB host slack.
 GENERIC_MEM_FLOOR_MIB = 9 * 1024
 
-STUB_COMMANDS = ("image-build", "run-test", "vm-run", "image-prune")
+STUB_COMMANDS = ("image-build", "run-test", "vm-run")
 
 # Named when qemu-system-x86_64 is missing. Not a generic "install qemu".
 QEMU_BOOTSTRAP_HINT = """\
@@ -327,14 +328,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     prune = sub.add_parser(
         "image-prune",
-        help="Drop overlays and old run dirs (later PR)",
+        help="Drop overlays and old run dirs. Never deletes goldens unless --images.",
     )
     prune.add_argument(
         "--images",
         action="store_true",
-        help="Also delete golden images",
+        help="Also delete golden images. Never deletes $CACHE/keys/.",
     )
     return parser
+
+
+def _run_image_prune(*, images: bool) -> int:
+    try:
+        prune(images=images)
+    except OSError as exc:
+        print(f"image-prune: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _run_check_host() -> int:
@@ -370,6 +380,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "check-host":
         return _run_check_host()
+
+    if args.command == "image-prune":
+        return _run_image_prune(images=args.images)
 
     if args.command in STUB_COMMANDS:
         print(
