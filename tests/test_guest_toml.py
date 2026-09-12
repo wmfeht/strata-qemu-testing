@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import tempfile
 import unittest
@@ -103,8 +104,26 @@ class Ubuntu2404RecipeTests(unittest.TestCase):
         self.assertIsNotNone(SHA256_HEX.fullmatch(guest.golden_digest()))
         self.assertNotEqual(guest.golden_digest(), guest.recipe_digest())
 
+    def test_snapshot_is_not_older_than_cloud_image(self) -> None:
+        """20260901 snapshot + 20260911 cloudimg: gtk 24.04.28 vs core 24.04.29."""
+        guest = load_guest("ubuntu-2404")
+        image_day = re.search(r"/noble/(\d{8})/", guest.source_url)
+        snap_day = re.search(
+            r"/ubuntu/(\d{8})T", guest.packages.snapshot_url or ""
+        )
+        self.assertIsNotNone(image_day, guest.source_url)
+        self.assertIsNotNone(snap_day, guest.packages.snapshot_url)
+        assert image_day is not None
+        assert snap_day is not None
+        self.assertGreaterEqual(
+            snap_day.group(1),
+            image_day.group(1),
+            "APT snapshot must not predate the cloud image date",
+        )
+
     def test_setup_sh_configures_noble_desktop(self) -> None:
         text = (RECIPE / "setup.sh").read_text(encoding="utf-8")
+        guest = load_guest("ubuntu-2404")
         self.assertIn("ubuntu-desktop-minimal", text)
         self.assertIn("gnome-screenshot", text)
         self.assertIn("gnome-initial-setup", text)
@@ -114,6 +133,9 @@ class Ubuntu2404RecipeTests(unittest.TestCase):
         self.assertIn("/etc/gdm3/custom.conf", text)
         self.assertIn("loginctl enable-linger tester", text)
         self.assertIn("qemu-guest-agent", text)
+        self.assertIn(guest.packages.snapshot_url or "", text)
+        self.assertIn("*.sources", text)
+        self.assertIn("Allow-Downgrades", text)
         self.assertNotRegex(text, r"(^|[;&|]\s*)(bash\s+|sudo\s+.*)?/?install\.sh")
 
     def test_user_data_template_has_tester_and_placeholder(self) -> None:

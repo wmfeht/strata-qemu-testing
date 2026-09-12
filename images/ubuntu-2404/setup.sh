@@ -4,16 +4,18 @@
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 
-SNAPSHOT_URL="${SNAPSHOT_URL:-http://snapshot.ubuntu.com/ubuntu/20260901T000000Z}"
+SNAPSHOT_URL="${SNAPSHOT_URL:-http://snapshot.ubuntu.com/ubuntu/20260911T000000Z}"
 
+# Snapshot is the only index. Leftover live archive sources mix
+# ubuntu-release-upgrader 1:24.04.29 (cloudimg) with gtk 1:24.04.28.
 sudo -n mkdir -p /etc/apt/sources.list.d
-if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
-  sudo -n mv /etc/apt/sources.list.d/ubuntu.sources \
-    /etc/apt/sources.list.d/ubuntu.sources.disabled
-fi
 if [[ -f /etc/apt/sources.list ]]; then
   sudo -n mv /etc/apt/sources.list /etc/apt/sources.list.disabled
 fi
+shopt -s nullglob
+for src in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+  sudo -n mv "$src" "${src}.disabled"
+done
 sudo -n tee /etc/apt/sources.list.d/snapshot.list >/dev/null <<EOF
 deb [check-valid-until=no] ${SNAPSHOT_URL} noble main universe
 deb [check-valid-until=no] ${SNAPSHOT_URL} noble-updates main universe
@@ -21,7 +23,10 @@ deb [check-valid-until=no] ${SNAPSHOT_URL} noble-security main universe
 EOF
 
 sudo -n apt-get update
-sudo -n apt-get install -y \
+# Cloudimg packages can be newer than the snapshot; allow the snapshot
+# to win so (= version) deps in ubuntu-desktop-minimal resolve.
+sudo -n apt-get dist-upgrade -y -o APT::Get::Allow-Downgrades=true
+sudo -n apt-get install -y -o APT::Get::Allow-Downgrades=true \
   ubuntu-desktop-minimal \
   gnome-screenshot \
   qemu-guest-agent \

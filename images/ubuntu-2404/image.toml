@@ -22,8 +22,10 @@ wayland = true
 
 [packages]
 manager = "apt"
-# Same snapshot service the Strata E2E Dockerfile uses.
-snapshot_url = "http://snapshot.ubuntu.com/ubuntu/20260901T000000Z"
+# Must not predate the cloud image: a 20260901 snapshot vs 20260911
+# cloudimg leaves ubuntu-release-upgrader-core 1:24.04.29 installed
+# while ubuntu-desktop-minimal pulls gtk 1:24.04.28 (= core 24.04.28).
+snapshot_url = "http://snapshot.ubuntu.com/ubuntu/20260911T000000Z"
 runtime = [
   "bubblewrap", "ffmpeg", "ffmpegthumbnailer", "fontconfig",
   "gstreamer1.0-libav", "gstreamer1.0-plugins-good",
