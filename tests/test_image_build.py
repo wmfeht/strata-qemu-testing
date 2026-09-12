@@ -20,6 +20,7 @@ from strataqemu.guest import load_guest
 from strataqemu.image_build import (
     WELL_KNOWN_TEST_PASSWORD,
     ImageBuildError,
+    build_duration_note,
     capture_build_timeout_evidence,
     create_blank_qcow2_argv,
     golden_qcow2,
@@ -89,6 +90,7 @@ class IncrementalImageBuildTests(unittest.TestCase):
                     os.environ[config.CACHE_ENV] = old
         self.assertEqual(code, 0, err.getvalue())
         self.assertIn(str(golden.resolve()), buf.getvalue())
+        self.assertNotIn("typically takes", err.getvalue())
         self.assertNotIn("not implemented", buf.getvalue() + err.getvalue())
         ch.assert_not_called()
 
@@ -122,6 +124,7 @@ class IncrementalImageBuildTests(unittest.TestCase):
                     os.environ[config.CACHE_ENV] = old
         self.assertEqual(code, 1)
         self.assertIn("injected-host-failure", err.getvalue())
+        self.assertNotIn("typically takes", err.getvalue())
         self.assertNotEqual(buf.getvalue().strip(), str(golden.resolve()))
         self.assertNotIn("not implemented", buf.getvalue() + err.getvalue())
         ch.assert_called()
@@ -148,6 +151,50 @@ class IncrementalImageBuildTests(unittest.TestCase):
                 paths.append(buf.getvalue().strip())
             self.assertEqual(paths[0], paths[1])
             self.assertEqual(paths[0], str(golden.resolve()))
+
+    def test_duration_note_cloud_vs_iso(self) -> None:
+        ubuntu = load_guest("ubuntu-2404")
+        cloud = build_duration_note(ubuntu)
+        self.assertIn("ubuntu-2404", cloud)
+        self.assertIn("10-30 minutes", cloud)
+        self.assertIn("timeout 60 minutes", cloud)
+        self.assertIn("run dir", cloud)
+        self.assertNotIn("ISO autoinstall", cloud)
+        omarchy = load_guest("omarchy-4")
+        iso = build_duration_note(omarchy)
+        self.assertIn("omarchy-4", iso)
+        self.assertIn("ISO autoinstall", iso)
+        self.assertIn("20-60 minutes", iso)
+        self.assertIn("timeout 60 minutes", iso)
+
+    def test_live_build_prints_duration_note_on_stderr(self) -> None:
+        guest = load_guest("ubuntu-2404")
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "cache"
+            golden = golden_qcow2(guest, cache)
+            host = CheckHostResult(
+                ok=True, errors=(), ssh_key=Path("k"), ovmf_code=Path("o")
+            )
+            buf = io.StringIO()
+            err = io.StringIO()
+            with (
+                redirect_stdout(buf),
+                redirect_stderr(err),
+                patch(
+                    "strataqemu.image_build.check_host", return_value=host
+                ),
+                patch(
+                    "strataqemu.image_build.build_live", return_value=golden
+                ) as live,
+            ):
+                code = run_image_build(
+                    "ubuntu-2404", force=True, cache_dir=cache
+                )
+        self.assertEqual(code, 0, err.getvalue())
+        live.assert_called_once()
+        self.assertIn(build_duration_note(guest), err.getvalue())
+        self.assertIn(str(golden.resolve()), buf.getvalue())
+        self.assertNotIn("typically takes", buf.getvalue())
 
     def test_arch_matching_golden_prints_path_and_skips_qemu(self) -> None:
         guest = load_guest("arch")
@@ -793,6 +840,95 @@ class IsoAutoinstallBuildTests(unittest.TestCase):
                 )
         self.assertIn("rejected tester", str(ctx.exception).lower())
         self.assertEqual(calls["n"], 4)
+
+    def test_wait_iso_autoinstall_does_not_info_log_ssh_rejects(self) -> None:
+        calls = {"n": 0}
+
+        def fake_run(argv, **kwargs):
+            calls["n"] += 1
+            return subprocess.CompletedProcess(
+                argv,
+                255,
+                "",
+                "tester@127.0.0.1: Permission denied (publickey,password).\n",
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "working.qcow2",
+                tmp,
+                ssh_port=22022,
+                vnc_port=5901,
+                identity=identity,
+            )
+            with (
+                patch(
+                    "strataqemu.image_build.vnc_framebuffer_png",
+                    return_value=True,
+                ),
+                patch(
+                    "strataqemu.image_build.qmp_screendump",
+                    return_value=False,
+                ),
+                self.assertNoLogs("strataqemu", level="INFO"),
+                self.assertRaises(TimeoutError),
+            ):
+                wait_iso_autoinstall(
+                    machine,
+                    major=4,
+                    timeout=3600,
+                    run=fake_run,
+                    sleep=lambda _s: None,
+                    max_attempts=4,
+                )
+        self.assertEqual(calls["n"], 4)
+
+    def test_wait_ssh_does_not_warning_log_each_reject(self) -> None:
+        calls = {"n": 0}
+
+        def fake_run(argv, **kwargs):
+            calls["n"] += 1
+            return subprocess.CompletedProcess(
+                argv,
+                255,
+                "",
+                "Permission denied (publickey,password).\n",
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "working.qcow2",
+                tmp,
+                ssh_port=22022,
+                vnc_port=5901,
+                identity=identity,
+            )
+            with (
+                patch(
+                    "strataqemu.image_build.vnc_framebuffer_png",
+                    return_value=True,
+                ),
+                patch(
+                    "strataqemu.image_build.qmp_screendump",
+                    return_value=False,
+                ),
+                self.assertNoLogs("strataqemu", level="WARNING"),
+                self.assertRaises(ImageBuildError),
+            ):
+                wait_ssh(
+                    machine,
+                    timeout=180,
+                    run=fake_run,
+                    sleep=lambda _s: None,
+                    auth_reject_max=3,
+                )
+        self.assertEqual(calls["n"], 3)
 
     def test_wait_predicate_accepts_4x_rejects_3x_and_wizard(self) -> None:
         self.assertTrue(omarchy_version_matches_major("4.0.3\n", 4))

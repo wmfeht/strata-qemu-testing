@@ -29,6 +29,10 @@ runtime = [
   "xdg-desktop-portal",
   "jq",
   "grim",
+  # ISO does not ship these; install.sh requires them (see setup.sh).
+  "gst-libav",
+  "gst-plugins-good",
+  "gtksourceview5",
 ]
 
 [user]

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Guest setup for omarchy-4. Unencrypted ISO installs do not autologin;
 # this writes SDDM autologin, NOPASSWD, linger, and grim. Strata is out
-# of scope. Do not refresh the distro after install.
+# of scope. Do not run omarchy update or pacman -Syu after install.
 #
 # Image-build runs this via `sudo -S` (password sudo until we write
 # NOPASSWD). Re-runs as tester with NOPASSWD exec sudo -n here.
@@ -52,6 +52,16 @@ tester ALL=(ALL) NOPASSWD: ALL
 Defaults:tester !authenticate
 EOF
 chmod 440 /etc/sudoers.d/tester
+
+# The ISO install uses an offline repo and never fetches core/extra/multilib/
+# omarchy sync DBs (omacom/omarchy#10263). install.sh then dies with
+# "target not found" for gst-libav, gst-plugins-good, and gtksourceview5,
+# which the ISO does not ship (it has gtksourceview4). Sync DBs and install
+# those three only. Do not -Syu or omarchy update; that would roll the pin.
+if [[ ! -f /var/lib/pacman/sync/core.db ]]; then
+  pacman -Sy --noconfirm
+fi
+pacman -S --noconfirm --needed gst-libav gst-plugins-good gtksourceview5
 
 if ! command -v grim >/dev/null 2>&1; then
   pacman -S --noconfirm --needed grim

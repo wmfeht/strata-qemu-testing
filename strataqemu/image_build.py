@@ -351,7 +351,7 @@ def wait_ssh(
         last = (proc.stderr or proc.stdout or "").strip()
         if ssh_auth_rejected(proc.returncode, last):
             auth_rejects += 1
-            log.warning(
+            log.debug(
                 "SSH auth rejected (%s/%s): %s",
                 auth_rejects,
                 auth_reject_max,
@@ -469,12 +469,12 @@ def wait_iso_autoinstall(
                 ):
                     logged_progress = True
                     log.info(
-                        "SSH rejected tester; working disk %s bytes "
+                        "working disk %s bytes "
                         "(autoinstall writing, waiting for reboot)",
                         disk,
                     )
                 elif ssh_auth_rejected(proc.returncode, last):
-                    log.info(
+                    log.debug(
                         "SSH rejected tester (live ISO, waiting): %s",
                         last.splitlines()[-1] if last else last,
                     )
@@ -642,7 +642,7 @@ def _spawn_qemu(
             cidata_iso=cidata_iso,
             install_iso=install_iso,
         )
-        log.info("qemu argv: %s", " ".join(argv))
+        log.debug("qemu argv: %s", " ".join(argv))
         logf = arts.qemu_log.open("ab")
         try:
             proc = launcher(
@@ -977,6 +977,29 @@ def build_live(
         raise
 
 
+def _format_minutes(seconds: int) -> str:
+    minutes = max(1, (max(0, seconds) + 59) // 60)
+    if minutes == 1:
+        return "1 minute"
+    return f"{minutes} minutes"
+
+
+def build_duration_note(guest: Guest) -> str:
+    """One-line expectation for a live golden build (stderr, not stdout)."""
+    timeout = _format_minutes(guest.build_timeout_s)
+    if guest.source_kind == "iso-autoinstall":
+        typical = "20-60 minutes"
+        what = "ISO autoinstall and setup"
+    else:
+        typical = "10-30 minutes"
+        what = "first boot, package install, and setup"
+    return (
+        f"image-build: {guest.id} {what} typically takes {typical} "
+        f"(timeout {timeout}). Quiet until done; SSH transcripts stay in "
+        f"the run dir, not the terminal."
+    )
+
+
 def run_image_build(
     guest_id: str | None,
     *,
@@ -1018,6 +1041,7 @@ def run_image_build(
         return 1
 
     try:
+        print(build_duration_note(guest), file=sys.stderr)
         installed = build_live(
             guest, cache, host=host, run=run, popen=popen
         )
