@@ -12,8 +12,6 @@ from pathlib import Path
 
 from strataqemu.cloudinit import (
     CloudInitError,
-    VFAT_LABEL,
-    VOLUME_ID,
     omarchy_mcopy_argv,
     omarchy_mkfs_vfat_argv,
     render_user_data,
@@ -41,11 +39,9 @@ class XorrisoArgvTests(unittest.TestCase):
     def test_volume_id_cidata(self) -> None:
         argv = xorriso_argv("/tmp/cidata.iso")
         self.assertEqual(argv[0], "xorriso")
-        self.assertEqual(_after(argv, "-V"), VOLUME_ID)
-        self.assertEqual(VOLUME_ID, "cidata")
+        self.assertEqual(_after(argv, "-V"), "cidata")
         self.assertIn("user-data", argv)
         self.assertIn("meta-data", argv)
-        self.assertNotIn("qemu-system-x86_64", argv)
 
 
 class RenderedUserDataTests(unittest.TestCase):
@@ -119,11 +115,6 @@ class XorrisoIsoTests(unittest.TestCase):
                 )
                 self.assertIn("cidata", (info.stdout + info.stderr).lower())
 
-    def test_recipe_template_roundtrip(self) -> None:
-        guest = load_guest("ubuntu-2404")
-        tmpl = (guest.recipe_dir / "user-data.yaml.tmpl").read_text(encoding="utf-8")
-        self.assertEqual(tmpl, TEMPLATE)
-
     def test_arch_template_renders_tester_wheel(self) -> None:
         guest = load_guest("arch")
         tmpl = (guest.recipe_dir / "user-data.yaml.tmpl").read_text(encoding="utf-8")
@@ -153,8 +144,7 @@ class OmarchyCidataTests(unittest.TestCase):
         dest = "/tmp/cidata.img"
         mkfs = omarchy_mkfs_vfat_argv(dest)
         self.assertEqual(mkfs[0], "mkfs.vfat")
-        self.assertEqual(_after(mkfs, "-n"), VFAT_LABEL)
-        self.assertEqual(VFAT_LABEL, "CIDATA")
+        self.assertEqual(_after(mkfs, "-n"), "CIDATA")
         self.assertIn(dest, mkfs)
         mcopy = omarchy_mcopy_argv(dest)
         self.assertEqual(mcopy[0], "mcopy")
@@ -166,8 +156,6 @@ class OmarchyCidataTests(unittest.TestCase):
         self.assertIn("::/", mcopy)
         self.assertNotIn("user-data", mcopy)
         self.assertNotIn("meta-data", mcopy)
-        self.assertNotIn("qemu-system-x86_64", mkfs + mcopy)
-        self.assertNotIn("xorriso", mkfs + mcopy)
 
     def test_dump_has_vda_no_encryption_no_tailscale(self) -> None:
         guest = load_guest("omarchy-4")

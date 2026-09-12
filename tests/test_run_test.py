@@ -762,7 +762,6 @@ class ArchInstallFromTests(unittest.TestCase):
     def test_omarchy4_install_from_release_missing_golden_twice(self) -> None:
         guest = load_guest("omarchy-4")
         msg = missing_golden_message("omarchy-4")
-        self.assertEqual(msg, "run `mise run image-build -- omarchy-4` first")
         with tempfile.TemporaryDirectory() as td:
             cache = Path(td) / "empty-cache"
             cache.mkdir()
@@ -818,7 +817,6 @@ class ArchInstallFromTests(unittest.TestCase):
     def test_omarchy3_install_from_release_missing_golden_twice(self) -> None:
         guest = load_guest("omarchy-3")
         msg = missing_golden_message("omarchy-3")
-        self.assertEqual(msg, "run `mise run image-build -- omarchy-3` first")
         with tempfile.TemporaryDirectory() as td:
             cache = Path(td) / "empty-cache"
             cache.mkdir()

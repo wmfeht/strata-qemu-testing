@@ -37,14 +37,6 @@ class SpikeOverlayArgvTests(unittest.TestCase):
             overlay = tmp / "runs" / "r1" / "overlay.qcow2"
             rel_backing = os.path.relpath(backing, os.getcwd())
             argv = spike_overlay_create_argv(rel_backing, overlay)
-        self.assertEqual(argv[0], "qemu-img")
-        self.assertFalse(
-            any(Path(str(tok)).name.startswith("qemu-system") for tok in argv)
-        )
-        self.assertIn("backing_file_strict=on", argv)
-        backing_path = Path(argv[argv.index("-b") + 1])
-        self.assertTrue(backing_path.is_absolute())
-        self.assertEqual(backing_path, backing.resolve())
         self.assertEqual(
             argv,
             create_overlay_argv(backing.resolve(), overlay),
@@ -73,16 +65,12 @@ class SpikeQemuArgvTests(unittest.TestCase):
             run.assert_not_called()
 
         self.assertEqual(argv[0], "qemu-system-x86_64")
-        self.assertFalse(
-            any(Path(str(tok)).name == "qemu-system-x86_64" for tok in argv[1:])
-        )
         self.assertEqual(_after(argv, "-vga"), "none")
         self.assertIn("virtio-gpu-gl-pci", argv)
         self.assertNotIn("virtio-vga-gl", argv)
         self.assertEqual(_after(argv, "-display"), "egl-headless,gl=on")
         vnc = _after(argv, "-vnc")
         self.assertEqual(vnc, "127.0.0.1:5901")
-        self.assertTrue(vnc.startswith("127.0.0.1:"))
         self.assertFalse(any("0.0.0.0" in tok for tok in argv))
         self.assertIn("virtio-scsi-pci,id=scsi0", argv)
         self.assertTrue(any("scsi-cd" in tok for tok in argv))

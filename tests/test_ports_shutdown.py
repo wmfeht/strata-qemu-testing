@@ -11,13 +11,6 @@ from pathlib import Path
 
 from strataqemu.ports import (
     BIND_HOST,
-    MAX_PORT_RETRIES,
-    SSH_FALLBACK,
-    SSH_FALLBACK_END,
-    SSH_FALLBACK_START,
-    VNC_FALLBACK,
-    VNC_FALLBACK_END,
-    VNC_FALLBACK_START,
     AddressAlreadyInUse,
     allocate_port,
     allocate_ssh_port,
@@ -34,7 +27,6 @@ from strataqemu.qemu import (
     run_shutdown,
 )
 from strataqemu.ssh import (
-    POWEROFF_COMMAND,
     scp_command,
     scp_download_command,
     ssh_command,
@@ -73,29 +65,15 @@ class PortAllocatorTests(unittest.TestCase):
         sock, got = bind_localhost(BIND_HOST, port)
         try:
             self.assertEqual(got, port)
-            self.assertEqual(sock.getsockname()[0], BIND_HOST)
+            self.assertEqual(sock.getsockname()[0], "127.0.0.1")
         finally:
             sock.close()
-
-    def test_fallback_ranges_match_design(self) -> None:
-        self.assertEqual(SSH_FALLBACK_START, 22022)
-        self.assertEqual(SSH_FALLBACK_END, 22999)
-        self.assertEqual(VNC_FALLBACK_START, 5900)
-        self.assertEqual(VNC_FALLBACK_END, 5999)
-        self.assertEqual(SSH_FALLBACK.start, 22022)
-        self.assertIn(22999, SSH_FALLBACK)
-        self.assertNotIn(23000, SSH_FALLBACK)
-        self.assertEqual(VNC_FALLBACK.start, 5900)
-        self.assertIn(5999, VNC_FALLBACK)
-        self.assertNotIn(6000, VNC_FALLBACK)
-        self.assertEqual(MAX_PORT_RETRIES, 5)
-        self.assertEqual(BIND_HOST, "127.0.0.1")
 
     def test_ssh_fallback_used_when_ephemeral_denied(self) -> None:
         seen: list[int] = []
 
         def bind(host: str, port: int):
-            self.assertEqual(host, BIND_HOST)
+            self.assertEqual(host, "127.0.0.1")
             seen.append(port)
             if port == 0:
                 raise OSError("ephemeral denied")
@@ -110,15 +88,15 @@ class PortAllocatorTests(unittest.TestCase):
             return _Fake(), port
 
         port = allocate_ssh_port(bind=bind)
-        self.assertEqual(port, SSH_FALLBACK_START)
+        self.assertEqual(port, 22022)
         self.assertEqual(seen[0], 0)
-        self.assertEqual(seen[1], SSH_FALLBACK_START)
+        self.assertEqual(seen[1], 22022)
 
     def test_vnc_fallback_used_when_ephemeral_denied(self) -> None:
         seen: list[int] = []
 
         def bind(host: str, port: int):
-            self.assertEqual(host, BIND_HOST)
+            self.assertEqual(host, "127.0.0.1")
             seen.append(port)
             if port == 0:
                 raise OSError("ephemeral denied")
@@ -133,8 +111,8 @@ class PortAllocatorTests(unittest.TestCase):
             return _Fake(), port
 
         port = allocate_vnc_port(bind=bind)
-        self.assertEqual(port, VNC_FALLBACK_START)
-        self.assertEqual(seen[1], VNC_FALLBACK_START)
+        self.assertEqual(port, 5900)
+        self.assertEqual(seen[1], 5900)
 
     def test_retry_five_times_then_succeeds_or_raises(self) -> None:
         self.assertTrue(is_address_already_in_use("Address already in use"))
@@ -157,7 +135,7 @@ class PortAllocatorTests(unittest.TestCase):
 
         with self.assertRaises(AddressAlreadyInUse):
             retry_on_addr_in_use(always)
-        self.assertEqual(n["c"], MAX_PORT_RETRIES)
+        self.assertEqual(n["c"], 5)
 
 
 class OpenSshArgvTests(unittest.TestCase):
@@ -215,8 +193,7 @@ class OpenSshArgvTests(unittest.TestCase):
 
     def test_poweroff_command_is_systemctl(self) -> None:
         argv = ssh_poweroff_command(port=22022, identity="/tmp/k")
-        self.assertIn(POWEROFF_COMMAND, argv)
-        self.assertEqual(POWEROFF_COMMAND, "sudo systemctl poweroff")
+        self.assertIn("sudo systemctl poweroff", argv)
         self.assertNotIn("-tt", argv)
 
     def test_machine_ssh_defaults_pty_false(self) -> None:

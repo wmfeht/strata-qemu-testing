@@ -248,7 +248,6 @@ class MiseTomlTests(unittest.TestCase):
     def test_run_test_depends_is_check_host_only(self) -> None:
         depends = self.data["tasks"]["run-test"]["depends"]
         self.assertEqual(depends, ["check-host"])
-        self.assertNotIn("image-build", depends)
 
     def test_test_task_is_unittest_discover_without_check_host(self) -> None:
         task = self.data["tasks"]["test"]
@@ -257,10 +256,6 @@ class MiseTomlTests(unittest.TestCase):
             "python -m unittest discover -s tests -t . -v",
         )
         self.assertNotIn("depends", task)
-        depends = task.get("depends", [])
-        if isinstance(depends, str):
-            depends = [depends]
-        self.assertNotIn("check-host", depends)
 
     def test_argparse_proxy_tasks_have_raw_args(self) -> None:
         for name in ARGPARSE_PROXY_TASKS:
@@ -284,13 +279,10 @@ class MiseTomlTests(unittest.TestCase):
         self.assertIs(task["interactive"], True)
         self.assertIs(task["raw_args"], True)
         self.assertEqual(task["depends"], ["check-host"])
-        self.assertNotIn("image-build", task["depends"])
         self.assertEqual(
             task["run"],
             "python -m strataqemu spike-wayland-ubuntu",
         )
-        self.assertNotIn("SystemExit", task["run"])
-        self.assertNotEqual(task["run"], "python -c 'raise SystemExit(2)'")
 
     def test_bootstrap_gl_package_keys(self) -> None:
         packages = self.data["bootstrap"]["packages"]
@@ -345,16 +337,6 @@ class PyprojectTests(unittest.TestCase):
         project = data["project"]
         self.assertNotIn("dependencies", project)
         self.assertNotIn("optional-dependencies", project)
-        declared = []
-        for key in ("dependencies", "optional-dependencies"):
-            value = project.get(key)
-            if isinstance(value, list):
-                declared.extend(str(item) for item in value)
-            elif isinstance(value, dict):
-                declared.extend(str(item) for item in value)
-        blob = " ".join(declared).lower()
-        self.assertNotIn("paramiko", blob)
-        self.assertNotIn("pexpect", blob)
 
     def test_requires_python_311(self) -> None:
         data = tomllib.loads(

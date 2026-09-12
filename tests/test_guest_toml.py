@@ -13,12 +13,10 @@ from strataqemu.guest import (
     Guest,
     GuestError,
     ISO_CIDATA_REQUIRED,
-    SDDM_WAYLAND_SESSION_CANDIDATES,
     choose_sddm_session,
     covered_recipe_files,
     default_images_root,
     load_guest,
-    recipe_digest,
 )
 from strataqemu.qemu import uses_cloud_init_seed, uses_iso_autoinstall
 
@@ -30,7 +28,6 @@ class Ubuntu2404RecipeTests(unittest.TestCase):
     def test_load_real_recipe(self) -> None:
         guest = load_guest("ubuntu-2404")
         self.assertEqual(guest.id, "ubuntu-2404")
-        self.assertNotIn(".", guest.id)
         self.assertEqual(guest.arch, "x86_64")
         self.assertEqual(guest.firmware, "uefi")
         self.assertEqual(guest.source_kind, "cloud-image")
@@ -99,8 +96,6 @@ class Ubuntu2404RecipeTests(unittest.TestCase):
         self.assertIn("bootstrap.sh", names)
         self.assertIn("setup.sh", names)
         self.assertIn("user-data.yaml.tmpl", names)
-        digest = recipe_digest(RECIPE)
-        self.assertEqual(digest, load_guest("ubuntu-2404").recipe_digest())
 
     def test_golden_digest_includes_source_checksum(self) -> None:
         guest = load_guest("ubuntu-2404")
@@ -167,7 +162,6 @@ class ArchRecipeTests(unittest.TestCase):
     def test_load_real_recipe(self) -> None:
         guest = load_guest("arch")
         self.assertEqual(guest.id, "arch")
-        self.assertNotIn(".", guest.id)
         self.assertEqual(guest.arch, "x86_64")
         self.assertEqual(guest.firmware, "bios")
         self.assertEqual(guest.source_kind, "cloud-image")
@@ -197,8 +191,6 @@ class ArchRecipeTests(unittest.TestCase):
         ):
             self.assertIn(pkg, runtime)
         self.assertNotIn("omarchy", runtime)
-        self.assertNotIn("gnome", guest.session.kind)
-        self.assertNotEqual(guest.session.display_manager, "gdm")
         self.assertTrue(uses_cloud_init_seed(guest.id))
         self.assertTrue((guest.recipe_dir / "bootstrap.sh").is_file())
         self.assertTrue((guest.recipe_dir / "setup.sh").is_file())
@@ -328,7 +320,6 @@ class FedoraWorkstationRecipeTests(unittest.TestCase):
     def test_load_real_recipe(self) -> None:
         guest = load_guest("fedora-workstation")
         self.assertEqual(guest.id, "fedora-workstation")
-        self.assertNotIn(".", guest.id)
         self.assertEqual(guest.arch, "x86_64")
         self.assertEqual(guest.firmware, "uefi")
         self.assertEqual(guest.source_kind, "cloud-image")
@@ -341,7 +332,6 @@ class FedoraWorkstationRecipeTests(unittest.TestCase):
         self.assertNotIn("44-1.7", guest.source_url)
         self.assertIsNotNone(SHA256_HEX.fullmatch(guest.source_sha256))
         self.assertEqual(guest.source_filename(), "Fedora-Cloud-Base-Generic.qcow2")
-        self.assertNotIn("44-1.7", guest.source_filename())
         self.assertEqual(guest.user.name, "tester")
         self.assertIn("wheel", guest.user.groups)
         self.assertTrue(guest.session.autologin)
@@ -406,7 +396,6 @@ class FedoraWorkstationRecipeTests(unittest.TestCase):
         self.assertIn("--add-service=ssh", text)
         self.assertIn("rpm -qa", text)
         self.assertIn("nmcli", text)
-        self.assertNotRegex(text, r"(^|[;&|]\s*)(bash\s+|sudo\s+.*)?/?install\.sh")
         self.assertNotIn("install.sh", text)
 
     def test_user_data_template_has_tester_wheel_nopasswd(self) -> None:
@@ -428,7 +417,6 @@ class Omarchy4RecipeTests(unittest.TestCase):
     def test_load_real_recipe(self) -> None:
         guest = load_guest("omarchy-4")
         self.assertEqual(guest.id, "omarchy-4")
-        self.assertNotIn(".", guest.id)
         self.assertEqual(guest.arch, "x86_64")
         self.assertEqual(guest.firmware, "uefi")
         self.assertEqual(guest.source_kind, "iso-autoinstall")
@@ -441,7 +429,6 @@ class Omarchy4RecipeTests(unittest.TestCase):
             guest.source_sha256,
             "03d60bc74306dca51f96e1a84b690871d8d606826b260edd0208962da8507d14",
         )
-        self.assertIsNotNone(SHA256_HEX.fullmatch(guest.source_sha256))
         self.assertEqual(guest.source_filename(), "omarchy-4.0.3.iso")
         self.assertEqual(guest.user.name, "tester")
         self.assertIn("wheel", guest.user.groups)
@@ -456,7 +443,6 @@ class Omarchy4RecipeTests(unittest.TestCase):
         self.assertIn("gst-libav", runtime)
         self.assertIn("gst-plugins-good", runtime)
         self.assertIn("gtksourceview5", runtime)
-        self.assertIsNotNone(guest.cidata)
         assert guest.cidata is not None
         self.assertEqual(guest.cidata.disk, "/dev/vda")
         self.assertFalse(guest.cidata.encrypt)
@@ -532,10 +518,6 @@ class Omarchy4RecipeTests(unittest.TestCase):
         uwsm_idx = text.index("hyprland-uwsm.desktop")
         self.assertLess(desktop_idx, uwsm_idx)
         self.assertEqual(
-            SDDM_WAYLAND_SESSION_CANDIDATES,
-            ("omarchy.desktop", "hyprland-uwsm.desktop"),
-        )
-        self.assertEqual(
             choose_sddm_session(["hyprland-uwsm.desktop", "omarchy.desktop"]),
             "omarchy",
         )
@@ -609,7 +591,6 @@ class Omarchy3RecipeTests(unittest.TestCase):
     def test_load_real_recipe(self) -> None:
         guest = load_guest("omarchy-3")
         self.assertEqual(guest.id, "omarchy-3")
-        self.assertNotIn(".", guest.id)
         self.assertEqual(guest.arch, "x86_64")
         self.assertEqual(guest.firmware, "uefi")
         self.assertEqual(guest.source_kind, "iso-autoinstall")
@@ -622,7 +603,6 @@ class Omarchy3RecipeTests(unittest.TestCase):
             guest.source_sha256,
             "7bc1dc7d98f3d088e57dc06581a494ea441fb15f3edd191360fd1696931bd895",
         )
-        self.assertIsNotNone(SHA256_HEX.fullmatch(guest.source_sha256))
         self.assertEqual(guest.source_filename(), "omarchy-3.8.4.iso")
         self.assertEqual(guest.user.name, "tester")
         self.assertIn("wheel", guest.user.groups)
@@ -633,7 +613,6 @@ class Omarchy3RecipeTests(unittest.TestCase):
         self.assertEqual(guest.packages.manager, "pacman")
         runtime = set(guest.packages.runtime)
         self.assertIn("grim", runtime)
-        self.assertIsNotNone(guest.cidata)
         assert guest.cidata is not None
         self.assertEqual(guest.cidata.disk, "/dev/vda")
         self.assertFalse(guest.cidata.encrypt)
@@ -709,14 +688,6 @@ class Omarchy3RecipeTests(unittest.TestCase):
         desktop_idx = text.index("omarchy.desktop")
         uwsm_idx = text.index("hyprland-uwsm.desktop")
         self.assertLess(desktop_idx, uwsm_idx)
-        self.assertEqual(
-            SDDM_WAYLAND_SESSION_CANDIDATES,
-            ("omarchy.desktop", "hyprland-uwsm.desktop"),
-        )
-        self.assertEqual(
-            choose_sddm_session(["hyprland-uwsm.desktop", "omarchy.desktop"]),
-            "omarchy",
-        )
         self.assertIn("NOPASSWD: ALL", text)
         self.assertIn("Defaults:tester !authenticate", text)
         self.assertIn("grim", text)

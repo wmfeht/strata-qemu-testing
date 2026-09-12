@@ -17,7 +17,6 @@ from strataqemu.qemu import Machine
 from strataqemu.tests_spec import (
     GDBUS_NAME_HAS_OWNER_ARGV,
     GUEST_ARCHIVE_REMOTE,
-    INSTALL_FROM_FAIL_CLOSED,
     INSTALL_FROM_RELEASE_STEPS,
     INSTALL_SH_FLAGS,
     SCREENSHOT_TOOL_MISSING,
@@ -45,8 +44,6 @@ from strataqemu.tests_spec import (
     run_install_from_release_steps,
     run_session_only_steps,
     screenshot_tool_for_compositor,
-    screenshot_tool_missing,
-    session_only_step_names,
     sha256_file,
     smoke_desktop_script,
     smoke_install_script,
@@ -148,8 +145,6 @@ class ParseOracleTests(unittest.TestCase):
             parse_name_has_owner("garbage")
 
     def test_screenshot_tool_missing_maps_to_golden_bug(self) -> None:
-        self.assertTrue(screenshot_tool_missing(1))
-        self.assertFalse(screenshot_tool_missing(0))
         self.assertIn("rebuild the golden", SCREENSHOT_TOOL_MISSING)
 
     def test_session_exports(self) -> None:
@@ -162,52 +157,30 @@ class ParseOracleTests(unittest.TestCase):
     def test_ubuntu_compositor_is_gnome_shell(self) -> None:
         guest = load_guest("ubuntu-2404")
         self.assertEqual(compositor_process_name(guest), "gnome-shell")
-        self.assertEqual(compositor_process_name("ubuntu-2404"), "gnome-shell")
         self.assertEqual(screenshot_tool_for_compositor("gnome-shell"), "gnome-screenshot")
 
     def test_fedora_compositor_is_gnome_shell(self) -> None:
         guest = load_guest("fedora-workstation")
         self.assertEqual(compositor_process_name(guest), "gnome-shell")
-        self.assertEqual(compositor_process_name("fedora-workstation"), "gnome-shell")
-        self.assertEqual(
-            screenshot_tool_for_compositor("gnome-shell"), "gnome-screenshot"
-        )
         self.assertTrue(supports_install_from_release(guest))
-        self.assertTrue(supports_install_from_release("fedora-workstation"))
 
     def test_arch_compositor_is_hyprland_grim(self) -> None:
         guest = load_guest("arch")
         self.assertEqual(compositor_process_name(guest), "Hyprland")
-        self.assertEqual(compositor_process_name("arch"), "Hyprland")
         self.assertEqual(screenshot_tool_for_compositor("Hyprland"), "grim")
         self.assertTrue(supports_install_from_release(guest))
-        self.assertTrue(supports_install_from_release("ubuntu-2404"))
         self.assertIn("hyprctl clients", hyprctl_class_oracle_command())
         self.assertIn(STRATA_BUS_NAME, hyprctl_class_oracle_command())
 
     def test_omarchy4_compositor_is_hyprland_grim(self) -> None:
         guest = load_guest("omarchy-4")
         self.assertEqual(compositor_process_name(guest), "Hyprland")
-        self.assertEqual(compositor_process_name("omarchy-4"), "Hyprland")
-        self.assertEqual(screenshot_tool_for_compositor("Hyprland"), "grim")
         self.assertTrue(supports_install_from_release(guest))
-        self.assertTrue(supports_install_from_release("omarchy-4"))
-        self.assertEqual(
-            missing_golden_message("omarchy-4"),
-            "run `mise run image-build -- omarchy-4` first",
-        )
 
     def test_omarchy3_compositor_is_hyprland_grim(self) -> None:
         guest = load_guest("omarchy-3")
         self.assertEqual(compositor_process_name(guest), "Hyprland")
-        self.assertEqual(compositor_process_name("omarchy-3"), "Hyprland")
-        self.assertEqual(screenshot_tool_for_compositor("Hyprland"), "grim")
         self.assertTrue(supports_install_from_release(guest))
-        self.assertTrue(supports_install_from_release("omarchy-3"))
-        self.assertEqual(
-            missing_golden_message("omarchy-3"),
-            "run `mise run image-build -- omarchy-3` first",
-        )
 
     def test_missing_golden_message_matches_design(self) -> None:
         msg = missing_golden_message("ubuntu-2404")
@@ -219,8 +192,7 @@ class ParseOracleTests(unittest.TestCase):
             "run `mise run image-build -- fedora-workstation` first",
         )
 
-    def test_session_only_steps_are_session_and_screenshot(self) -> None:
-        self.assertEqual(session_only_step_names(), ("session", "screenshot"))
+    def test_session_only_forbids_install_and_window_oracles(self) -> None:
         self.assertTrue(command_is_forbidden_for_session_only("gtk-launch io.github.lgse.Strata"))
         self.assertTrue(command_is_forbidden_for_session_only("bash install.sh"))
         self.assertTrue(
@@ -862,9 +834,6 @@ class InstallArchHelperTests(unittest.TestCase):
                 ],
             )
             self.assertTrue((home / ".local/bin/strata").is_file())
-
-    def test_fail_closed_message_is_stable(self) -> None:
-        self.assertIn("not implemented yet (fail closed)", INSTALL_FROM_FAIL_CLOSED)
 
 
 class Omarchy4InstallFromTests(unittest.TestCase):

@@ -96,7 +96,6 @@ class SelectWaylandSessionTests(unittest.TestCase):
             ssh_session_id=SSH_SID,
         )
         self.assertEqual(sid, WAYLAND_SID)
-        self.assertNotEqual(sid, SSH_SID)
 
     def test_unspecified_ssh_session_is_not_selected(self) -> None:
         sid = select_wayland_session(
@@ -106,7 +105,6 @@ class SelectWaylandSessionTests(unittest.TestCase):
             ssh_session_id=SSH_SID,
         )
         self.assertEqual(sid, WAYLAND_SID)
-        self.assertNotEqual(sid, SSH_SID)
 
     def test_x11_is_hard_fail(self) -> None:
         with self.assertRaises(SessionError) as ctx:

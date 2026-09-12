@@ -37,7 +37,6 @@ class OverlayArgvTests(unittest.TestCase):
             # Relative golden must still become absolute in -b.
             rel_golden = os.path.relpath(golden, os.getcwd())
             argv = create_overlay_argv(rel_golden, overlay)
-        self.assertEqual(argv[0], "qemu-img")
         self.assertEqual(
             argv,
             [
@@ -54,8 +53,6 @@ class OverlayArgvTests(unittest.TestCase):
                 str(overlay),
             ],
         )
-        self.assertTrue(Path(argv[argv.index("-b") + 1]).is_absolute())
-        self.assertIn("backing_file_strict=on", argv)
 
     def test_without_strict_keeps_absolute_backing(self) -> None:
         argv = [
@@ -75,20 +72,7 @@ class OverlayArgvTests(unittest.TestCase):
         self.assertNotIn("backing_file_strict=on", fallback)
         self.assertIn("-b", fallback)
         self.assertEqual(fallback[fallback.index("-b") + 1], "/abs/golden.qcow2")
-        self.assertTrue(Path(fallback[fallback.index("-b") + 1]).is_absolute())
         self.assertEqual(fallback[-1], "overlay.qcow2")
-
-    def test_create_does_not_invoke_qemu_system(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            golden = tmp / "g.qcow2"
-            golden.write_bytes(b"g")
-            overlay = tmp / "o.qcow2"
-            argv = create_overlay_argv(golden, overlay)
-        self.assertFalse(
-            any(Path(str(tok)).name.startswith("qemu-system") for tok in argv)
-        )
-        self.assertEqual(Path(argv[0]).name, "qemu-img")
 
 
 class OverlayLiveCreateTests(unittest.TestCase):

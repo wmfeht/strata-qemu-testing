@@ -62,7 +62,6 @@ class DefaultGlArgvTests(unittest.TestCase):
         self.assertEqual(_after(argv, "-display"), "egl-headless,gl=on")
         vnc = _after(argv, "-vnc")
         self.assertEqual(vnc, "127.0.0.1:5901")
-        self.assertNotIn("0.0.0.0", vnc)
         self.assertFalse(any("0.0.0.0" in tok for tok in argv))
 
         drives = _all_after(argv, "-drive")
@@ -167,7 +166,6 @@ class IsoAutoinstallTests(unittest.TestCase):
         )
         for guest in ("omarchy-4", "omarchy-3"):
             with self.subTest(guest=guest):
-                self.assertTrue(uses_iso_autoinstall(guest), guest)
                 with tempfile.TemporaryDirectory() as td:
                     tmp = Path(td)
                     iso = tmp / f"{guest}.iso"

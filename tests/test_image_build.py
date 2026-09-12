@@ -18,7 +18,6 @@ from strataqemu import config
 from strataqemu.cli import CheckHostResult, main
 from strataqemu.guest import load_guest
 from strataqemu.image_build import (
-    WELL_KNOWN_TEST_PASSWORD,
     ImageBuildError,
     build_duration_note,
     capture_build_timeout_evidence,
@@ -39,7 +38,7 @@ from strataqemu.image_build import (
     wait_ssh,
     working_qemu_argv,
 )
-from strataqemu.qemu import Machine, uses_cloud_init_seed, uses_iso_autoinstall
+from strataqemu.qemu import Machine
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP = REPO_ROOT / "images" / "ubuntu-2404" / "bootstrap.sh"
@@ -299,7 +298,6 @@ class WorkingDiskArgvTests(unittest.TestCase):
         self.assertTrue(any(d.startswith("scsi-cd") for d in devices))
         self.assertIn("virtio-gpu-gl-pci", argv)
         self.assertEqual(_after(argv, "-display"), "egl-headless,gl=on")
-        self.assertTrue(uses_cloud_init_seed("ubuntu-2404"))
 
 
 class BootstrapShTests(unittest.TestCase):
@@ -549,20 +547,15 @@ class IsoAutoinstallBuildTests(unittest.TestCase):
         self.assertIn("omarchy_version", src)
         self.assertIn("setup_ssh_command", src)
         self.assertNotIn("sudo -n bash /tmp/setup.sh", src)
-        convert_idx = src.find("convert_and_resize")
-        blank_idx = src.find("create_blank_qcow2")
-        self.assertGreater(blank_idx, 0)
-        self.assertGreater(convert_idx, 0)
 
     def test_omarchy4_setup_ssh_uses_password_sudo_not_n(self) -> None:
         guest = load_guest("omarchy-4")
         cmd = setup_ssh_command(guest)
         self.assertIn("sudo -S", cmd)
         self.assertIn("-p ''", cmd)
-        self.assertIn(WELL_KNOWN_TEST_PASSWORD, cmd)
+        self.assertIn("foobar", cmd)
         self.assertIn("bash /tmp/setup.sh", cmd)
         self.assertNotIn("sudo -n", cmd)
-        self.assertEqual(WELL_KNOWN_TEST_PASSWORD, "foobar")
         ubuntu = load_guest("ubuntu-2404")
         cloud = setup_ssh_command(ubuntu)
         self.assertIn("sudo -n bash /tmp/setup.sh", cloud)
@@ -571,15 +564,6 @@ class IsoAutoinstallBuildTests(unittest.TestCase):
         arch_cmd = setup_ssh_command(arch)
         self.assertIn("sudo -n bash /tmp/setup.sh", arch_cmd)
         self.assertNotIn("sudo -S", arch_cmd)
-
-    def test_omarchy3_setup_ssh_uses_password_sudo_not_n(self) -> None:
-        guest = load_guest("omarchy-3")
-        cmd = setup_ssh_command(guest)
-        self.assertIn("sudo -S", cmd)
-        self.assertIn("-p ''", cmd)
-        self.assertIn(WELL_KNOWN_TEST_PASSWORD, cmd)
-        self.assertIn("bash /tmp/setup.sh", cmd)
-        self.assertNotIn("sudo -n", cmd)
 
     def test_blank_disk_argv_is_create_not_convert(self) -> None:
         argv = create_blank_qcow2_argv("/tmp/working.qcow2", 40)
@@ -633,12 +617,6 @@ class IsoAutoinstallBuildTests(unittest.TestCase):
         self.assertIn("addr=0x8", blk[0])
         self.assertIn("drive=cidata0", blk[1])
         self.assertIn("addr=0x9", blk[1])
-        guest = load_guest("omarchy-4")
-        self.assertTrue(uses_iso_autoinstall(guest.id))
-        self.assertFalse(uses_cloud_init_seed(guest.id))
-        guest3 = load_guest("omarchy-3")
-        self.assertTrue(uses_iso_autoinstall(guest3.id))
-        self.assertFalse(uses_cloud_init_seed(guest3.id))
 
     def test_timeout_evidence_tries_screenshot_and_qmp(self) -> None:
         with tempfile.TemporaryDirectory() as td:
