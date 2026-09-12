@@ -118,6 +118,35 @@ screenshot.
 The version step is recorded as skipped if `strata --version` does not
 behave like a command-line flag.
 
+`--install-from` does not probe Omarchy version detection or rewrite
+Hyprland bindings. Use `--omarchy-bindings` for that.
+
+### Omarchy bindings
+
+```bash
+mise run run-test -- omarchy-4 --omarchy-bindings
+STRATA_QEMU_INSTALL_SH=~/dev/strata/install.sh \
+  mise run run-test -- omarchy-3 --omarchy-bindings
+```
+
+Omarchy guests only (`omarchy-3`, `omarchy-4`). Exclusive with
+`--session-only` and `--install-from`. Does not install or launch Strata.
+
+The guest sources `install.sh` (curled from `lgse/strata` `main`, or a
+host copy uploaded from `STRATA_QEMU_INSTALL_SH`) and:
+
+1. checks that `detect_omarchy_major` matches the guest (4 or 3);
+2. probes `omarchy_major_from` on whole `N.M` tokens and on
+   `dev (b280f130)` (lgse/strata#743 / #652);
+3. writes and asserts Hyprland file-manager bindings (`bindings.lua` on 4,
+   `bindings.conf` on 3; the unused sibling must not carry the installer
+   marker);
+4. takes a session screenshot.
+
+Point `STRATA_QEMU_INSTALL_SH` at a PR checkout when `main` does not yet
+include `omarchy_major_from`; the token probes fail closed against the
+pre-#743 installer.
+
 ### Output
 
 On success `run-test` prints the guest, the screenshot path, and the run
@@ -204,6 +233,7 @@ the command.
 | `mise run run-test -- <guest> --session-only [--keep]` | Session and screenshot smoke. |
 | `mise run run-test -- <guest> --install-from release [--keep]` | Install from the latest GitHub release. |
 | `mise run run-test -- <guest> --install-from local-archive PATH [--keep]` | Install from a host tarball. |
+| `mise run run-test -- omarchy-3\|omarchy-4 --omarchy-bindings [--keep]` | Probe Omarchy detection and Hyprland bindings (optional `STRATA_QEMU_INSTALL_SH`). |
 | `mise run vm-run -- <guest> [--graphical] [--keep]` | Interactive throwaway overlay. |
 | `mise run image-prune [-- --images]` | Delete run directories (and goldens). |
 | `mise run test` | Host unit tests. |

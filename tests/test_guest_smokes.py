@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import socket
 import stat
@@ -12,12 +13,21 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from strataqemu.tests_spec import parse_install_sh_sha256
+from strataqemu.tests_spec import (
+    OMARCHY_DEV_HASH_OUTPUT,
+    OMARCHY_TOKEN_CASES,
+    parse_install_sh_sha256,
+    parse_smoke_kv,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SMOKE_SESSION = REPO_ROOT / "guest-tests" / "smoke-session.sh"
 SMOKE_DESKTOP = REPO_ROOT / "guest-tests" / "smoke-desktop.sh"
 SMOKE_INSTALL = REPO_ROOT / "guest-tests" / "smoke-install.sh"
+SMOKE_OMARCHY_DETECT = REPO_ROOT / "guest-tests" / "smoke-omarchy-detect.sh"
+SMOKE_OMARCHY_BINDINGS = REPO_ROOT / "guest-tests" / "smoke-omarchy-bindings.sh"
+FIXTURE_PR743 = REPO_ROOT / "tests" / "fixtures" / "omarchy-detect" / "install-pr743.sh"
+FIXTURE_MAIN = REPO_ROOT / "tests" / "fixtures" / "omarchy-detect" / "install-main.sh"
 UID = 1000
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
@@ -590,6 +600,137 @@ class SmokeInstallScriptTests(unittest.TestCase):
             ],
         )
         self.assertTrue((home / ".local/bin/strata").is_file())
+
+
+def _share_omarchy_major() -> str:
+    """Major that PR #743 would read from the host version file, if any."""
+    path = Path("/usr/share/omarchy/version")
+    if not path.is_file():
+        return ""
+    text = path.read_text(encoding="utf-8")
+    match = re.search(r"(^|[^0-9.])([34])[.][0-9]+", text)
+    return match.group(2) if match else ""
+
+
+class SmokeOmarchyDetectScriptTests(unittest.TestCase):
+    def test_scripts_are_executable(self) -> None:
+        self.assertTrue(SMOKE_OMARCHY_DETECT.is_file())
+        self.assertTrue(os.access(SMOKE_OMARCHY_DETECT, os.X_OK))
+        self.assertTrue(SMOKE_OMARCHY_BINDINGS.is_file())
+        self.assertTrue(os.access(SMOKE_OMARCHY_BINDINGS, os.X_OK))
+
+    def _detect(
+        self, case: str, install_sh: Path, extra_env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        env = {
+            **os.environ,
+            "INSTALL_SH": str(install_sh),
+            "SMOKE_OMARCHY_CASE": case,
+        }
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            ["bash", str(SMOKE_OMARCHY_DETECT)],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_token_cases_against_pr743_fixture(self) -> None:
+        for token, expected in OMARCHY_TOKEN_CASES:
+            with self.subTest(token=token):
+                completed = self._detect(
+                    "token", FIXTURE_PR743, {"SMOKE_OMARCHY_OUTPUT": token}
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(
+                    parse_smoke_kv(completed.stdout, "DETECTED_MAJOR"), expected
+                )
+
+    def test_token_case_fails_on_main_fixture(self) -> None:
+        completed = self._detect(
+            "token", FIXTURE_MAIN, {"SMOKE_OMARCHY_OUTPUT": "4.0.0-1"}
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("omarchy_major_from missing", completed.stderr)
+
+    def test_command_hash_pr743_falls_back_to_version_file(self) -> None:
+        completed = self._detect(
+            "command",
+            FIXTURE_PR743,
+            {"SMOKE_OMARCHY_OUTPUT": OMARCHY_DEV_HASH_OUTPUT},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        got = parse_smoke_kv(completed.stdout, "DETECTED_MAJOR")
+        self.assertEqual(got, _share_omarchy_major())
+
+    def test_command_hash_main_fixture_is_three(self) -> None:
+        completed = self._detect(
+            "command",
+            FIXTURE_MAIN,
+            {"SMOKE_OMARCHY_OUTPUT": OMARCHY_DEV_HASH_OUTPUT},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(parse_smoke_kv(completed.stdout, "DETECTED_MAJOR"), "3")
+
+
+class SmokeOmarchyBindingsScriptTests(unittest.TestCase):
+    def _run(
+        self, major: str, extra_env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        env = {**os.environ, "SMOKE_OMARCHY_MAJOR": major}
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            ["bash", str(SMOKE_OMARCHY_BINDINGS)],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_omarchy_3_write_uses_bindings_conf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            (home / ".config" / "hypr").mkdir(parents=True)
+            completed = self._run(
+                "3",
+                {
+                    "HOME": str(home),
+                    "INSTALL_SH": str(FIXTURE_PR743),
+                    "SMOKE_WRITE_BINDINGS": "1",
+                },
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(parse_smoke_kv(completed.stdout, "BINDINGS_KIND"), "conf")
+            self.assertTrue((home / ".config" / "hypr" / "bindings.conf").is_file())
+            self.assertFalse((home / ".config" / "hypr" / "bindings.lua").exists())
+            conf = (home / ".config" / "hypr" / "bindings.conf").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("strata-installer: file-manager start", conf)
+
+    def test_omarchy_4_write_uses_bindings_lua_not_conf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            (home / ".config" / "hypr").mkdir(parents=True)
+            completed = self._run(
+                "4",
+                {
+                    "HOME": str(home),
+                    "INSTALL_SH": str(FIXTURE_PR743),
+                    "SMOKE_WRITE_BINDINGS": "1",
+                },
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(parse_smoke_kv(completed.stdout, "BINDINGS_KIND"), "lua")
+            self.assertTrue((home / ".config" / "hypr" / "bindings.lua").is_file())
+            self.assertFalse((home / ".config" / "hypr" / "bindings.conf").exists())
+            lua = (home / ".config" / "hypr" / "bindings.lua").read_text(encoding="utf-8")
+            self.assertIn("strata-installer: file-manager start", lua)
 
 
 if __name__ == "__main__":

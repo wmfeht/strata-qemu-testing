@@ -3,8 +3,10 @@
 Injectable SSH/run-dir so host unittests never spawn QEMU. ``--session-only``
 runs session + in-guest screenshot; it does not gtk-launch Strata, run
 ``install.sh``, or wait on the application bus name. ``--install-from``
-release/local-archive on ``arch``, ``ubuntu-2404``, and ``fedora-workstation``
-runs session → install → version → desktop-entry → window.
+release/local-archive on ``arch``, ``ubuntu-2404``, ``fedora-workstation``,
+``omarchy-3``, and ``omarchy-4`` runs session → install → version →
+desktop-entry → window. ``--omarchy-bindings`` is a separate Omarchy-only
+flow (lgse/strata#743): session → detect → write/check Hyprland bindings.
 """
 
 from __future__ import annotations
@@ -52,6 +54,26 @@ INSTALL_FROM_RELEASE_STEPS = (
     "desktop-entry",
     "window",
 )
+OMARCHY_BINDINGS_STEPS = (
+    "session",
+    "omarchy-detect",
+    "omarchy-bindings",
+    "screenshot",
+)
+OMARCHY_BINDINGS_GUESTS = frozenset({"omarchy-4", "omarchy-3"})
+# Whole N.M token cases for omarchy_major_from (lgse/strata#743 / #652).
+OMARCHY_TOKEN_CASES: tuple[tuple[str, str], ...] = (
+    ("4.0.0-1", "4"),
+    ("4.0.0.alpha", "4"),
+    ("3.8.5", "3"),
+    ("1:4.0.0-1", "4"),
+    ("Omarchy 2.3.1", ""),
+    ("5.4.0", ""),
+    ("dev (b280f130)", ""),
+)
+OMARCHY_DEV_HASH_OUTPUT = "dev (b280f130)"
+GUEST_INSTALL_SH_REMOTE = "/tmp/strata-install.sh"
+OMARCHY_BINDINGS_MARKER = "strata-installer: file-manager start"
 INSTALL_FROM_RELEASE_GUESTS = frozenset(
     {
         "arch",
@@ -65,6 +87,13 @@ VERSION_CLI_RE = re.compile(r"^(strata\s+)?v?\d+\.\d+", re.IGNORECASE)
 INSTALL_FROM_FAIL_CLOSED = (
     "run-test: --install-from is not supported for this guest; "
     "use --session-only"
+)
+OMARCHY_BINDINGS_FAIL_CLOSED = (
+    "run-test: --omarchy-bindings is only supported for omarchy-3 and omarchy-4"
+)
+OMARCHY_BINDINGS_EXCLUSIVE = (
+    "run-test: --omarchy-bindings cannot be combined with "
+    "--session-only or --install-from"
 )
 INSTALL_SH_SHA256_PREFIX = "INSTALL_SH_SHA256="
 INSTALL_SH_URL = "https://raw.githubusercontent.com/lgse/strata/main/install.sh"
@@ -85,6 +114,9 @@ _ARCHIVE_TARGET_MARKERS = (
 )
 LOCAL_ARCHIVE_MISSING_PATH = (
     "run-test: --install-from local-archive requires a host archive path"
+)
+INSTALL_SH_MISSING_PATH = (
+    "run-test: STRATA_QEMU_INSTALL_SH is set but the file is missing"
 )
 # Substrings that must not appear in --session-only guest commands.
 SESSION_ONLY_FORBIDDEN = (
@@ -131,6 +163,28 @@ def smoke_desktop_script() -> Path:
 
 def smoke_install_script() -> Path:
     return guest_tests_dir() / "smoke-install.sh"
+
+
+def smoke_omarchy_detect_script() -> Path:
+    return guest_tests_dir() / "smoke-omarchy-detect.sh"
+
+
+def smoke_omarchy_bindings_script() -> Path:
+    return guest_tests_dir() / "smoke-omarchy-bindings.sh"
+
+
+def omarchy_install_major(guest: Guest | str) -> int | None:
+    """Installer major the guest recipe is supposed to look like, or None."""
+    guest_id = guest.id if isinstance(guest, Guest) else guest
+    if guest_id == "omarchy-4":
+        return 4
+    if guest_id == "omarchy-3":
+        return 3
+    return None
+
+
+def supports_omarchy_bindings(guest: Guest | str) -> bool:
+    return omarchy_install_major(guest) is not None
 
 
 def missing_golden_message(guest_id: str) -> str:
@@ -252,6 +306,292 @@ def install_smoke_command(
     prefix = "SMOKE_FORBID_OMARCHY=1 " if forbid_omarchy else ""
     flags = " ".join(shlex.quote(part) for part in install_sh_argv(archive=archive))
     return f"{prefix}bash /tmp/smoke-install.sh {flags}".rstrip()
+
+
+def omarchy_detect_command(
+    *,
+    case: str = "live",
+    install_sh: str = GUEST_INSTALL_SH_REMOTE,
+    output: str | None = None,
+    user_version: str | None = None,
+) -> str:
+    """Host-side SSH command that runs the uploaded Omarchy detect smoke."""
+    parts = [
+        f"INSTALL_SH={shlex.quote(install_sh)}",
+        f"SMOKE_OMARCHY_CASE={shlex.quote(case)}",
+    ]
+    if output is not None:
+        parts.append(f"SMOKE_OMARCHY_OUTPUT={shlex.quote(output)}")
+    if user_version is not None:
+        parts.append(f"SMOKE_USER_VERSION={shlex.quote(user_version)}")
+    parts.append("bash /tmp/smoke-omarchy-detect.sh")
+    return " ".join(parts)
+
+
+def omarchy_bindings_command(
+    major: int,
+    *,
+    write: bool = False,
+    install_sh: str = GUEST_INSTALL_SH_REMOTE,
+) -> str:
+    parts = [f"SMOKE_OMARCHY_MAJOR={int(major)}"]
+    if write:
+        parts.append("SMOKE_WRITE_BINDINGS=1")
+        parts.append(f"INSTALL_SH={shlex.quote(install_sh)}")
+    parts.append("bash /tmp/smoke-omarchy-bindings.sh")
+    return " ".join(parts)
+
+
+def parse_smoke_kv(text: str, key: str) -> str:
+    """Read ``KEY=value`` from guest-smoke stdout. Empty values are allowed."""
+    prefix = f"{key}="
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith(prefix):
+            return line.split("=", 1)[1]
+    raise SessionSmokeError(f"smoke did not print {key}=")
+
+
+def run_omarchy_install_oracles(
+    machine: Machine,
+    *,
+    major: int,
+    probe_pr743: bool = True,
+    write_bindings: bool = True,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+) -> tuple[list[dict], dict]:
+    """``omarchy-detect`` then write/check ``omarchy-bindings``.
+
+    Used only by ``--omarchy-bindings``, not by ``--install-from``.
+    """
+    recorded = commands if commands is not None else []
+    steps: list[dict] = []
+    extras: dict = {}
+
+    detect_helper = smoke_omarchy_detect_script()
+    if not detect_helper.is_file():
+        raise SessionSmokeError(f"missing Omarchy detect smoke {detect_helper}")
+    scp_to_guest(
+        machine,
+        detect_helper,
+        "/tmp/smoke-omarchy-detect.sh",
+        run=run,
+        commands=recorded,
+    )
+    started = time.monotonic()
+    live = ssh_run(
+        machine,
+        omarchy_detect_command(case="live"),
+        timeout=15,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    detected = parse_smoke_kv(f"{live.stdout}{live.stderr}", "DETECTED_MAJOR")
+    expected = str(major)
+    if detected != expected:
+        raise SessionSmokeError(
+            f"omarchy-detect: live major {detected!r}, expected {expected}"
+        )
+    if probe_pr743:
+        for output, want in OMARCHY_TOKEN_CASES:
+            token = ssh_run(
+                machine,
+                omarchy_detect_command(case="token", output=output),
+                timeout=15,
+                check=True,
+                run=run,
+                commands=recorded,
+            )
+            got = parse_smoke_kv(f"{token.stdout}{token.stderr}", "DETECTED_MAJOR")
+            if got != want:
+                raise SessionSmokeError(
+                    f"omarchy-detect: token {output!r} detected {got!r}, "
+                    f"expected {want!r} (lgse/strata#743)"
+                )
+        hashed = ssh_run(
+            machine,
+            omarchy_detect_command(
+                case="command", output=OMARCHY_DEV_HASH_OUTPUT
+            ),
+            timeout=15,
+            check=True,
+            run=run,
+            commands=recorded,
+        )
+        got_hash = parse_smoke_kv(
+            f"{hashed.stdout}{hashed.stderr}", "DETECTED_MAJOR"
+        )
+        if got_hash != expected:
+            raise SessionSmokeError(
+                f"omarchy-detect: {OMARCHY_DEV_HASH_OUTPUT!r} detected "
+                f"{got_hash!r}, expected {expected} from the version file "
+                "(lgse/strata#743)"
+            )
+        extras["omarchy_pr743_probes"] = "pass"
+    steps.append(
+        {
+            "name": "omarchy-detect",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+            "detected_major": detected,
+            "oracle": "detect_omarchy_major",
+        }
+    )
+    extras["omarchy_major"] = detected
+
+    bind_helper = smoke_omarchy_bindings_script()
+    if not bind_helper.is_file():
+        raise SessionSmokeError(
+            f"missing Omarchy bindings smoke {bind_helper}"
+        )
+    scp_to_guest(
+        machine,
+        bind_helper,
+        "/tmp/smoke-omarchy-bindings.sh",
+        run=run,
+        commands=recorded,
+    )
+    started = time.monotonic()
+    bindings = ssh_run(
+        machine,
+        omarchy_bindings_command(major, write=write_bindings),
+        timeout=15,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    kind = parse_smoke_kv(f"{bindings.stdout}{bindings.stderr}", "BINDINGS_KIND")
+    path = parse_smoke_kv(f"{bindings.stdout}{bindings.stderr}", "BINDINGS_PATH")
+    want_kind = "lua" if major == 4 else "conf"
+    if kind != want_kind:
+        raise SessionSmokeError(
+            f"omarchy-bindings: kind {kind!r}, expected {want_kind} "
+            f"for Omarchy {major}"
+        )
+    steps.append(
+        {
+            "name": "omarchy-bindings",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+            "kind": kind,
+            "path": path,
+        }
+    )
+    extras["omarchy_bindings"] = kind
+    return steps, extras
+
+
+def stage_guest_install_sh(
+    machine: Machine,
+    *,
+    install_sh_path: Path | str | None,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+) -> None:
+    """Put ``install.sh`` at ``GUEST_INSTALL_SH_REMOTE``. Never pipe curl to bash."""
+    recorded = commands if commands is not None else []
+    if install_sh_path is not None:
+        src = Path(install_sh_path)
+        if not src.is_file():
+            raise SessionSmokeError(f"run-test: install.sh not found: {src}")
+        scp_to_guest(
+            machine,
+            src,
+            GUEST_INSTALL_SH_REMOTE,
+            run=run,
+            commands=recorded,
+        )
+        return
+    ssh_run(
+        machine,
+        (
+            f"curl -fsSL {shlex.quote(INSTALL_SH_URL)} "
+            f"-o {shlex.quote(GUEST_INSTALL_SH_REMOTE)}"
+        ),
+        timeout=60,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+
+
+def run_omarchy_bindings_steps(
+    machine: Machine,
+    *,
+    guest: Guest,
+    screenshot_dest: Path,
+    qmp_dest: Path | None = None,
+    session_timeout: float = SESSION_TIMEOUT_S,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    install_sh_path: Path | str | None = None,
+) -> tuple[list[dict], dict]:
+    """session → detect (#743 probes) → write/check bindings → screenshot."""
+    major = omarchy_install_major(guest)
+    if major is None:
+        raise SessionSmokeError(OMARCHY_BINDINGS_FAIL_CLOSED)
+    compositor = compositor_process_name(guest)
+    recorded = commands if commands is not None else []
+    steps: list[dict] = []
+
+    started = time.monotonic()
+    exports = run_session_step(
+        machine,
+        compositor=compositor,
+        timeout=session_timeout,
+        run=run,
+        commands=recorded,
+        sleep=sleep,
+    )
+    steps.append(
+        {
+            "name": "session",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+            "sid": exports.get("SESSION_ID"),
+        }
+    )
+    env = session_env_from_exports(exports)
+    stage_guest_install_sh(
+        machine,
+        install_sh_path=install_sh_path,
+        run=run,
+        commands=recorded,
+    )
+    extra_steps, extras = run_omarchy_install_oracles(
+        machine,
+        major=major,
+        probe_pr743=True,
+        write_bindings=True,
+        run=run,
+        commands=recorded,
+    )
+    steps.extend(extra_steps)
+
+    shot_started = time.monotonic()
+    capture_guest_screenshot(
+        machine,
+        env,
+        screenshot_dest,
+        tool=screenshot_tool_for_compositor(compositor),
+        run=run,
+        commands=recorded,
+    )
+    if qmp_dest is not None:
+        extra_qmp_screendump(machine, qmp_dest)
+    steps.append(
+        {
+            "name": "screenshot",
+            "status": "pass",
+            "seconds": round(time.monotonic() - shot_started, 1),
+            "path": str(screenshot_dest),
+        }
+    )
+    extras["screenshot"] = str(screenshot_dest)
+    return steps, extras
 
 
 def strata_version_is_cli(returncode: int, output: str) -> bool:

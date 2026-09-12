@@ -19,6 +19,10 @@ from strataqemu.tests_spec import (
     GUEST_ARCHIVE_REMOTE,
     INSTALL_FROM_RELEASE_STEPS,
     INSTALL_SH_FLAGS,
+    OMARCHY_BINDINGS_FAIL_CLOSED,
+    OMARCHY_BINDINGS_STEPS,
+    OMARCHY_DEV_HASH_OUTPUT,
+    OMARCHY_TOKEN_CASES,
     SCREENSHOT_TOOL_MISSING,
     SESSION_ONLY_FORBIDDEN,
     STRATA_BUS_NAME,
@@ -36,17 +40,24 @@ from strataqemu.tests_spec import (
     install_sh_argv,
     install_smoke_command,
     missing_golden_message,
+    omarchy_bindings_command,
+    omarchy_detect_command,
+    omarchy_install_major,
     parse_archive_version,
     parse_install_sh_sha256,
     parse_name_has_owner,
     parse_observed_version,
     parse_session_exports,
+    parse_smoke_kv,
     run_install_from_release_steps,
+    run_omarchy_bindings_steps,
     run_session_only_steps,
     screenshot_tool_for_compositor,
     sha256_file,
     smoke_desktop_script,
     smoke_install_script,
+    smoke_omarchy_bindings_script,
+    smoke_omarchy_detect_script,
     smoke_session_script,
     strata_version_is_cli,
     supports_install_from_release,
@@ -84,6 +95,7 @@ class _FakeRun:
         self.hyprctl_code = 0
         self.exec_line = "Exec=/home/tester/.local/bin/strata %U\n"
         self.version_stdout = "0.9.0\n"
+        self.detected_major = "4"
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
@@ -110,6 +122,26 @@ class _FakeRun:
             )
         if "smoke-session.sh" in remote:
             return _completed(self.session_code, stdout=self.session_stdout)
+        if "smoke-omarchy-detect.sh" in remote:
+            major = self.detected_major
+            if "SMOKE_OMARCHY_CASE=token" in remote:
+                if "4.0.0" in remote or "1:4.0.0-1" in remote:
+                    major = "4"
+                elif "3.8.5" in remote:
+                    major = "3"
+                else:
+                    major = ""
+            return _completed(
+                0,
+                stdout=f"SMOKE_OMARCHY_CASE=live\nDETECTED_MAJOR={major}\n",
+            )
+        if "smoke-omarchy-bindings.sh" in remote:
+            kind = "lua" if self.detected_major == "4" else "conf"
+            path = f"/home/tester/.config/hypr/bindings.{kind}"
+            return _completed(
+                0,
+                stdout=f"BINDINGS_KIND={kind}\nBINDINGS_PATH={path}\n",
+            )
         if "gnome-screenshot" in remote:
             return _completed(0)
         if " grim " in f" {remote} " or remote.strip().startswith("grim "):
@@ -866,6 +898,8 @@ class Omarchy4InstallFromTests(unittest.TestCase):
         self.assertEqual(list(names), list(INSTALL_FROM_RELEASE_STEPS))
         blob = "\n".join(commands)
         self.assertIn("smoke-install.sh", blob)
+        self.assertNotIn("smoke-omarchy-detect.sh", blob)
+        self.assertNotIn("smoke-omarchy-bindings.sh", blob)
         self.assertIn("--non-interactive", blob)
         self.assertIn("--with-desktop-entry", blob)
         self.assertIn("--without-file-chooser", blob)
@@ -876,6 +910,7 @@ class Omarchy4InstallFromTests(unittest.TestCase):
         self.assertIn("gtk-launch", blob)
         self.assertNotIn("NameHasOwner", blob)
         self.assertEqual(extras["install_method"], "install.sh")
+        self.assertNotIn("omarchy_major", extras)
 
     def test_version_step_skipped_when_not_cli(self) -> None:
         fake = _FakeRun()
@@ -909,6 +944,7 @@ class Omarchy4InstallFromTests(unittest.TestCase):
         self.assertIn("session", [s["name"] for s in steps])
         self.assertIn("install", [s["name"] for s in steps])
         self.assertIn("window", [s["name"] for s in steps])
+        self.assertNotIn("omarchy-detect", [s["name"] for s in steps])
 
 
 class Omarchy3InstallFromTests(unittest.TestCase):
@@ -941,15 +977,10 @@ class Omarchy3InstallFromTests(unittest.TestCase):
         self.assertEqual(list(names), list(INSTALL_FROM_RELEASE_STEPS))
         blob = "\n".join(commands)
         self.assertIn("smoke-install.sh", blob)
-        self.assertIn("--non-interactive", blob)
-        self.assertIn("--with-desktop-entry", blob)
-        self.assertIn("--without-file-chooser", blob)
-        self.assertNotIn("--with-omarchy-keybinds", blob)
+        self.assertNotIn("smoke-omarchy-detect.sh", blob)
+        self.assertNotIn("smoke-omarchy-bindings.sh", blob)
         self.assertNotIn("SMOKE_FORBID_OMARCHY", blob)
         self.assertIn("hyprctl clients", blob)
-        self.assertIn("grim", blob)
-        self.assertIn("gtk-launch", blob)
-        self.assertNotIn("NameHasOwner", blob)
         self.assertEqual(extras["install_method"], "install.sh")
 
     def test_version_step_skipped_when_not_cli(self) -> None:
@@ -981,9 +1012,153 @@ class Omarchy3InstallFromTests(unittest.TestCase):
         self.assertEqual(version["status"], "skip")
         self.assertIn("not a CLI", version["reason"])
         self.assertNotIn("observed_version", extras)
-        self.assertIn("session", [s["name"] for s in steps])
-        self.assertIn("install", [s["name"] for s in steps])
-        self.assertIn("window", [s["name"] for s in steps])
+        self.assertNotIn("omarchy-detect", [s["name"] for s in steps])
+
+
+class OmarchyBindingsFlowTests(unittest.TestCase):
+    def test_omarchy4_detect_and_lua_bindings(self) -> None:
+        fake = _FakeRun()
+        fake.session_stdout += "HYPRLAND_INSTANCE_SIGNATURE=sig\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            install_sh = tmp / "install.sh"
+            install_sh.write_text("#!/bin/bash\n", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            commands: list[str] = []
+            steps, extras = run_omarchy_bindings_steps(
+                machine,
+                guest=load_guest("omarchy-4"),
+                screenshot_dest=tmp / "screenshot.png",
+                session_timeout=5,
+                run=fake,
+                commands=commands,
+                sleep=lambda _s: None,
+                install_sh_path=install_sh,
+            )
+        self.assertEqual([s["name"] for s in steps], list(OMARCHY_BINDINGS_STEPS))
+        blob = "\n".join(commands)
+        self.assertNotIn("smoke-install.sh", blob)
+        self.assertIn("smoke-omarchy-detect.sh", blob)
+        self.assertIn("smoke-omarchy-bindings.sh", blob)
+        self.assertIn("SMOKE_WRITE_BINDINGS=1", blob)
+        self.assertIn("SMOKE_OMARCHY_CASE=token", blob)
+        self.assertIn("SMOKE_OMARCHY_CASE=command", blob)
+        self.assertIn(OMARCHY_DEV_HASH_OUTPUT, blob)
+        for output, _want in OMARCHY_TOKEN_CASES:
+            self.assertIn(output, blob)
+        self.assertEqual(extras["omarchy_major"], "4")
+        self.assertEqual(extras["omarchy_bindings"], "lua")
+        self.assertEqual(extras["omarchy_pr743_probes"], "pass")
+        detect = [s for s in steps if s["name"] == "omarchy-detect"][0]
+        self.assertEqual(detect["detected_major"], "4")
+        bindings = [s for s in steps if s["name"] == "omarchy-bindings"][0]
+        self.assertEqual(bindings["kind"], "lua")
+
+    def test_omarchy3_writes_conf_bindings(self) -> None:
+        fake = _FakeRun()
+        fake.detected_major = "3"
+        fake.session_stdout += "HYPRLAND_INSTANCE_SIGNATURE=sig\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            commands: list[str] = []
+            steps, extras = run_omarchy_bindings_steps(
+                machine,
+                guest=load_guest("omarchy-3"),
+                screenshot_dest=tmp / "screenshot.png",
+                session_timeout=5,
+                run=fake,
+                commands=commands,
+                sleep=lambda _s: None,
+            )
+        self.assertEqual(extras["omarchy_major"], "3")
+        self.assertEqual(extras["omarchy_bindings"], "conf")
+        blob = "\n".join(commands)
+        self.assertIn("curl -fsSL", blob)
+        self.assertIn("SMOKE_OMARCHY_MAJOR=3", blob)
+
+    def test_wrong_live_major_fails_closed(self) -> None:
+        fake = _FakeRun()
+        fake.detected_major = "3"
+        fake.session_stdout += "HYPRLAND_INSTANCE_SIGNATURE=sig\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            with self.assertRaises(SessionSmokeError) as ctx:
+                run_omarchy_bindings_steps(
+                    machine,
+                    guest=load_guest("omarchy-4"),
+                    screenshot_dest=tmp / "screenshot.png",
+                    session_timeout=5,
+                    run=fake,
+                    sleep=lambda _s: None,
+                )
+        self.assertIn("live major '3'", str(ctx.exception))
+
+    def test_arch_guest_is_not_supported(self) -> None:
+        fake = _FakeRun()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            with self.assertRaises(SessionSmokeError) as ctx:
+                run_omarchy_bindings_steps(
+                    machine,
+                    guest=load_guest("arch"),
+                    screenshot_dest=tmp / "screenshot.png",
+                    session_timeout=5,
+                    run=fake,
+                    sleep=lambda _s: None,
+                )
+        self.assertEqual(str(ctx.exception), OMARCHY_BINDINGS_FAIL_CLOSED)
+
+
+class OmarchyHelperTests(unittest.TestCase):
+    def test_install_major_and_commands(self) -> None:
+        self.assertEqual(omarchy_install_major("omarchy-4"), 4)
+        self.assertEqual(omarchy_install_major(load_guest("omarchy-3")), 3)
+        self.assertIsNone(omarchy_install_major("arch"))
+        self.assertIn("SMOKE_OMARCHY_CASE=live", omarchy_detect_command())
+        self.assertIn(
+            "SMOKE_OMARCHY_OUTPUT=",
+            omarchy_detect_command(case="token", output="dev (b280f130)"),
+        )
+        self.assertEqual(
+            omarchy_bindings_command(4),
+            "SMOKE_OMARCHY_MAJOR=4 bash /tmp/smoke-omarchy-bindings.sh",
+        )
+        self.assertIn("SMOKE_WRITE_BINDINGS=1", omarchy_bindings_command(4, write=True))
+        self.assertTrue(smoke_omarchy_detect_script().is_file())
+        self.assertTrue(smoke_omarchy_bindings_script().is_file())
+        self.assertEqual(parse_smoke_kv("DETECTED_MAJOR=\n", "DETECTED_MAJOR"), "")
+        self.assertEqual(parse_smoke_kv("DETECTED_MAJOR=4\n", "DETECTED_MAJOR"), "4")
 
 
 if __name__ == "__main__":

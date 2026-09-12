@@ -141,6 +141,15 @@ class CliHelpTests(unittest.TestCase):
             self.assertNotIn("not implemented", text)
             self.assertNotIn("SystemExit", text)
 
+    def test_run_test_help_includes_omarchy_bindings(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            code = main(["run-test", "--help"])
+        self.assertEqual(code, 0)
+        text = buf.getvalue() + err.getvalue()
+        self.assertIn("--omarchy-bindings", text)
+
     def test_install_from_local_archive_binds_path(self) -> None:
         parser = build_parser()
         args = parser.parse_args(

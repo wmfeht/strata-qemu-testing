@@ -28,7 +28,11 @@ from strataqemu.run_test import (
 )
 from strataqemu.tests_spec import (
     INSTALL_FROM_FAIL_CLOSED,
+    INSTALL_SH_MISSING_PATH,
     LOCAL_ARCHIVE_MISSING_PATH,
+    OMARCHY_BINDINGS_EXCLUSIVE,
+    OMARCHY_BINDINGS_FAIL_CLOSED,
+    OMARCHY_BINDINGS_STEPS,
     missing_golden_message,
     sha256_file,
 )
@@ -96,6 +100,29 @@ class _FakeRun:
                 "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\n"
                 "WAYLAND_DISPLAY=wayland-0\n"
                 "HYPRLAND_INSTANCE_SIGNATURE=sig\n",
+                "",
+            )
+        if "smoke-omarchy-detect.sh" in remote:
+            major = "4"
+            if "SMOKE_OMARCHY_CASE=token" in remote:
+                if "4.0.0" in remote:
+                    major = "4"
+                elif "3.8.5" in remote:
+                    major = "3"
+                else:
+                    major = ""
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                f"SMOKE_OMARCHY_CASE=live\nDETECTED_MAJOR={major}\n",
+                "",
+            )
+        if "smoke-omarchy-bindings.sh" in remote:
+            kind = "lua" if "SMOKE_OMARCHY_MAJOR=4" in remote else "conf"
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                f"BINDINGS_KIND={kind}\nBINDINGS_PATH=/home/tester/.config/hypr/bindings.{kind}\n",
                 "",
             )
         if "smoke-install.sh" in remote or "install-arch.sh" in remote:
@@ -602,6 +629,7 @@ class HelpAndMiseTests(unittest.TestCase):
         self.assertIn("--install-from", text)
         self.assertIn("release", text)
         self.assertIn("local-archive", text)
+        self.assertIn("--omarchy-bindings", text)
         self.assertNotIn("not implemented", text)
 
     def test_vm_run_help_has_graphical(self) -> None:
@@ -870,6 +898,32 @@ class ArchInstallFromTests(unittest.TestCase):
         self.assertEqual(texts[0], texts[1])
         self.assertFalse(golden_qcow2(guest, cache).exists())
 
+    def test_missing_install_sh_env_fail_closed_no_qemu(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        missing = Path("/tmp/does-not-exist-strata-install.sh")
+        old = os.environ.get(config.INSTALL_SH_ENV)
+        os.environ[config.INSTALL_SH_ENV] = str(missing)
+        try:
+            with (
+                redirect_stdout(buf),
+                redirect_stderr(err),
+                patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+                patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+            ):
+                code = main(
+                    ["run-test", "--", "omarchy-4", "--omarchy-bindings"]
+                )
+            self.assertEqual(code, 2, err.getvalue())
+            self.assertIn(INSTALL_SH_MISSING_PATH, err.getvalue())
+            popen.assert_not_called()
+            run.assert_not_called()
+        finally:
+            if old is None:
+                os.environ.pop(config.INSTALL_SH_ENV, None)
+            else:
+                os.environ[config.INSTALL_SH_ENV] = old
+
     def test_local_archive_missing_path_fail_closed_no_qemu(self) -> None:
         buf = io.StringIO()
         err = io.StringIO()
@@ -996,6 +1050,105 @@ class ArchInstallFromTests(unittest.TestCase):
             self.assertIn("abababab", text)
             self.assertNotIn("9.9.9", text)
             del golden
+
+    def test_omarchy_bindings_records_detect_and_bindings(self) -> None:
+        fake = _FakeRun()
+        recorded_argv: list[list[str]] = []
+
+        def popen(argv, **kwargs):
+            name = Path(str(argv[0])).name if argv else ""
+            if name.startswith("qemu-system"):
+                recorded_argv.append(list(argv))
+                return _DummyProc()
+            raise AssertionError(f"unexpected Popen: {argv}")
+
+        def fake_overlay(golden, overlay, **kwargs):
+            dest = Path(overlay)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"overlay")
+            return dest
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cache, golden = _cache_with_golden(tmp, "omarchy-4")
+            host = _host_ok(tmp)
+            install_sh = tmp / "install.sh"
+            install_sh.write_text("#!/bin/bash\n", encoding="utf-8")
+            buf = io.StringIO()
+            err = io.StringIO()
+            with (
+                redirect_stdout(buf),
+                redirect_stderr(err),
+                patch.object(Machine, "shutdown", return_value="kill"),
+                patch(
+                    "strataqemu.tests_spec.qmp_screendump", return_value=False
+                ),
+            ):
+                code = run_run_test(
+                    "omarchy-4",
+                    omarchy_bindings=True,
+                    keep=True,
+                    cache_dir=cache,
+                    check_host_fn=lambda: host,
+                    run=fake,
+                    popen=popen,
+                    create_overlay_fn=fake_overlay,
+                    settle_s=0,
+                    install_sh_path=install_sh,
+                )
+            self.assertEqual(code, 0, err.getvalue())
+            self.assertIn("omarchy-bindings ok", buf.getvalue())
+            blob = " ".join(str(c) for c in fake.calls)
+            self.assertIn("smoke-omarchy-detect.sh", blob)
+            self.assertIn("smoke-omarchy-bindings.sh", blob)
+            self.assertNotIn("smoke-install.sh", blob)
+            result_files = list((cache / "runs").glob("*/result.json"))
+            self.assertTrue(result_files)
+            text = result_files[0].read_text(encoding="utf-8")
+            for name in OMARCHY_BINDINGS_STEPS:
+                self.assertIn(f'"name": "{name}"', text)
+            self.assertIn("omarchy_major", text)
+            self.assertIn("omarchy_bindings", text)
+            del golden
+
+    def test_omarchy_bindings_rejects_other_guests(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with (
+            redirect_stdout(buf),
+            redirect_stderr(err),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+            patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+        ):
+            code = main(["run-test", "--", "arch", "--omarchy-bindings"])
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertIn(OMARCHY_BINDINGS_FAIL_CLOSED, err.getvalue())
+        popen.assert_not_called()
+        run.assert_not_called()
+
+    def test_omarchy_bindings_exclusive_with_install_from(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with (
+            redirect_stdout(buf),
+            redirect_stderr(err),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+            patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+        ):
+            code = main(
+                [
+                    "run-test",
+                    "--",
+                    "omarchy-4",
+                    "--omarchy-bindings",
+                    "--install-from",
+                    "release",
+                ]
+            )
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertIn(OMARCHY_BINDINGS_EXCLUSIVE, err.getvalue())
+        popen.assert_not_called()
+        run.assert_not_called()
 
     def test_ubuntu_install_from_release_records_gnome_bus_and_version(self) -> None:
         fake = _FakeRun()

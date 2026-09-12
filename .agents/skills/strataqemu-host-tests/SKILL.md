@@ -43,7 +43,7 @@ No KVM, no network, no QEMU. Tests must pass on a laptop without
 | `wait_ssh`, `wait_qga`, `wait_iso_autoinstall` | `run=` fake returning scripted `CompletedProcess` objects; `sleep=lambda s: None`; `max_attempts=` | `tests/test_image_build.py` |
 | `run_run_test`, `run_vm_run` | `_FakeRun` responder + `_DummyProc` via `popen=` and `settle_s=0` | `tests/test_run_test.py` |
 | step functions in `tests_spec.py` | `Machine` with a temp run dir, `_FakeRun`, `commands=[]` | `tests/test_tests_spec.py` |
-| `guest-tests/*.sh` | fake `loginctl`, `busctl`, `pgrep`, `gdbus`, `hyprctl`, `grim`, `gnome-screenshot` scripts on a temp `PATH`; fixtures in `SMOKE_FIXTURE` | `tests/test_guest_smokes.py` |
+| `guest-tests/*.sh` | fake `loginctl`, `busctl`, `pgrep`, `gdbus`, `hyprctl`, `grim`, `gnome-screenshot` scripts on a temp `PATH`; fixtures in `SMOKE_FIXTURE`. Omarchy detect/bindings source `tests/fixtures/omarchy-detect/` under a throwaway `HOME` | `tests/test_guest_smokes.py` |
 
 ## The SSH responder pattern
 
