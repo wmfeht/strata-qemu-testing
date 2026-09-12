@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strataqemu"
+version = "0.1.0"
+description = "Host-side QEMU/KVM workflows for Strata distro-matrix testing"
+readme = "README.md"
+requires-python = ">=3.11"
+# Host Python deps: stdlib only. SSH is subprocess + OpenSSH, not paramiko.
+# pexpect is not a v1 installer dependency.
+
+[tool.setuptools.packages.find]
+include = ["strataqemu*"]

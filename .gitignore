@@ -1,0 +1,28 @@
+# Cache, goldens, overlays, run artifacts (never in git)
+cache/
+.cache/
+*.qcow2
+*.img
+overlays/
+
+# Generated test SSH keys (only keys/README.md is committed)
+keys/*
+!keys/README.md
+
+# Operator overrides
+mise.local.toml
+mise.local.lock
+
+# Unsupported in v1; operators still create one by habit
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

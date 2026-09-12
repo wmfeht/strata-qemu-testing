@@ -1,0 +1,535 @@
+"""Host-side unit tests for the shipped CLI and check-host.
+
+No KVM, no real QEMU process. Probes are injected.
+"""
+
+from __future__ import annotations
+
+import io
+import os
+import tomllib
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from unittest.mock import patch
+
+from strataqemu import config
+from strataqemu.cli import (
+    GENERIC_MEM_FLOOR_MIB,
+    REQUIRED_BINARIES,
+    CheckHostEnv,
+    build_parser,
+    check_host,
+    find_ovmf_code,
+    main,
+    ovmf_code_candidates,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+ARGPARSE_PROXY_TASKS = (
+    "check-host",
+    "image-build",
+    "run-test",
+    "vm-run",
+    "image-prune",
+)
+QEMU_TASKS = ("image-build", "run-test", "vm-run")
+SUBCOMMANDS = (
+    "check-host",
+    "image-build",
+    "run-test",
+    "vm-run",
+    "image-prune",
+)
+
+
+def _write_exec(directory: Path, name: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _bindir_with(tmp: Path, names: tuple[str, ...]) -> Path:
+    bindir = tmp / "bin"
+    for name in names:
+        _write_exec(bindir, name)
+    return bindir
+
+
+def _touch(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"fw")
+    return path
+
+
+def _success_env(
+    tmp: Path,
+    *,
+    binaries: tuple[str, ...] | None = None,
+    virgl_ok: bool = True,
+    mem: int | None = None,
+    euid: int = 1000,
+    include_ovmf: bool = True,
+    kvm_exists: bool = True,
+    kvm_accessible: bool = True,
+) -> CheckHostEnv:
+    names = binaries if binaries is not None else REQUIRED_BINARIES
+    bindir = _bindir_with(tmp, names)
+    kvm = tmp / "dev" / "kvm"
+    if kvm_exists:
+        kvm.parent.mkdir(parents=True, exist_ok=True)
+        kvm.write_bytes(b"")
+        kvm.chmod(0o666)
+    share = tmp / "usr" / "share"
+    if include_ovmf:
+        _touch(share / "edk2" / "x64" / "OVMF_CODE.4m.fd")
+    cache = tmp / "cache"
+    cache.mkdir()
+    return CheckHostEnv(
+        path=str(bindir),
+        kvm_path=kvm,
+        kvm_accessible=lambda _p: kvm_accessible,
+        cache_dir=cache,
+        firmware_share_roots=(share,),
+        virgl_ok=virgl_ok,
+        mem_available_mib=GENERIC_MEM_FLOOR_MIB if mem is None else mem,
+        euid=euid,
+    )
+
+
+class CliHelpTests(unittest.TestCase):
+    def test_help_names_subcommands(self) -> None:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["--help"])
+        self.assertEqual(code, 0)
+        text = buf.getvalue()
+        for name in SUBCOMMANDS:
+            with self.subTest(name=name):
+                self.assertIn(name, text)
+
+    def test_parser_accepts_each_subcommand(self) -> None:
+        parser = build_parser()
+        for name in SUBCOMMANDS:
+            with self.subTest(name=name):
+                args = parser.parse_args([name])
+                self.assertEqual(args.command, name)
+
+    def test_stub_subcommands_fail_closed(self) -> None:
+        for name in ("image-build", "run-test", "vm-run", "image-prune"):
+            err = io.StringIO()
+            with self.subTest(name=name), redirect_stderr(err):
+                code = main([name])
+            self.assertEqual(code, 2)
+            self.assertIn(name, err.getvalue())
+            self.assertIn("not implemented", err.getvalue())
+
+
+class MiseTomlTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.data = tomllib.loads(
+            (REPO_ROOT / "mise.toml").read_text(encoding="utf-8")
+        )
+
+    def test_python_pin(self) -> None:
+        self.assertEqual(self.data["tools"]["python"], "3.11")
+
+    def test_min_version_is_bootstrap_floor_not_strata(self) -> None:
+        min_version = self.data["min_version"]
+        self.assertIsInstance(min_version, str)
+        self.assertNotEqual(min_version, "2026.9.0")
+        self.assertTrue(min_version)
+
+    def test_run_test_depends_is_check_host_only(self) -> None:
+        depends = self.data["tasks"]["run-test"]["depends"]
+        self.assertEqual(depends, ["check-host"])
+        self.assertNotIn("image-build", depends)
+
+    def test_test_task_is_unittest_discover_without_check_host(self) -> None:
+        task = self.data["tasks"]["test"]
+        self.assertEqual(
+            task["run"],
+            "python -m unittest discover -s tests -t . -v",
+        )
+        self.assertNotIn("depends", task)
+        depends = task.get("depends", [])
+        if isinstance(depends, str):
+            depends = [depends]
+        self.assertNotIn("check-host", depends)
+
+    def test_argparse_proxy_tasks_have_raw_args(self) -> None:
+        for name in ARGPARSE_PROXY_TASKS:
+            with self.subTest(name=name):
+                self.assertIs(
+                    self.data["tasks"][name]["raw_args"],
+                    True,
+                )
+
+    def test_qemu_tasks_are_interactive(self) -> None:
+        for name in QEMU_TASKS:
+            with self.subTest(name=name):
+                self.assertIs(
+                    self.data["tasks"][name]["interactive"],
+                    True,
+                )
+
+    def test_bootstrap_gl_package_keys(self) -> None:
+        packages = self.data["bootstrap"]["packages"]
+        for key in (
+            "pacman:qemu-ui-egl-headless",
+            "pacman:qemu-hw-display-virtio-gpu-pci-gl",
+            "dnf:qemu-device-display-virtio-gpu-pci-gl",
+            "apt:qemu-system-gui",
+        ):
+            with self.subTest(key=key):
+                self.assertIn(key, packages)
+
+    def test_lockfile_records_cpython_311_with_checksums(self) -> None:
+        lock_path = REPO_ROOT / "mise.lock"
+        self.assertTrue(lock_path.is_file(), lock_path)
+        lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+        python_entries = lock["tools"]["python"]
+        if isinstance(python_entries, dict):
+            python_entries = [python_entries]
+        versions = [entry["version"] for entry in python_entries]
+        self.assertTrue(
+            any(v.startswith("3.11.") for v in versions),
+            versions,
+        )
+        checksums = []
+        for entry in python_entries:
+            for key, value in entry.items():
+                if key.startswith("platforms.") and isinstance(value, dict):
+                    checksums.append(value.get("checksum", ""))
+        self.assertTrue(checksums)
+        self.assertTrue(all(c.startswith("sha256:") for c in checksums), checksums)
+
+
+class PyprojectTests(unittest.TestCase):
+    def test_no_paramiko_or_pexpect(self) -> None:
+        data = tomllib.loads(
+            (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        project = data["project"]
+        self.assertNotIn("dependencies", project)
+        self.assertNotIn("optional-dependencies", project)
+        declared = []
+        for key in ("dependencies", "optional-dependencies"):
+            value = project.get(key)
+            if isinstance(value, list):
+                declared.extend(str(item) for item in value)
+            elif isinstance(value, dict):
+                declared.extend(str(item) for item in value)
+        blob = " ".join(declared).lower()
+        self.assertNotIn("paramiko", blob)
+        self.assertNotIn("pexpect", blob)
+
+    def test_requires_python_311(self) -> None:
+        data = tomllib.loads(
+            (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        self.assertIn("3.11", data["project"]["requires-python"])
+
+
+class ScriptShimTests(unittest.TestCase):
+    def test_shims_exec_module_and_do_not_invoke_mise(self) -> None:
+        for name in SUBCOMMANDS:
+            path = REPO_ROOT / "scripts" / name
+            with self.subTest(name=name):
+                self.assertTrue(path.is_file(), path)
+                text = path.read_text(encoding="utf-8")
+                self.assertIn("-m", text)
+                self.assertIn("strataqemu", text)
+                self.assertIn(name, text)
+                self.assertNotIn("mise", text)
+
+
+class ConfigTests(unittest.TestCase):
+    def test_cache_dir_honors_strata_qemu_cache(self) -> None:
+        with self._temp_env("/tmp/strata-qemu-cache-test-xyz") as expected:
+            self.assertEqual(config.cache_dir(), Path(expected))
+
+    def test_default_uses_xdg_cache_home(self) -> None:
+        xdg = "/tmp/xdg-cache-test-xyz"
+        old_cache = os.environ.pop(config.CACHE_ENV, None)
+        old_xdg = os.environ.get("XDG_CACHE_HOME")
+        os.environ["XDG_CACHE_HOME"] = xdg
+        try:
+            self.assertEqual(
+                config.cache_dir(),
+                Path(xdg) / config.CACHE_DIRNAME,
+            )
+        finally:
+            if old_cache is not None:
+                os.environ[config.CACHE_ENV] = old_cache
+            os.environ.pop("XDG_CACHE_HOME", None)
+            if old_xdg is not None:
+                os.environ["XDG_CACHE_HOME"] = old_xdg
+
+    def _temp_env(self, value: str):
+        class _Guard:
+            def __enter__(self_inner):
+                self_inner.old = os.environ.get(config.CACHE_ENV)
+                os.environ[config.CACHE_ENV] = value
+                return value
+
+            def __exit__(self_inner, *exc):
+                if self_inner.old is None:
+                    os.environ.pop(config.CACHE_ENV, None)
+                else:
+                    os.environ[config.CACHE_ENV] = self_inner.old
+
+        return _Guard()
+
+
+class CheckHostTests(unittest.TestCase):
+    def test_missing_qemu_names_mise_bootstrap(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            names = tuple(b for b in REQUIRED_BINARIES if b != "qemu-system-x86_64")
+            env = _success_env(tmp, binaries=names)
+            result = check_host(env)
+        self.assertFalse(result.ok)
+        joined = "\n".join(result.errors)
+        self.assertIn("mise bootstrap", joined)
+        self.assertIn("qemu-system-x86_64", joined)
+        self.assertNotIn("install qemu", joined.lower().replace("mise bootstrap", ""))
+
+    def test_missing_kvm_hints_group_and_no_tcg(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            env = _success_env(tmp, kvm_accessible=False)
+            result = check_host(env)
+        self.assertFalse(result.ok)
+        joined = "\n".join(result.errors)
+        self.assertIn("kvm", joined.lower())
+        self.assertIn("re-login", joined.lower())
+        self.assertIn("TCG", joined)
+
+    def test_missing_kvm_node(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            env = _success_env(tmp, kvm_exists=False)
+            result = check_host(env)
+        self.assertFalse(result.ok)
+        joined = "\n".join(result.errors)
+        self.assertIn("does not exist", joined)
+        self.assertIn("TCG", joined)
+
+    def test_missing_ovmf(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            env = _success_env(tmp, include_ovmf=False)
+            result = check_host(env)
+        self.assertFalse(result.ok)
+        joined = "\n".join(result.errors)
+        self.assertIn("OVMF", joined)
+        self.assertIn("secboot", joined.lower())
+
+    def test_success_generates_key_under_cache(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            env = _success_env(tmp)
+            result = check_host(env)
+            key = config.ssh_private_key(env.cache_dir)
+            self.assertTrue(result.ok, result.errors)
+            self.assertEqual(result.errors, ())
+            self.assertTrue(key.is_file(), key)
+            self.assertTrue(key.with_name(key.name + ".pub").is_file())
+            self.assertEqual(result.ssh_key, key)
+            self.assertIsNotNone(result.ovmf_code)
+            assert result.ovmf_code is not None
+            self.assertTrue(result.ovmf_code.is_file())
+            self.assertNotIn("secboot", result.ovmf_code.name.lower())
+
+    def test_keygen_uses_strata_qemu_cache_env(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cache = tmp / "from-env"
+            old = os.environ.get(config.CACHE_ENV)
+            os.environ[config.CACHE_ENV] = str(cache)
+            try:
+                env = _success_env(tmp)
+                env = CheckHostEnv(
+                    path=env.path,
+                    kvm_path=env.kvm_path,
+                    kvm_accessible=env.kvm_accessible,
+                    cache_dir=config.cache_dir(),
+                    firmware_share_roots=env.firmware_share_roots,
+                    virgl_ok=env.virgl_ok,
+                    mem_available_mib=env.mem_available_mib,
+                    euid=env.euid,
+                )
+                result = check_host(env)
+            finally:
+                if old is None:
+                    os.environ.pop(config.CACHE_ENV, None)
+                else:
+                    os.environ[config.CACHE_ENV] = old
+            self.assertTrue(result.ok, result.errors)
+            key = cache / "keys" / "id_ed25519"
+            self.assertTrue(key.is_file(), key)
+            self.assertEqual(result.ssh_key, key)
+
+    def test_success_does_not_overwrite_existing_key(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            env = _success_env(tmp)
+            key = config.ssh_private_key(env.cache_dir)
+            key.parent.mkdir(parents=True, exist_ok=True)
+            key.write_text("keep-me", encoding="utf-8")
+            result = check_host(env)
+            self.assertTrue(result.ok, result.errors)
+            self.assertEqual(key.read_text(encoding="utf-8"), "keep-me")
+
+    def test_virgl_failure_is_fail_closed(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            env = _success_env(tmp, virgl_ok=False)
+            result = check_host(env)
+        self.assertFalse(result.ok)
+        joined = "\n".join(result.errors)
+        self.assertIn("virgl", joined.lower())
+
+    def test_low_memory_fails(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            env = _success_env(tmp, mem=1024)
+            result = check_host(env)
+        self.assertFalse(result.ok)
+        joined = "\n".join(result.errors)
+        self.assertIn("MemAvailable", joined)
+
+    def test_root_euid_fails(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            env = _success_env(tmp, euid=0)
+            result = check_host(env)
+        self.assertFalse(result.ok)
+        joined = "\n".join(result.errors)
+        self.assertIn("root", joined.lower())
+
+
+class OvmfSearchTests(unittest.TestCase):
+    def test_prefers_4m_non_secboot_over_secboot(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            share = Path(td)
+            secboot = _touch(share / "edk2" / "x64" / "OVMF_CODE.4m.secboot.fd")
+            good = _touch(share / "edk2" / "x64" / "OVMF_CODE.4m.fd")
+            later = _touch(share / "edk2" / "ovmf" / "OVMF_CODE.fd")
+            found = find_ovmf_code(
+                ovmf_code_candidates((share,)) + [secboot, later]
+            )
+            self.assertEqual(found, good)
+            self.assertNotIn("secboot", found.name.lower())
+            self.assertTrue(_is_4m_name(found))
+
+    def test_search_order_arch_then_ubuntu_then_fedora(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            share = Path(td)
+            ubuntu = _touch(share / "OVMF" / "OVMF_CODE_4M.fd")
+            fedora = _touch(share / "edk2" / "ovmf" / "OVMF_CODE.fd")
+            found = find_ovmf_code(ovmf_code_candidates((share,)))
+            self.assertEqual(found, ubuntu)
+            self.assertNotEqual(found, fedora)
+
+    def test_fedora_generic_name_accepted_if_only_hit(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            share = Path(td)
+            fedora = _touch(share / "edk2" / "ovmf" / "OVMF_CODE.fd")
+            found = find_ovmf_code(ovmf_code_candidates((share,)))
+            self.assertEqual(found, fedora)
+
+    def test_secboot_only_is_rejected(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            share = Path(td)
+            _touch(share / "edk2" / "x64" / "OVMF_CODE.4m.secboot.fd")
+            _touch(share / "OVMF" / "OVMF_CODE_4M.secboot.fd")
+            found = find_ovmf_code(ovmf_code_candidates((share,)))
+            self.assertIsNone(found)
+
+    def test_4m_preferred_over_later_generic(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            share = Path(td)
+            four = _touch(share / "OVMF" / "OVMF_CODE_4M.fd")
+            generic = _touch(share / "edk2" / "ovmf" / "OVMF_CODE.fd")
+            found = find_ovmf_code(ovmf_code_candidates((share,)))
+            self.assertEqual(found, four)
+            self.assertNotEqual(found, generic)
+
+
+def _is_4m_name(path: Path) -> bool:
+    return "4m" in path.name.lower()
+
+
+class ShippedCliDoesNotSpawnQemuTests(unittest.TestCase):
+    def test_check_host_does_not_exec_qemu(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            env = _success_env(tmp)
+            with patch("subprocess.run") as run:
+                # Real ssh-keygen is allowed; fail if qemu is invoked.
+                def _run(cmd, *args, **kwargs):
+                    if cmd and Path(str(cmd[0])).name.startswith("qemu"):
+                        raise AssertionError(f"spawned qemu: {cmd}")
+                    # Still generate a key without calling qemu.
+                    key = Path(cmd[cmd.index("-f") + 1])
+                    key.parent.mkdir(parents=True, exist_ok=True)
+                    key.write_text("k", encoding="utf-8")
+                    key.with_name(key.name + ".pub").write_text(
+                        "p", encoding="utf-8"
+                    )
+
+                    class _C:
+                        returncode = 0
+
+                    return _C()
+
+                run.side_effect = _run
+                result = check_host(env)
+            self.assertTrue(result.ok, result.errors)
+            for call in run.call_args_list:
+                cmd = call.args[0]
+                self.assertFalse(
+                    Path(str(cmd[0])).name.startswith("qemu"),
+                    cmd,
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

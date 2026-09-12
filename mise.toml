@@ -1,0 +1,133 @@
+# Operator contract. min_version is the [bootstrap.packages] / mise bootstrap
+# floor — not Strata's tools+tasks-only 2026.9.0. This host verified
+# `mise bootstrap --help` on 2026.9.4.
+min_version = "2026.9.4"
+
+[settings]
+lockfile = true
+
+[tools]
+python = "3.11"
+
+# ---------------------------------------------------------------------------
+# Host packages. Keys are "manager:package". Only the manager present on this
+# machine is applied. "latest" accepts an already-installed version.
+# Does not install KVM, /dev/kvm, or a working GPU EGL stack.
+# ---------------------------------------------------------------------------
+[bootstrap.packages]
+# QEMU system emulator (qemu-system-x86_64)
+"pacman:qemu-system-x86" = "latest"
+"apt:qemu-system-x86" = "latest"
+"dnf:qemu-system-x86" = "latest"
+
+# qemu-img
+"pacman:qemu-img" = "latest"
+"apt:qemu-utils" = "latest"
+"dnf:qemu-img" = "latest"
+
+# GL modules matching frozen argv. qemu-system-x86 does NOT pull these on
+# Arch/Fedora. Ubuntu qemu-system-gui → qemu-system-modules-opengl does
+# (ui-egl-headless.so + hw-display-virtio-gpu-pci-gl.so).
+# Arch: virtio-gpu-gl (no -pci) is the wrong .so; we need virtio-gpu-gl-pci.
+"pacman:qemu-hw-display-virtio-gpu-pci-gl" = "latest"
+"pacman:qemu-hw-display-virtio-vga-gl" = "latest"
+"pacman:qemu-ui-egl-headless" = "latest"
+"pacman:qemu-ui-opengl" = "latest"
+"pacman:qemu-ui-gtk" = "latest"
+"pacman:qemu-ui-sdl" = "latest"
+"apt:qemu-system-gui" = "latest"
+"dnf:qemu-device-display-virtio-gpu-pci-gl" = "latest"
+"dnf:qemu-device-display-virtio-vga-gl" = "latest"
+"dnf:qemu-ui-egl-headless" = "latest"
+"dnf:qemu-ui-opengl" = "latest"
+"dnf:qemu-ui-gtk" = "latest"
+"dnf:qemu-ui-sdl" = "latest"
+
+# virgl / EGL userspace (necessary, not sufficient)
+"pacman:virglrenderer" = "latest"
+"pacman:mesa" = "latest"
+"apt:libvirglrenderer1" = "latest"
+"apt:libegl1" = "latest"
+"apt:libgl1-mesa-dri" = "latest"
+"dnf:virglrenderer" = "latest"
+"dnf:mesa-libEGL" = "latest"
+"dnf:mesa-dri-drivers" = "latest"
+
+# OVMF 4M firmware (check-host still searches paths and fail-closes)
+"pacman:edk2-ovmf" = "latest"
+"apt:ovmf" = "latest"
+"dnf:edk2-ovmf" = "latest"
+
+# cidata ISO
+"pacman:xorriso" = "latest"
+"apt:xorriso" = "latest"
+"dnf:xorriso" = "latest"
+
+# SSH client (subprocess OpenSSH)
+"pacman:openssh" = "latest"
+"apt:openssh-client" = "latest"
+"dnf:openssh-clients" = "latest"
+
+# guest bootstrap.sh downloaders
+"pacman:curl" = "latest"
+"pacman:ca-certificates" = "latest"
+"apt:curl" = "latest"
+"apt:ca-certificates" = "latest"
+"dnf:curl" = "latest"
+"dnf:ca-certificates" = "latest"
+
+# openssl passwd -6 for Omarchy user_credentials.json
+"pacman:openssl" = "latest"
+"apt:openssl" = "latest"
+"dnf:openssl" = "latest"
+
+# ---------------------------------------------------------------------------
+# Tasks. Extra argv is forwarded to python -m strataqemu (raw_args = true).
+# depends MUST NOT make run-test build a golden.
+# interactive = true on anything that spawns QEMU (TTY / Ctrl-C).
+# ---------------------------------------------------------------------------
+[tasks.check-host]
+description = "Fail-closed host check: /dev/kvm, qemu, virgl/egl, OVMF 4M, xorriso, ssh, curl"
+raw_args = true
+run = "python -m strataqemu check-host"
+
+[tasks.bootstrap]
+description = "Post-package host verification. NOT images/*/bootstrap.sh."
+depends = ["check-host"]
+
+[tasks.image-build]
+description = "Build or refresh a golden from its recipe. Incremental; --force rebuilds."
+depends = ["check-host"]
+interactive = true
+raw_args = true
+run = "python -m strataqemu image-build"
+
+[tasks.run-test]
+description = "Boot overlay, run smokes. Fails if no golden — never builds one."
+depends = ["check-host"]
+interactive = true
+raw_args = true
+run = "python -m strataqemu run-test"
+
+[tasks.vm-run]
+description = "Interactive throwaway overlay. --graphical for GTK/SDL GL."
+depends = ["check-host"]
+interactive = true
+raw_args = true
+output = "interleave"
+run = "python -m strataqemu vm-run"
+
+[tasks.image-prune]
+description = "Drop overlays and old run dirs. Never deletes goldens unless --images."
+raw_args = true
+run = "python -m strataqemu image-prune"
+
+[tasks.test]
+description = "Host-side unit tests. No KVM, no qemu, no check-host. -t . so import strataqemu works without pip install -e."
+run = "python -m unittest discover -s tests -t . -v"
+
+# PR 3 fills a working run line. Stub fails closed until then.
+[tasks.spike-wayland-ubuntu]
+description = "Throwaway Noble overlay: Type=wayland + guest screenshot. Operator-gated. Stub until PR 3."
+hide = true
+run = "python -c 'raise SystemExit(2)'"

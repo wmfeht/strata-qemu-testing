@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+os.execv(
+    sys.executable,
+    [sys.executable, "-m", "strataqemu", "run-test", *sys.argv[1:]],
+)
