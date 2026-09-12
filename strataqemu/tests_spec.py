@@ -53,7 +53,13 @@ INSTALL_FROM_RELEASE_STEPS = (
     "window",
 )
 INSTALL_FROM_RELEASE_GUESTS = frozenset(
-    {"arch", "ubuntu-2404", "fedora-workstation", "omarchy-4"}
+    {
+        "arch",
+        "ubuntu-2404",
+        "fedora-workstation",
+        "omarchy-4",
+        "omarchy-3",
+    }
 )
 VERSION_CLI_RE = re.compile(r"^(strata\s+)?v?\d+\.\d+", re.IGNORECASE)
 INSTALL_FROM_FAIL_CLOSED = (
@@ -148,7 +154,7 @@ def compositor_process_name(guest: Guest | str) -> str:
     if guest_id == "ubuntu-2404" or kind == "gnome" or compositor == "mutter":
         return "gnome-shell"
     if (
-        guest_id in {"arch", "omarchy-4"}
+        guest_id in {"arch", "omarchy-4", "omarchy-3"}
         or compositor == "hyprland"
         or kind == "hyprland"
     ):

@@ -181,12 +181,46 @@ def _blob_has_forbidden_token(blob: str) -> str | None:
     return None
 
 
+def _validate_omarchy_bootloader_schema(data: dict) -> None:
+    """4.x dumps use bootloader_config + omarchy_install; 3.x uses bootloader."""
+    bootloader_config = data.get("bootloader_config")
+    bootloader = data.get("bootloader")
+    omarchy_install = data.get("omarchy_install")
+    if isinstance(bootloader_config, dict):
+        if not isinstance(omarchy_install, dict):
+            raise CloudInitError(
+                "user_configuration.json missing omarchy_install"
+            )
+        if omarchy_install.get("mode") != "full_disk":
+            raise CloudInitError("omarchy_install.mode must be full_disk")
+        return
+    if isinstance(bootloader, str) and bootloader.strip():
+        if bootloader != "Limine":
+            raise CloudInitError(
+                "user_configuration.json bootloader must be Limine"
+            )
+        if omarchy_install is not None:
+            raise CloudInitError(
+                "3.x user_configuration.json must not contain omarchy_install"
+            )
+        return
+    raise CloudInitError(
+        "user_configuration.json missing bootloader or bootloader_config"
+    )
+
+
 def validate_omarchy_configuration(
     data: dict,
     *,
     disk: str = ISO_AUTOINSTALL_DISK,
 ) -> None:
-    """Fail closed unless this is a complete unencrypted 4.x full-disk dump."""
+    """Fail closed unless this is a complete unencrypted full-disk dump.
+
+    4.x (Quattro) dumps use ``bootloader_config`` plus ``omarchy_install``.
+    3.x dumps use a string ``bootloader`` (Limine) and have no
+    ``omarchy_install``. Disk target, 1MiB alignment, and no-encryption
+    rules are the same for both.
+    """
     if not isinstance(data, dict):
         raise CloudInitError("user_configuration.json must be a JSON object")
     if "disk_encryption" in data:
@@ -232,13 +266,7 @@ def validate_omarchy_configuration(
                     raise CloudInitError(
                         f"partition {key} {value!r} must be 1MiB-aligned"
                     )
-    if "bootloader_config" not in data:
-        raise CloudInitError("user_configuration.json missing bootloader_config")
-    omarchy_install = data.get("omarchy_install")
-    if not isinstance(omarchy_install, dict):
-        raise CloudInitError("user_configuration.json missing omarchy_install")
-    if omarchy_install.get("mode") != "full_disk":
-        raise CloudInitError("omarchy_install.mode must be full_disk")
+    _validate_omarchy_bootloader_schema(data)
     needle = _blob_has_forbidden_token(json.dumps(data))
     if needle is not None:
         raise CloudInitError(

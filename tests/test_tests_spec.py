@@ -197,6 +197,18 @@ class ParseOracleTests(unittest.TestCase):
             "run `mise run image-build -- omarchy-4` first",
         )
 
+    def test_omarchy3_compositor_is_hyprland_grim(self) -> None:
+        guest = load_guest("omarchy-3")
+        self.assertEqual(compositor_process_name(guest), "Hyprland")
+        self.assertEqual(compositor_process_name("omarchy-3"), "Hyprland")
+        self.assertEqual(screenshot_tool_for_compositor("Hyprland"), "grim")
+        self.assertTrue(supports_install_from_release(guest))
+        self.assertTrue(supports_install_from_release("omarchy-3"))
+        self.assertEqual(
+            missing_golden_message("omarchy-3"),
+            "run `mise run image-build -- omarchy-3` first",
+        )
+
     def test_missing_golden_message_matches_design(self) -> None:
         msg = missing_golden_message("ubuntu-2404")
         self.assertEqual(
@@ -914,6 +926,81 @@ class Omarchy4InstallFromTests(unittest.TestCase):
             steps, extras = run_install_from_release_steps(
                 machine,
                 guest=load_guest("omarchy-4"),
+                screenshot_dest=tmp / "screenshot.png",
+                session_timeout=5,
+                run=fake,
+                commands=commands,
+                sleep=lambda _s: None,
+                intended_version="0.9.0",
+            )
+        version = [s for s in steps if s["name"] == "version"][0]
+        self.assertEqual(version["status"], "skip")
+        self.assertIn("not a CLI", version["reason"])
+        self.assertNotIn("observed_version", extras)
+        self.assertIn("session", [s["name"] for s in steps])
+        self.assertIn("install", [s["name"] for s in steps])
+        self.assertIn("window", [s["name"] for s in steps])
+
+
+class Omarchy3InstallFromTests(unittest.TestCase):
+    def test_install_from_release_hyprland_oracle_existing_flags(self) -> None:
+        fake = _FakeRun()
+        fake.session_stdout += "HYPRLAND_INSTANCE_SIGNATURE=sig\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            dest = tmp / "screenshot.png"
+            commands: list[str] = []
+            steps, extras = run_install_from_release_steps(
+                machine,
+                guest=load_guest("omarchy-3"),
+                screenshot_dest=dest,
+                session_timeout=5,
+                run=fake,
+                commands=commands,
+                sleep=lambda _s: None,
+                intended_version="0.9.0",
+            )
+        names = [s["name"] for s in steps]
+        self.assertEqual(list(names), list(INSTALL_FROM_RELEASE_STEPS))
+        blob = "\n".join(commands)
+        self.assertIn("smoke-install.sh", blob)
+        self.assertIn("--non-interactive", blob)
+        self.assertIn("--with-desktop-entry", blob)
+        self.assertIn("--without-file-chooser", blob)
+        self.assertNotIn("--with-omarchy-keybinds", blob)
+        self.assertNotIn("SMOKE_FORBID_OMARCHY", blob)
+        self.assertIn("hyprctl clients", blob)
+        self.assertIn("grim", blob)
+        self.assertIn("gtk-launch", blob)
+        self.assertNotIn("NameHasOwner", blob)
+        self.assertEqual(extras["install_method"], "install.sh")
+
+    def test_version_step_skipped_when_not_cli(self) -> None:
+        fake = _FakeRun()
+        fake.version_stdout = "Gtk-Message: Failed to open display\n"
+        fake.session_stdout += "HYPRLAND_INSTANCE_SIGNATURE=sig\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            commands: list[str] = []
+            steps, extras = run_install_from_release_steps(
+                machine,
+                guest=load_guest("omarchy-3"),
                 screenshot_dest=tmp / "screenshot.png",
                 session_timeout=5,
                 run=fake,

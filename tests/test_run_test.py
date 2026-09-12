@@ -815,6 +815,62 @@ class ArchInstallFromTests(unittest.TestCase):
         self.assertEqual(texts[0], texts[1])
         self.assertFalse(golden_qcow2(guest, cache).exists())
 
+    def test_omarchy3_install_from_release_missing_golden_twice(self) -> None:
+        guest = load_guest("omarchy-3")
+        msg = missing_golden_message("omarchy-3")
+        self.assertEqual(msg, "run `mise run image-build -- omarchy-3` first")
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "empty-cache"
+            cache.mkdir()
+            old = os.environ.get(config.CACHE_ENV)
+            os.environ[config.CACHE_ENV] = str(cache)
+            texts = []
+            try:
+                for _ in range(2):
+                    buf = io.StringIO()
+                    err = io.StringIO()
+                    with (
+                        redirect_stdout(buf),
+                        redirect_stderr(err),
+                        patch(
+                            "subprocess.Popen", side_effect=_refuse_qemu_system
+                        ) as popen,
+                        patch(
+                            "subprocess.run", side_effect=_refuse_qemu_system
+                        ) as run,
+                        patch(
+                            "strataqemu.image_build.run_image_build"
+                        ) as build,
+                        patch(
+                            "strataqemu.image_build.build_live"
+                        ) as live,
+                    ):
+                        code = main(
+                            [
+                                "run-test",
+                                "--",
+                                "omarchy-3",
+                                "--install-from",
+                                "release",
+                            ]
+                        )
+                    self.assertEqual(code, 1)
+                    text = buf.getvalue() + err.getvalue()
+                    texts.append(text)
+                    self.assertIn(msg, text)
+                    self.assertNotIn("not implemented", text)
+                    popen.assert_not_called()
+                    run.assert_not_called()
+                    build.assert_not_called()
+                    live.assert_not_called()
+            finally:
+                if old is None:
+                    os.environ.pop(config.CACHE_ENV, None)
+                else:
+                    os.environ[config.CACHE_ENV] = old
+        self.assertEqual(texts[0], texts[1])
+        self.assertFalse(golden_qcow2(guest, cache).exists())
+
     def test_local_archive_missing_path_fail_closed_no_qemu(self) -> None:
         buf = io.StringIO()
         err = io.StringIO()

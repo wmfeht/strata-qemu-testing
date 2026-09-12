@@ -1,0 +1,44 @@
+id = "omarchy-3"
+arch = "x86_64"
+firmware = "uefi"
+source_kind = "iso-autoinstall"
+# Official 3.x pin. Do not follow /latest/.
+source_url = "https://iso.omarchy.org/omarchy-3.8.4.iso"
+source_sha256 = "7bc1dc7d98f3d088e57dc06581a494ea441fb15f3edd191360fd1696931bd895"
+disk_gb = 40
+memory_mib = 8192
+cpus = 4
+build_timeout_s = 3600
+boot_timeout_s = 180
+ovmf_code = "OVMF_CODE.4m.fd"
+ovmf_vars_template = "OVMF_VARS.4m.fd"
+
+[session]
+kind = "hyprland"
+display_manager = "sddm"
+compositor = "hyprland"
+autologin = true
+wayland = true
+
+[packages]
+manager = "pacman"
+runtime = [
+  "hyprland",
+  "sddm",
+  "xdg-desktop-portal-hyprland",
+  "xdg-desktop-portal",
+  "jq",
+  "grim",
+  # ISO does not ship these; install.sh requires them (see setup.sh).
+  "gst-libav",
+  "gst-plugins-good",
+  "gtksourceview5",
+]
+
+[user]
+name = "tester"
+groups = ["wheel"]
+
+[cidata]
+disk = "/dev/vda"
+encrypt = false

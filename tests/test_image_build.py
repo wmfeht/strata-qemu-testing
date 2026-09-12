@@ -27,6 +27,7 @@ from strataqemu.image_build import (
     golden_vars_fd,
     inventory_basename,
     inventory_provenance_key,
+    omarchy_major_for_guest,
     omarchy_version_matches_major,
     recipe_files_to_upload,
     required_free_bytes,
@@ -45,6 +46,7 @@ BOOTSTRAP = REPO_ROOT / "images" / "ubuntu-2404" / "bootstrap.sh"
 ARCH_BOOTSTRAP = REPO_ROOT / "images" / "arch" / "bootstrap.sh"
 FEDORA_BOOTSTRAP = REPO_ROOT / "images" / "fedora-workstation" / "bootstrap.sh"
 OMARCHY4_BOOTSTRAP = REPO_ROOT / "images" / "omarchy-4" / "bootstrap.sh"
+OMARCHY3_BOOTSTRAP = REPO_ROOT / "images" / "omarchy-3" / "bootstrap.sh"
 
 
 def _after(argv: list[str], flag: str) -> str:
@@ -166,6 +168,12 @@ class IncrementalImageBuildTests(unittest.TestCase):
         self.assertIn("ISO autoinstall", iso)
         self.assertIn("20-60 minutes", iso)
         self.assertIn("timeout 60 minutes", iso)
+        omarchy3 = load_guest("omarchy-3")
+        iso3 = build_duration_note(omarchy3)
+        self.assertIn("omarchy-3", iso3)
+        self.assertIn("ISO autoinstall", iso3)
+        self.assertIn("20-60 minutes", iso3)
+        self.assertIn("timeout 60 minutes", iso3)
 
     def test_live_build_prints_duration_note_on_stderr(self) -> None:
         guest = load_guest("ubuntu-2404")
@@ -564,6 +572,15 @@ class IsoAutoinstallBuildTests(unittest.TestCase):
         self.assertIn("sudo -n bash /tmp/setup.sh", arch_cmd)
         self.assertNotIn("sudo -S", arch_cmd)
 
+    def test_omarchy3_setup_ssh_uses_password_sudo_not_n(self) -> None:
+        guest = load_guest("omarchy-3")
+        cmd = setup_ssh_command(guest)
+        self.assertIn("sudo -S", cmd)
+        self.assertIn("-p ''", cmd)
+        self.assertIn(WELL_KNOWN_TEST_PASSWORD, cmd)
+        self.assertIn("bash /tmp/setup.sh", cmd)
+        self.assertNotIn("sudo -n", cmd)
+
     def test_blank_disk_argv_is_create_not_convert(self) -> None:
         argv = create_blank_qcow2_argv("/tmp/working.qcow2", 40)
         self.assertEqual(argv[0], "qemu-img")
@@ -619,6 +636,9 @@ class IsoAutoinstallBuildTests(unittest.TestCase):
         guest = load_guest("omarchy-4")
         self.assertTrue(uses_iso_autoinstall(guest.id))
         self.assertFalse(uses_cloud_init_seed(guest.id))
+        guest3 = load_guest("omarchy-3")
+        self.assertTrue(uses_iso_autoinstall(guest3.id))
+        self.assertFalse(uses_cloud_init_seed(guest3.id))
 
     def test_timeout_evidence_tries_screenshot_and_qmp(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -943,12 +963,35 @@ class IsoAutoinstallBuildTests(unittest.TestCase):
         self.assertFalse(omarchy_version_matches_major("wizard hang", 4))
         self.assertTrue(omarchy_version_matches_major("3.8.2", 3))
 
+    def test_wait_predicate_accepts_3x_rejects_4x_and_wizard(self) -> None:
+        self.assertEqual(omarchy_major_for_guest("omarchy-3"), 3)
+        self.assertEqual(omarchy_major_for_guest(load_guest("omarchy-3")), 3)
+        self.assertEqual(omarchy_major_for_guest("omarchy-4"), 4)
+        self.assertTrue(omarchy_version_matches_major("3.8.4\n", 3))
+        self.assertTrue(omarchy_version_matches_major("Omarchy 3.8.4", 3))
+        self.assertTrue(omarchy_version_matches_major("omarchy 3.1.0", 3))
+        self.assertFalse(omarchy_version_matches_major("4.0.3\n", 3))
+        self.assertFalse(omarchy_version_matches_major("Omarchy 4.0.3", 3))
+        self.assertFalse(omarchy_version_matches_major("", 3))
+        self.assertFalse(
+            omarchy_version_matches_major("waiting for configurator", 3)
+        )
+        self.assertFalse(omarchy_version_matches_major("wizard hang", 3))
+
     def test_golden_vars_path_is_omarchy_4_vars_fd(self) -> None:
         guest = load_guest("omarchy-4")
         with tempfile.TemporaryDirectory() as td:
             cache = Path(td)
             path = golden_vars_fd(guest, cache)
         self.assertEqual(path.name, "omarchy-4.vars.fd")
+        self.assertEqual(path.parent.name, "images")
+
+    def test_golden_vars_path_is_omarchy_3_vars_fd(self) -> None:
+        guest = load_guest("omarchy-3")
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td)
+            path = golden_vars_fd(guest, cache)
+        self.assertEqual(path.name, "omarchy-3.vars.fd")
         self.assertEqual(path.parent.name, "images")
 
     def test_omarchy4_matching_golden_prints_path_and_skips_qemu(self) -> None:
@@ -995,6 +1038,75 @@ class IsoAutoinstallBuildTests(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("checksum", proc.stderr.lower())
             self.assertFalse(dest.exists(), dest)
+
+    def test_omarchy3_matching_golden_prints_path_and_skips_qemu(self) -> None:
+        guest = load_guest("omarchy-3")
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "cache"
+            golden = golden_qcow2(guest, cache)
+            golden.parent.mkdir(parents=True)
+            golden.write_bytes(b"existing-golden")
+            buf = io.StringIO()
+            err = io.StringIO()
+            with (
+                redirect_stdout(buf),
+                redirect_stderr(err),
+                patch("strataqemu.image_build.check_host") as ch,
+                patch("subprocess.Popen", side_effect=_refuse_qemu_system),
+                patch("subprocess.run", side_effect=_refuse_qemu_system),
+            ):
+                code = run_image_build("omarchy-3", cache_dir=cache)
+            self.assertEqual(code, 0, err.getvalue())
+            self.assertIn(str(golden.resolve()), buf.getvalue())
+            ch.assert_not_called()
+
+    def test_omarchy3_bootstrap_checksum_mismatch_fail_closed(self) -> None:
+        payload = b"omarchy-3-iso-fixture-bad\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = tmp / "tiny.iso"
+            src.write_bytes(payload)
+            cache = tmp / "cache"
+            env = os.environ.copy()
+            env["STRATA_QEMU_CACHE"] = str(cache)
+            env["SOURCE_URL"] = src.resolve().as_uri()
+            env["SOURCE_SHA256"] = "0" * 64
+            env["SOURCE_FILENAME"] = "tiny.iso"
+            proc = subprocess.run(
+                ["bash", str(OMARCHY3_BOOTSTRAP)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            dest = cache / "downloads" / "tiny.iso"
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("checksum", proc.stderr.lower())
+            self.assertFalse(dest.exists(), dest)
+
+    def test_omarchy3_bootstrap_matching_sha256(self) -> None:
+        payload = b"omarchy-3-iso-fixture\n"
+        digest = hashlib.sha256(payload).hexdigest()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = tmp / "tiny.iso"
+            src.write_bytes(payload)
+            cache = tmp / "cache"
+            env = os.environ.copy()
+            env["STRATA_QEMU_CACHE"] = str(cache)
+            env["SOURCE_URL"] = src.resolve().as_uri()
+            env["SOURCE_SHA256"] = digest
+            env["SOURCE_FILENAME"] = "tiny.iso"
+            proc = subprocess.run(
+                ["bash", str(OMARCHY3_BOOTSTRAP)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            dest = cache / "downloads" / "tiny.iso"
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(dest.read_bytes(), payload)
 
     def test_omarchy4_bootstrap_matching_sha256(self) -> None:
         payload = b"omarchy-iso-fixture\n"
