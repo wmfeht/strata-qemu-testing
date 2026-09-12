@@ -83,8 +83,9 @@ checksum is printed and the command exits 0. `--force` rebuilds.
 `check-host` only. Missing golden exits non-zero with
 `run \`mise run image-build -- ubuntu-2404\` first`.
 
-`--keep` retains the throwaway overlay after success. Failures keep the run
-dir (serial log, screenshot, `result.json`).
+Success keeps the run dir’s screenshot, `result.json`, and logs, and deletes
+the throwaway overlay. `--keep` retains the overlay too. Failures keep the
+whole run dir.
 
 Hidden, operator-gated spike (not a daily command):
 `mise run spike-wayland-ubuntu`.

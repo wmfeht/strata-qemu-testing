@@ -378,6 +378,35 @@ class QgaAndQmpProtocolTests(unittest.TestCase):
     def test_qga_missing_socket_returns_false(self) -> None:
         self.assertFalse(qga_guest_shutdown("/tmp/no-such-qga.sock"))
 
+    def test_qga_hangup_after_execute_is_success(self) -> None:
+        """Guest often drops the agent before a JSON return."""
+        with tempfile.TemporaryDirectory() as td:
+            sock_path = str(Path(td) / "qga.sock")
+            received: list[dict] = []
+            ready = threading.Event()
+
+            def server() -> None:
+                srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                srv.bind(sock_path)
+                srv.listen(1)
+                srv.settimeout(3)
+                ready.set()
+                conn, _ = srv.accept()
+                try:
+                    buf = conn.recv(4096)
+                    received.append(json.loads(buf.split(b"\n", 1)[0]))
+                finally:
+                    conn.close()
+                    srv.close()
+
+            thread = threading.Thread(target=server)
+            thread.start()
+            self.assertTrue(ready.wait(3))
+            ok = qga_guest_shutdown(sock_path)
+            thread.join(3)
+        self.assertTrue(ok)
+        self.assertEqual(received, [{"execute": "guest-shutdown"}])
+
 
 if __name__ == "__main__":
     unittest.main()

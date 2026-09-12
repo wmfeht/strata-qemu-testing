@@ -12,6 +12,12 @@ import tomllib
 
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 DIGEST_BASENAMES = ("image.toml", "bootstrap.sh", "setup.sh")
+# Session drop-ins hashed into the golden so greetd/hyprland.lua edits rebuild.
+DIGEST_OPTIONAL_BASENAMES = (
+    "greetd-config.toml",
+    "hyprland.lua",
+    "hyprland.conf",
+)
 
 
 class GuestError(ValueError):
@@ -60,6 +66,14 @@ def covered_recipe_files(recipe_dir: Path) -> tuple[Path, ...]:
         if path.is_file():
             found.append(path)
             seen.add(path)
+    for name in DIGEST_OPTIONAL_BASENAMES:
+        path = root / name
+        if path.is_file():
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            found.append(path)
+            seen.add(resolved)
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
@@ -74,7 +88,7 @@ def covered_recipe_files(recipe_dir: Path) -> tuple[Path, ...]:
 
 
 def recipe_digest(recipe_dir: Path) -> str:
-    """SHA-256 over image.toml + bootstrap.sh + setup.sh + templates."""
+    """SHA-256 over image.toml + bootstrap.sh + setup.sh + templates + drop-ins."""
     h = hashlib.sha256()
     root = recipe_dir.resolve()
     for path in covered_recipe_files(root):
@@ -167,9 +181,9 @@ class Guest:
                 "source_kind must be 'cloud-image' or 'iso-autoinstall'"
             )
         source_url = _require_str(data, "source_url")
-        if "/current/" in source_url:
+        if "/current/" in source_url or "/latest/" in source_url:
             raise GuestError(
-                "source_url must be a dated tree, not …/current/"
+                "source_url must be a dated tree, not …/current/ or …/latest/"
             )
         source_sha256 = _parse_source_sha256(data)
 

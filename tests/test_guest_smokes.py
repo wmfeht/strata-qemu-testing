@@ -118,6 +118,44 @@ printf '\x89PNG\r\n\x1a\n' > "$dest"
 dd if=/dev/zero bs=256 count=1 >> "$dest" 2>/dev/null || true
 """
 
+GRIM_FAKE = r"""#!/usr/bin/env bash
+set -euo pipefail
+dest="${1:-}"
+if [[ -z "$dest" ]]; then
+  exit 1
+fi
+printf '\x89PNG\r\n\x1a\n' > "$dest"
+dd if=/dev/zero bs=256 count=1 >> "$dest" 2>/dev/null || true
+"""
+
+HYPRCTL_FAKE = r"""#!/usr/bin/env bash
+set -euo pipefail
+FIXTURE="${SMOKE_FIXTURE:?}"
+if [[ "$*" == *clients* ]]; then
+  cat "$FIXTURE/hyprctl-clients.json"
+  exit 0
+fi
+exit 1
+"""
+
+JQ_FAKE = r"""#!/usr/bin/env bash
+set -euo pipefail
+input="$(cat)"
+if [[ "$input" == *io.github.lgse.Strata* ]]; then
+  printf '%s\n' "$input"
+  exit 0
+fi
+exit 1
+"""
+
+HYPR_CLIENTS_HIT = """\
+[{"class": "io.github.lgse.Strata", "title": "Strata"}]
+"""
+
+HYPR_CLIENTS_MISS = """\
+[{"class": "kitty", "title": "term"}]
+"""
+
 MIXED_LIST = """\
 c1 1000 tester seat0 tty2
 c2 1000 tester - pts/0
@@ -253,6 +291,19 @@ class SmokeSessionScriptTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("compositor", proc.stderr.lower())
 
+    def test_hyprland_exports_instance_signature(self) -> None:
+        (self.fixture / "proc-Hyprland").write_text("1\n", encoding="utf-8")
+        hypr = self.runtime / "hypr" / "sig-newer"
+        hypr.mkdir(parents=True)
+        older = self.runtime / "hypr" / "sig-older"
+        older.mkdir()
+        os.utime(older, (1, 1))
+        os.utime(hypr, None)
+        proc = self._run(self._env(SMOKE_COMPOSITOR="Hyprland"))
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("HYPRLAND_INSTANCE_SIGNATURE=sig-newer", proc.stdout)
+        self.assertIn("WAYLAND_DISPLAY=wayland-0", proc.stdout)
+
 
 class SmokeDesktopScriptTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -328,6 +379,88 @@ class SmokeDesktopScriptTests(unittest.TestCase):
             if line.strip() and not line.lstrip().startswith("#")
         ]
         self.assertFalse(any("gtk-launch" in line for line in commands))
+
+
+class SmokeDesktopHyprlandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._td.name)
+        self.fixture = self.tmp / "fixture"
+        self.bindir = self.tmp / "bin"
+        self.fixture.mkdir()
+        self.bindir.mkdir()
+        _write_exec(self.bindir / "grim", GRIM_FAKE)
+        _write_exec(self.bindir / "hyprctl", HYPRCTL_FAKE)
+        _write_exec(self.bindir / "jq", JQ_FAKE)
+        self.shot = self.tmp / "window.png"
+        (self.fixture / "hyprctl-clients.json").write_text(
+            HYPR_CLIENTS_HIT, encoding="utf-8"
+        )
+
+    def tearDown(self) -> None:
+        self._td.cleanup()
+
+    def _env(self, *, with_grim: bool = True) -> dict[str, str]:
+        env = os.environ.copy()
+        if with_grim:
+            env["PATH"] = f"{self.bindir}{os.pathsep}{env.get('PATH', '')}"
+        else:
+            empty = self.tmp / "empty-bin"
+            empty.mkdir(exist_ok=True)
+            _write_exec(empty / "hyprctl", HYPRCTL_FAKE)
+            _write_exec(empty / "jq", JQ_FAKE)
+            env["PATH"] = str(empty)
+        env["SMOKE_FIXTURE"] = str(self.fixture)
+        env["SMOKE_SCREENSHOT_PATH"] = str(self.shot)
+        env["SMOKE_ORACLE"] = "hyprland"
+        return env
+
+    def _run(self, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        assert bash is not None
+        return subprocess.run(
+            [bash, str(SMOKE_DESKTOP)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    def test_class_hit_writes_png(self) -> None:
+        proc = self._run(self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertTrue(self.shot.is_file())
+        self.assertTrue(self.shot.read_bytes().startswith(PNG_MAGIC))
+
+    def test_class_miss_fails_after_screenshot(self) -> None:
+        (self.fixture / "hyprctl-clients.json").write_text(
+            HYPR_CLIENTS_MISS, encoding="utf-8"
+        )
+        proc = self._run(self._env())
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue(self.shot.is_file())
+        self.assertIn("io.github.lgse.Strata", proc.stderr)
+
+    def test_missing_grim_is_golden_bug(self) -> None:
+        proc = self._run(self._env(with_grim=False))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(
+            proc.stderr.strip(),
+            "screenshot tool missing; rebuild the golden",
+        )
+        self.assertNotIn("timeout", proc.stderr.lower())
+        self.assertFalse(self.shot.exists())
+
+    def test_hyprland_oracle_does_not_use_gnome_bus(self) -> None:
+        text = SMOKE_DESKTOP.read_text(encoding="utf-8")
+        self.assertIn("hyprctl clients", text)
+        self.assertIn("grim", text)
+        proc = self._run(self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        blob = proc.stdout + proc.stderr
+        self.assertNotIn("NameHasOwner", blob)
+        self.assertNotIn("gnome-screenshot", blob)
 
 
 if __name__ == "__main__":

@@ -61,3 +61,11 @@ class RunArtifacts:
     @property
     def ssh_port_file(self) -> Path:
         return self.root / "ssh_port"
+
+    @property
+    def screenshot(self) -> Path:
+        return self.root / "screenshot.png"
+
+    def throwaway_paths(self) -> tuple[Path, ...]:
+        """Overlay, copied vars, and sockets. Not logs/screenshot/result.json."""
+        return (self.overlay, self.ovmf_vars, self.qmp_sock, self.qga_sock)

@@ -1,0 +1,10 @@
+[terminal]
+vt = 1
+
+[initial_session]
+command = "dbus-run-session Hyprland --config /home/tester/.config/hypr/hyprland.lua"
+user = "tester"
+
+[default_session]
+command = "dbus-run-session Hyprland --config /home/tester/.config/hypr/hyprland.lua"
+user = "tester"

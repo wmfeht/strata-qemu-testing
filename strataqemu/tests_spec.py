@@ -1,13 +1,15 @@
-"""Session and GNOME desktop-oracle steps for ``run-test``.
+"""Session, screenshot, and desktop-oracle steps for ``run-test``.
 
 Injectable SSH/run-dir so host unittests never spawn QEMU. ``--session-only``
 runs session + in-guest screenshot; it does not gtk-launch Strata or wait on
-the application bus name.
+the application bus name. ``--install-from release`` on ``arch`` adds install,
+desktop-entry, and Hyprland window steps (no ``strata --version``).
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import shlex
 import subprocess
 import time
@@ -23,17 +25,31 @@ log = logging.getLogger("strataqemu")
 RunFn = Callable[..., subprocess.CompletedProcess]
 
 SESSION_TIMEOUT_S = 60
+INSTALL_TIMEOUT_S = 180
+WINDOW_TIMEOUT_S = 45
+DESKTOP_ENTRY_TIMEOUT_S = 10
 GUEST_SCREENSHOT_REMOTE = "/tmp/strata-window.png"
 SCREENSHOT_TOOL_MISSING = "screenshot tool missing; rebuild the golden"
 STRATA_BUS_NAME = "io.github.lgse.Strata"
+STRATA_DESKTOP_FILE = "io.github.lgse.Strata.desktop"
+STRATA_BIN_REL = ".local/bin/strata"
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 MIN_PNG_BYTES = 256
 SESSION_ONLY_STEPS = ("session", "screenshot")
+INSTALL_FROM_RELEASE_STEPS = ("session", "install", "desktop-entry", "window")
+INSTALL_FROM_RELEASE_GUESTS = frozenset({"arch"})
+INSTALL_FROM_FAIL_CLOSED = (
+    "run-test --install-from is not implemented yet (fail closed). "
+    "See docs/design.md."
+)
+INSTALL_SH_SHA256_PREFIX = "INSTALL_SH_SHA256="
+INSTALL_SH_URL = "https://raw.githubusercontent.com/lgse/strata/main/install.sh"
 # Substrings that must not appear in --session-only guest commands.
 SESSION_ONLY_FORBIDDEN = (
     "install.sh",
     "strata --version",
     "gtk-launch",
+    "gio launch",
     "NameHasOwner",
     STRATA_BUS_NAME,
 )
@@ -79,6 +95,7 @@ def compositor_process_name(guest: Guest | str) -> str:
     """Process name for the session compositor check.
 
     ``ubuntu-2404`` (and GNOME/Mutter recipes) use ``gnome-shell``.
+    ``arch`` (Hyprland) uses ``Hyprland``.
     """
     if isinstance(guest, Guest):
         guest_id = guest.id
@@ -90,9 +107,25 @@ def compositor_process_name(guest: Guest | str) -> str:
         compositor = ""
     if guest_id == "ubuntu-2404" or kind == "gnome" or compositor == "mutter":
         return "gnome-shell"
-    if compositor == "hyprland" or kind == "hyprland":
+    if guest_id == "arch" or compositor == "hyprland" or kind == "hyprland":
         return "Hyprland"
     return compositor or "gnome-shell"
+
+
+def screenshot_tool_for_compositor(compositor: str) -> str:
+    """In-guest capture binary. Hyprland uses ``grim``; GNOME uses gnome-screenshot."""
+    if compositor == "Hyprland":
+        return "grim"
+    return "gnome-screenshot"
+
+
+def supports_install_from_release(guest: Guest | str) -> bool:
+    guest_id = guest.id if isinstance(guest, Guest) else guest
+    return guest_id in INSTALL_FROM_RELEASE_GUESTS
+
+
+def install_arch_script() -> Path:
+    return repo_root() / "images" / "common" / "install-arch.sh"
 
 
 def parse_session_exports(text: str) -> dict[str, str]:
@@ -148,6 +181,44 @@ def screenshot_tool_missing(which_returncode: int) -> bool:
 
 def gdbus_name_has_owner_command() -> str:
     return " ".join(shlex.quote(part) for part in GDBUS_NAME_HAS_OWNER_ARGV)
+
+
+def parse_install_sh_sha256(text: str) -> str:
+    """Read ``INSTALL_SH_SHA256=`` from the Arch helper stdout."""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.startswith(INSTALL_SH_SHA256_PREFIX):
+            continue
+        digest = line.split("=", 1)[1].strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", digest):
+            return digest
+    raise SessionSmokeError("install helper did not print INSTALL_SH_SHA256")
+
+
+def hyprctl_class_oracle_command(env: Mapping[str, str] | None = None) -> str:
+    jq_filter = f'.[] | select(.class == "{STRATA_BUS_NAME}")'
+    body = f"hyprctl clients -j | jq -e {shlex.quote(jq_filter)}"
+    if env:
+        return f"{env_prefix(env)} {body}"
+    return body
+
+
+def launch_desktop_entry_command(env: Mapping[str, str]) -> str:
+    """gtk-launch, else gio launch, in the graphical env. Not used by --session-only.
+
+    The launcher is backgrounded: gtk-launch/gio wait for the GTK app to exit.
+    """
+    inner = (
+        "if command -v gtk-launch >/dev/null 2>&1; then "
+        f"nohup gtk-launch {STRATA_BUS_NAME} >/tmp/strata-launch.log 2>&1 & "
+        "elif command -v gio >/dev/null 2>&1; then "
+        f"nohup gio launch \"$HOME/.local/share/applications/{STRATA_DESKTOP_FILE}\" "
+        ">/tmp/strata-launch.log 2>&1 & "
+        "else echo 'gtk-launch and gio launch missing' >&2; exit 1; fi; "
+        "disown || true; sleep 1; exit 0"
+    )
+    prefix = env_prefix(env)
+    return f"{prefix} bash -lc {shlex.quote(inner)}"
 
 
 def session_only_step_names() -> tuple[str, ...]:
@@ -316,13 +387,15 @@ def capture_guest_screenshot(
     env: Mapping[str, str],
     dest: Path,
     *,
+    tool: str | None = None,
     run: RunFn | None = None,
     commands: list[str] | None = None,
 ) -> Path:
-    """In-guest ``gnome-screenshot``. Missing binary is a golden bug."""
+    """In-guest ``grim`` or ``gnome-screenshot``. Missing binary is a golden bug."""
+    binary = tool or "gnome-screenshot"
     which = ssh_run(
         machine,
-        "command -v gnome-screenshot",
+        f"command -v {shlex.quote(binary)}",
         timeout=15,
         run=run,
         commands=commands,
@@ -330,7 +403,10 @@ def capture_guest_screenshot(
     if screenshot_tool_missing(which.returncode):
         raise SessionSmokeError(SCREENSHOT_TOOL_MISSING)
     prefix = env_prefix(env)
-    cmd = f"{prefix} gnome-screenshot -f {shlex.quote(GUEST_SCREENSHOT_REMOTE)}"
+    if binary == "grim":
+        cmd = f"{prefix} grim {shlex.quote(GUEST_SCREENSHOT_REMOTE)}"
+    else:
+        cmd = f"{prefix} gnome-screenshot -f {shlex.quote(GUEST_SCREENSHOT_REMOTE)}"
     ssh_run(
         machine, cmd, timeout=60, check=True, run=run, commands=commands
     )
@@ -450,7 +526,12 @@ def run_session_only_steps(
     env = session_env_from_exports(exports)
     shot_started = time.monotonic()
     capture_guest_screenshot(
-        machine, env, screenshot_dest, run=run, commands=recorded
+        machine,
+        env,
+        screenshot_dest,
+        tool=screenshot_tool_for_compositor(compositor),
+        run=run,
+        commands=recorded,
     )
     if qmp_dest is not None:
         extra_qmp_screendump(machine, qmp_dest)
@@ -477,3 +558,194 @@ def assert_session_only_commands(commands: Sequence[str]) -> None:
             raise SessionSmokeError(
                 f"--session-only invoked a forbidden command: {command}"
             )
+
+
+def wait_hyprland_class(
+    machine: Machine,
+    env: Mapping[str, str],
+    *,
+    timeout: float = WINDOW_TIMEOUT_S,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> None:
+    """Wait until ``hyprctl clients`` lists class ``io.github.lgse.Strata``."""
+    remote = hyprctl_class_oracle_command(env)
+    deadline = time.monotonic() + timeout
+    last = "no probe yet"
+    nap = sleep or time.sleep
+    while time.monotonic() < deadline:
+        proc = ssh_run(
+            machine, remote, timeout=15, run=run, commands=commands
+        )
+        blob = f"{proc.stdout}{proc.stderr}"
+        if proc.returncode == 0:
+            return
+        last = blob.strip() or f"exit {proc.returncode}"
+        nap(1)
+    raise TimeoutError(
+        f"hyprctl class {STRATA_BUS_NAME} not present in {timeout}s: {last}"
+    )
+
+
+def _desktop_entry_probe_command() -> str:
+    path = f"$HOME/.local/share/applications/{STRATA_DESKTOP_FILE}"
+    return f"test -f {path} && grep -E '^Exec=' {path}"
+
+
+def run_install_from_release_steps(
+    machine: Machine,
+    *,
+    guest: Guest,
+    screenshot_dest: Path,
+    qmp_dest: Path | None = None,
+    session_timeout: float = SESSION_TIMEOUT_S,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> tuple[list[dict], dict]:
+    """session → install → desktop-entry → window. No version step."""
+    if not supports_install_from_release(guest):
+        raise SessionSmokeError(
+            f"--install-from release is not implemented for {guest.id}"
+        )
+    compositor = compositor_process_name(guest)
+    tool = screenshot_tool_for_compositor(compositor)
+    recorded = commands if commands is not None else []
+    steps: list[dict] = []
+
+    started = time.monotonic()
+    exports = run_session_step(
+        machine,
+        compositor=compositor,
+        timeout=session_timeout,
+        run=run,
+        commands=recorded,
+        sleep=sleep,
+    )
+    steps.append(
+        {
+            "name": "session",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+            "sid": exports.get("SESSION_ID"),
+        }
+    )
+    env = session_env_from_exports(exports)
+
+    started = time.monotonic()
+    helper = install_arch_script()
+    if not helper.is_file():
+        raise SessionSmokeError(f"missing Arch install helper {helper}")
+    scp_to_guest(
+        machine, helper, "/tmp/install-arch.sh", run=run, commands=recorded
+    )
+    proc = ssh_run(
+        machine,
+        "bash /tmp/install-arch.sh",
+        timeout=INSTALL_TIMEOUT_S,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    digest = parse_install_sh_sha256(f"{proc.stdout}{proc.stderr}")
+    ssh_run(
+        machine,
+        f"test -x \"$HOME/{STRATA_BIN_REL}\"",
+        timeout=15,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    steps.append(
+        {
+            "name": "install",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+            "install_sh_sha256": digest,
+        }
+    )
+
+    started = time.monotonic()
+    entry = ssh_run(
+        machine,
+        _desktop_entry_probe_command(),
+        timeout=DESKTOP_ENTRY_TIMEOUT_S,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    exec_blob = f"{entry.stdout}{entry.stderr}"
+    if STRATA_BIN_REL not in exec_blob:
+        raise SessionSmokeError(
+            f"desktop Exec= does not point at ~/{STRATA_BIN_REL}: {exec_blob}"
+        )
+    steps.append(
+        {
+            "name": "desktop-entry",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+        }
+    )
+
+    started = time.monotonic()
+    which = ssh_run(
+        machine,
+        f"command -v {shlex.quote(tool)}",
+        timeout=15,
+        run=run,
+        commands=recorded,
+    )
+    if screenshot_tool_missing(which.returncode):
+        raise SessionSmokeError(SCREENSHOT_TOOL_MISSING)
+    ssh_run(
+        machine,
+        launch_desktop_entry_command(env),
+        timeout=30,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    class_error: BaseException | None = None
+    try:
+        wait_hyprland_class(
+            machine,
+            env,
+            timeout=WINDOW_TIMEOUT_S,
+            run=run,
+            commands=recorded,
+            sleep=sleep,
+        )
+    except (TimeoutError, SessionSmokeError) as exc:
+        class_error = exc
+    capture_guest_screenshot(
+        machine,
+        env,
+        screenshot_dest,
+        tool=tool,
+        run=run,
+        commands=recorded,
+    )
+    if qmp_dest is not None:
+        extra_qmp_screendump(machine, qmp_dest)
+    if class_error is not None:
+        raise class_error
+    steps.append(
+        {
+            "name": "window",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+            "path": str(screenshot_dest),
+        }
+    )
+    for command in recorded:
+        if "strata --version" in command:
+            raise SessionSmokeError(
+                f"--install-from release invoked strata --version: {command}"
+            )
+    extras = {
+        "install_method": "install.sh",
+        "install_sh_sha256": digest,
+        "screenshot": str(screenshot_dest),
+    }
+    return steps, extras

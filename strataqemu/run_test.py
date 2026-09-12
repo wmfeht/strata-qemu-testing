@@ -36,11 +36,14 @@ from strataqemu.ports import (
 )
 from strataqemu.qemu import Machine, build_qemu_argv
 from strataqemu.tests_spec import (
+    INSTALL_FROM_FAIL_CLOSED,
     SESSION_TIMEOUT_S,
     SessionSmokeError,
     compositor_process_name,
     missing_golden_message,
+    run_install_from_release_steps,
     run_session_only_steps,
+    supports_install_from_release,
 )
 
 log = logging.getLogger("strataqemu")
@@ -284,6 +287,28 @@ def _shutdown_machine(machine: Machine) -> None:
             machine.kill()
 
 
+def discard_throwaway_disks(run_dir: Path) -> None:
+    """Drop overlay/vars/sockets. Keep screenshot, result.json, and logs."""
+    arts = artifacts.RunArtifacts(run_dir)
+    for path in arts.throwaway_paths():
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
+        except OSError as exc:
+            log.debug("could not remove %s: %s", path, exc)
+
+
+def _finish_run_dir(run_dir: Path, *, keep: bool, failed: bool) -> None:
+    """Keep evidence. Delete the overlay on success unless ``--keep``."""
+    if keep or failed:
+        print(f"kept run dir: {run_dir}", file=sys.stderr)
+        return
+    discard_throwaway_disks(run_dir)
+    print(f"run dir: {run_dir}")
+
+
 def _prepare_overlay(
     guest: Guest,
     cache: Path,
@@ -314,7 +339,8 @@ def _load_or_usage(guest_id: str | None, command: str) -> Guest | int:
             )
         else:
             print(
-                "usage: python -m strataqemu run-test --session-only [--keep] <guest>",
+                "usage: python -m strataqemu run-test "
+                "[--session-only | --install-from release] [--keep] <guest>",
                 file=sys.stderr,
             )
         return 2
@@ -344,14 +370,15 @@ def run_run_test(
         return loaded
     guest = loaded
 
-    if install_from:
-        print(
-            "run-test --install-from is not implemented yet (fail closed). "
-            "See docs/design.md.",
-            file=sys.stderr,
-        )
+    install_release = (
+        install_from == "release"
+        and supports_install_from_release(guest)
+        and not session_only
+    )
+    if install_from and not session_only and not install_release:
+        print(INSTALL_FROM_FAIL_CLOSED, file=sys.stderr)
         return 2
-    if not session_only:
+    if not session_only and not install_release:
         print(
             "run-test: pass --session-only "
             "(install / version / window-after-install are later PRs)",
@@ -398,11 +425,12 @@ def run_run_test(
         overlay, ovmf_vars = _prepare_overlay(
             guest, cache, run_dir, create_overlay_fn=create_overlay_fn
         )
+        ovmf_code = host.ovmf_code if guest.firmware == "uefi" else None
         machine = _spawn_overlay_vm(
             guest=guest,
             overlay=overlay,
             run_dir=run_dir,
-            ovmf_code=host.ovmf_code,
+            ovmf_code=ovmf_code,
             ovmf_vars=ovmf_vars,
             identity=host.ssh_key,
             graphical=False,
@@ -414,15 +442,27 @@ def run_run_test(
         wait_ssh(machine, timeout=guest.boot_timeout_s, run=run)
         shot = run_dir / "screenshot.png"
         qmp_path = run_dir / "qmp-session.png"
-        steps = run_session_only_steps(
-            machine,
-            compositor=compositor_process_name(guest),
-            screenshot_dest=shot,
-            qmp_dest=qmp_path,
-            session_timeout=SESSION_TIMEOUT_S,
-            run=run,
-            commands=recorded,
-        )
+        extras: dict = {}
+        if install_release:
+            steps, extras = run_install_from_release_steps(
+                machine,
+                guest=guest,
+                screenshot_dest=shot,
+                qmp_dest=qmp_path,
+                session_timeout=SESSION_TIMEOUT_S,
+                run=run,
+                commands=recorded,
+            )
+        else:
+            steps = run_session_only_steps(
+                machine,
+                compositor=compositor_process_name(guest),
+                screenshot_dest=shot,
+                qmp_dest=qmp_path,
+                session_timeout=SESSION_TIMEOUT_S,
+                run=run,
+                commands=recorded,
+            )
         result.update(
             {
                 "ok": True,
@@ -431,8 +471,12 @@ def run_run_test(
                 "seconds": round(time.monotonic() - started, 1),
             }
         )
+        result.update(extras)
         _write_result(arts.result_json, result)
-        print(f"run-test: session ok ({guest.id})")
+        if install_release:
+            print(f"run-test: ok ({guest.id})")
+        else:
+            print(f"run-test: session ok ({guest.id})")
         print(f"screenshot: {shot}")
         return 0
     except KeyboardInterrupt:
@@ -466,10 +510,7 @@ def run_run_test(
     finally:
         if machine is not None:
             _shutdown_machine(machine)
-        if not keep and not failed:
-            shutil.rmtree(run_dir, ignore_errors=True)
-        elif failed or keep:
-            print(f"kept run dir: {run_dir}", file=sys.stderr)
+        _finish_run_dir(run_dir, keep=keep, failed=failed)
 
 
 def run_vm_run(
@@ -528,11 +569,12 @@ def run_vm_run(
         overlay, ovmf_vars = _prepare_overlay(
             guest, cache, run_dir, create_overlay_fn=create_overlay_fn
         )
+        ovmf_code = host.ovmf_code if guest.firmware == "uefi" else None
         machine = _spawn_overlay_vm(
             guest=guest,
             overlay=overlay,
             run_dir=run_dir,
-            ovmf_code=host.ovmf_code,
+            ovmf_code=ovmf_code,
             ovmf_vars=ovmf_vars,
             identity=host.ssh_key,
             graphical=graphical,

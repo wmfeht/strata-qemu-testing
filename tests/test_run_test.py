@@ -19,13 +19,17 @@ from strataqemu.overlay import create_overlay_argv
 from strataqemu.qemu import Machine
 from strataqemu.run_test import (
     choose_graphical_ui,
+    discard_throwaway_disks,
     require_golden,
     run_run_test,
     run_test_qemu_argv,
     run_vm_run,
     vm_run_qemu_argv,
 )
-from strataqemu.tests_spec import missing_golden_message
+from strataqemu.tests_spec import (
+    INSTALL_FROM_FAIL_CLOSED,
+    missing_golden_message,
+)
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 256
 
@@ -75,6 +79,8 @@ class _FakeRun:
                 dest.write_bytes(PNG)
             return subprocess.CompletedProcess(argv, 0, "", "")
         remote = str(argv[-1]) if argv else ""
+        if "command -v grim" in remote:
+            return subprocess.CompletedProcess(argv, 0, "/usr/bin/grim\n", "")
         if "command -v gnome-screenshot" in remote:
             return subprocess.CompletedProcess(
                 argv, 0, "/usr/bin/gnome-screenshot\n", ""
@@ -86,9 +92,23 @@ class _FakeRun:
                 "SESSION_ID=c1\n"
                 "XDG_RUNTIME_DIR=/run/user/1000\n"
                 "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\n"
-                "WAYLAND_DISPLAY=wayland-0\n",
+                "WAYLAND_DISPLAY=wayland-0\n"
+                "HYPRLAND_INSTANCE_SIGNATURE=sig\n",
                 "",
             )
+        if "install-arch.sh" in remote:
+            digest = "ab" * 32
+            return subprocess.CompletedProcess(
+                argv, 0, f"INSTALL_SH_SHA256={digest}\n", ""
+            )
+        if "Exec=" in remote or "Strata.desktop" in remote:
+            return subprocess.CompletedProcess(
+                argv, 0, "Exec=/home/tester/.local/bin/strata %U\n", ""
+            )
+        if "gtk-launch" in remote or "gio launch" in remote:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if "hyprctl clients" in remote:
+            return subprocess.CompletedProcess(argv, 0, "{}\n", "")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
 
@@ -101,11 +121,11 @@ def _host_ok(tmp: Path) -> CheckHostResult:
     return CheckHostResult(ok=True, errors=(), ovmf_code=code, ssh_key=key)
 
 
-def _cache_with_golden(tmp: Path) -> tuple[Path, Path]:
-    guest = load_guest("ubuntu-2404")
+def _cache_with_golden(tmp: Path, guest_id: str = "ubuntu-2404") -> tuple[Path, Path]:
+    guest = load_guest(guest_id)
     cache = tmp / "cache"
     golden = golden_qcow2(guest, cache)
-    golden.parent.mkdir(parents=True)
+    golden.parent.mkdir(parents=True, exist_ok=True)
     golden.write_bytes(b"golden-bytes")
     golden.chmod(0o444)
     return cache, golden
@@ -375,6 +395,87 @@ class SessionOnlyWiringTests(unittest.TestCase):
             self.assertTrue(shots)
             self.assertTrue(shots[0].read_bytes().startswith(b"\x89PNG"))
 
+    def test_success_without_keep_saves_screenshot_drops_overlay(self) -> None:
+        fake = _FakeRun()
+
+        def popen(argv, **kwargs):
+            name = Path(str(argv[0])).name if argv else ""
+            if name.startswith("qemu-system"):
+                return _DummyProc()
+            raise AssertionError(f"unexpected Popen: {argv}")
+
+        def fake_overlay(golden, overlay, **kwargs):
+            dest = Path(overlay)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"overlay")
+            return dest
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cache, _golden = _cache_with_golden(tmp)
+            vars_template = tmp / "OVMF_VARS.4m.fd"
+            vars_template.write_bytes(b"vars")
+            host = _host_ok(tmp)
+            buf = io.StringIO()
+            err = io.StringIO()
+            with (
+                redirect_stdout(buf),
+                redirect_stderr(err),
+                patch(
+                    "strataqemu.run_test.find_ovmf_vars",
+                    return_value=vars_template,
+                ),
+                patch.object(Machine, "shutdown", return_value="kill"),
+                patch(
+                    "strataqemu.tests_spec.qmp_screendump", return_value=False
+                ),
+            ):
+                code = run_run_test(
+                    "ubuntu-2404",
+                    session_only=True,
+                    keep=False,
+                    cache_dir=cache,
+                    check_host_fn=lambda: host,
+                    run=fake,
+                    popen=popen,
+                    create_overlay_fn=fake_overlay,
+                    settle_s=0,
+                )
+            self.assertEqual(code, 0, err.getvalue())
+            runs = list((cache / "runs").iterdir())
+            self.assertEqual(len(runs), 1, runs)
+            run_dir = runs[0]
+            self.assertTrue((run_dir / "screenshot.png").is_file())
+            self.assertTrue(
+                (run_dir / "screenshot.png").read_bytes().startswith(b"\x89PNG")
+            )
+            self.assertTrue((run_dir / "result.json").is_file())
+            self.assertFalse((run_dir / "overlay.qcow2").exists())
+            self.assertFalse((run_dir / "OVMF_VARS.fd").exists())
+            out = buf.getvalue()
+            self.assertIn("screenshot:", out)
+            self.assertIn(str(run_dir / "screenshot.png"), out)
+            self.assertIn(str(run_dir), out)
+            self.assertTrue((run_dir / "screenshot.png").exists())
+
+    def test_discard_throwaway_keeps_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "run"
+            run_dir.mkdir()
+            (run_dir / "overlay.qcow2").write_bytes(b"disk")
+            (run_dir / "OVMF_VARS.fd").write_bytes(b"vars")
+            (run_dir / "qmp.sock").write_bytes(b"")
+            (run_dir / "qga.sock").write_bytes(b"")
+            (run_dir / "screenshot.png").write_bytes(PNG)
+            (run_dir / "result.json").write_text("{}\n", encoding="utf-8")
+            (run_dir / "serial.log").write_text("boot\n", encoding="utf-8")
+            discard_throwaway_disks(run_dir)
+            self.assertFalse((run_dir / "overlay.qcow2").exists())
+            self.assertFalse((run_dir / "OVMF_VARS.fd").exists())
+            self.assertTrue((run_dir / "screenshot.png").is_file())
+            self.assertTrue((run_dir / "result.json").is_file())
+            self.assertTrue((run_dir / "serial.log").is_file())
+
     def test_vm_run_graphical_records_gtk_argv(self) -> None:
         recorded: list[list[str]] = []
 
@@ -435,6 +536,9 @@ class HelpAndMiseTests(unittest.TestCase):
         text = buf.getvalue() + err.getvalue()
         self.assertIn("--session-only", text)
         self.assertIn("--keep", text)
+        self.assertIn("--install-from", text)
+        self.assertIn("release", text)
+        self.assertIn("local-archive", text)
         self.assertNotIn("not implemented", text)
 
     def test_vm_run_help_has_graphical(self) -> None:
@@ -448,6 +552,213 @@ class HelpAndMiseTests(unittest.TestCase):
         self.assertIn("--keep", text)
         self.assertNotIn("not implemented", text)
         self.assertNotIn("--maintain", text)
+
+
+class ArchInstallFromTests(unittest.TestCase):
+    def test_missing_golden_install_from_release_twice(self) -> None:
+        guest = load_guest("arch")
+        msg = missing_golden_message("arch")
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "empty-cache"
+            cache.mkdir()
+            old = os.environ.get(config.CACHE_ENV)
+            os.environ[config.CACHE_ENV] = str(cache)
+            texts = []
+            try:
+                for _ in range(2):
+                    buf = io.StringIO()
+                    err = io.StringIO()
+                    with (
+                        redirect_stdout(buf),
+                        redirect_stderr(err),
+                        patch(
+                            "subprocess.Popen", side_effect=_refuse_qemu_system
+                        ) as popen,
+                        patch(
+                            "subprocess.run", side_effect=_refuse_qemu_system
+                        ) as run,
+                        patch(
+                            "strataqemu.image_build.run_image_build"
+                        ) as build,
+                        patch(
+                            "strataqemu.image_build.build_live"
+                        ) as live,
+                    ):
+                        code = main(
+                            [
+                                "run-test",
+                                "--",
+                                "arch",
+                                "--install-from",
+                                "release",
+                            ]
+                        )
+                    self.assertEqual(code, 1)
+                    text = buf.getvalue() + err.getvalue()
+                    texts.append(text)
+                    self.assertIn(msg, text)
+                    self.assertNotIn("not implemented", text)
+                    popen.assert_not_called()
+                    run.assert_not_called()
+                    build.assert_not_called()
+                    live.assert_not_called()
+            finally:
+                if old is None:
+                    os.environ.pop(config.CACHE_ENV, None)
+                else:
+                    os.environ[config.CACHE_ENV] = old
+        self.assertEqual(texts[0], texts[1])
+        self.assertFalse(golden_qcow2(guest, cache).exists())
+
+    def test_ubuntu_install_from_release_fail_closed(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with (
+            redirect_stdout(buf),
+            redirect_stderr(err),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+            patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+        ):
+            code = main(["run-test", "--", "ubuntu-2404", "--install-from", "release"])
+        self.assertEqual(code, 2)
+        text = buf.getvalue() + err.getvalue()
+        self.assertIn(INSTALL_FROM_FAIL_CLOSED, text)
+        popen.assert_not_called()
+        run.assert_not_called()
+
+    def test_arch_local_archive_fail_closed(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with (
+            redirect_stdout(buf),
+            redirect_stderr(err),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+        ):
+            code = main(
+                ["run-test", "--", "arch", "--install-from", "local-archive"]
+            )
+        self.assertEqual(code, 2)
+        self.assertIn(INSTALL_FROM_FAIL_CLOSED, buf.getvalue() + err.getvalue())
+        popen.assert_not_called()
+
+    def test_install_from_release_records_helper_not_version(self) -> None:
+        fake = _FakeRun()
+        recorded_argv: list[list[str]] = []
+
+        def popen(argv, **kwargs):
+            name = Path(str(argv[0])).name if argv else ""
+            if name.startswith("qemu-system"):
+                recorded_argv.append(list(argv))
+                return _DummyProc()
+            raise AssertionError(f"unexpected Popen: {argv}")
+
+        def fake_overlay(golden, overlay, **kwargs):
+            dest = Path(overlay)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"overlay")
+            return dest
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cache, golden = _cache_with_golden(tmp, "arch")
+            host = _host_ok(tmp)
+            buf = io.StringIO()
+            err = io.StringIO()
+            with (
+                redirect_stdout(buf),
+                redirect_stderr(err),
+                patch.object(Machine, "shutdown", return_value="kill"),
+                patch(
+                    "strataqemu.tests_spec.qmp_screendump", return_value=False
+                ),
+            ):
+                code = run_run_test(
+                    "arch",
+                    install_from="release",
+                    keep=True,
+                    cache_dir=cache,
+                    check_host_fn=lambda: host,
+                    run=fake,
+                    popen=popen,
+                    create_overlay_fn=fake_overlay,
+                    settle_s=0,
+                )
+            self.assertEqual(code, 0, err.getvalue())
+            self.assertTrue(recorded_argv)
+            qemu_argv = recorded_argv[0]
+            self.assertNotIn("if=pflash", " ".join(qemu_argv))
+            blob = " ".join(str(c) for c in fake.calls)
+            self.assertIn("install-arch.sh", blob)
+            self.assertIn("gtk-launch", blob)
+            self.assertIn("hyprctl clients", blob)
+            self.assertNotIn("strata --version", blob)
+            helper = (
+                Path(__file__).resolve().parents[1]
+                / "images"
+                / "common"
+                / "install-arch.sh"
+            ).read_text(encoding="utf-8")
+            self.assertIn("--non-interactive", helper)
+            self.assertIn("--with-desktop-entry", helper)
+            self.assertIn("--without-file-chooser", helper)
+            result_files = list((cache / "runs").glob("*/result.json"))
+            self.assertTrue(result_files)
+            text = result_files[0].read_text(encoding="utf-8")
+            self.assertIn('"name": "session"', text)
+            self.assertIn('"name": "install"', text)
+            self.assertIn('"name": "desktop-entry"', text)
+            self.assertIn('"name": "window"', text)
+            self.assertNotIn('"name": "version"', text)
+            self.assertIn("install_sh_sha256", text)
+            self.assertIn("abababab", text)
+            del golden
+
+    def test_session_only_arch_does_not_install(self) -> None:
+        fake = _FakeRun()
+
+        def popen(argv, **kwargs):
+            name = Path(str(argv[0])).name if argv else ""
+            if name.startswith("qemu-system"):
+                return _DummyProc()
+            raise AssertionError(f"unexpected Popen: {argv}")
+
+        def fake_overlay(golden, overlay, **kwargs):
+            dest = Path(overlay)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"overlay")
+            return dest
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cache, _golden = _cache_with_golden(tmp, "arch")
+            host = _host_ok(tmp)
+            err = io.StringIO()
+            with (
+                redirect_stderr(err),
+                patch.object(Machine, "shutdown", return_value=None),
+                patch(
+                    "strataqemu.tests_spec.qmp_screendump", return_value=False
+                ),
+            ):
+                code = run_run_test(
+                    "arch",
+                    session_only=True,
+                    keep=True,
+                    cache_dir=cache,
+                    check_host_fn=lambda: host,
+                    run=fake,
+                    popen=popen,
+                    create_overlay_fn=fake_overlay,
+                    settle_s=0,
+                )
+            self.assertEqual(code, 0, err.getvalue())
+            blob = " ".join(str(c) for c in fake.calls)
+            self.assertIn("grim", blob)
+            self.assertNotIn("install-arch.sh", blob)
+            self.assertNotIn("install.sh", blob)
+            self.assertNotIn("strata --version", blob)
+            self.assertNotIn("gtk-launch", blob)
+            self.assertNotIn("NameHasOwner", blob)
 
 
 if __name__ == "__main__":

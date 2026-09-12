@@ -115,6 +115,17 @@ class XorrisoIsoTests(unittest.TestCase):
         tmpl = (guest.recipe_dir / "user-data.yaml.tmpl").read_text(encoding="utf-8")
         self.assertEqual(tmpl, TEMPLATE)
 
+    def test_arch_template_renders_tester_wheel(self) -> None:
+        guest = load_guest("arch")
+        tmpl = (guest.recipe_dir / "user-data.yaml.tmpl").read_text(encoding="utf-8")
+        rendered = render_user_data(tmpl, PUBKEY)
+        self.assertIn("name: tester", rendered)
+        self.assertIn("wheel", rendered)
+        self.assertIn("NOPASSWD", rendered)
+        self.assertIn(PUBKEY, rendered)
+        self.assertNotIn("{{SSH_AUTHORIZED_KEY}}", rendered)
+        self.assertNotIn("omarchy", rendered.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

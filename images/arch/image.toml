@@ -1,0 +1,40 @@
+id = "arch"
+arch = "x86_64"
+# arch-boxes cloudimg is GPT with a BIOS boot partition; SeaBIOS (no
+# pflash) boots it. Do not pass a half-UEFI argv.
+firmware = "bios"
+source_kind = "cloud-image"
+# Dated tree, not …/images/latest/.
+source_url = "https://fastly.mirror.pkgbuild.com/images/v20260901.583572/Arch-Linux-x86_64-cloudimg-20260901.583572.qcow2"
+source_sha256 = "e3e688f97a71b265ce202905a504253f60f3680cf57d011a45411c43bedfa930"
+disk_gb = 40
+memory_mib = 8192
+cpus = 4
+build_timeout_s = 3600
+boot_timeout_s = 180
+
+[session]
+kind = "hyprland"
+display_manager = "greetd"
+compositor = "hyprland"
+autologin = true
+wayland = true
+
+[packages]
+manager = "pacman"
+# Must match the cloudimg day. A 404 archive fails the build with
+# retarget instructions; never fall through to a rolling mirror.
+snapshot_url = "https://archive.archlinux.org/repos/2026/09/01/$repo/os/$arch"
+runtime = [
+  "hyprland",
+  "greetd",
+  "xdg-desktop-portal-hyprland",
+  "xdg-desktop-portal",
+  "jq",
+  "grim",
+  "ttf-liberation",
+]
+
+[user]
+name = "tester"
+groups = ["wheel"]

@@ -17,6 +17,7 @@ from strataqemu.cli import CheckHostResult, main
 from strataqemu.guest import load_guest
 from strataqemu.image_build import (
     golden_qcow2,
+    recipe_files_to_upload,
     required_free_bytes,
     run_image_build,
     working_qemu_argv,
@@ -25,6 +26,7 @@ from strataqemu.qemu import uses_cloud_init_seed
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP = REPO_ROOT / "images" / "ubuntu-2404" / "bootstrap.sh"
+ARCH_BOOTSTRAP = REPO_ROOT / "images" / "arch" / "bootstrap.sh"
 
 
 def _after(argv: list[str], flag: str) -> str:
@@ -130,6 +132,38 @@ class IncrementalImageBuildTests(unittest.TestCase):
             self.assertEqual(paths[0], paths[1])
             self.assertEqual(paths[0], str(golden.resolve()))
 
+    def test_arch_matching_golden_prints_path_and_skips_qemu(self) -> None:
+        guest = load_guest("arch")
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "cache"
+            golden = golden_qcow2(guest, cache)
+            golden.parent.mkdir(parents=True)
+            golden.write_bytes(b"existing-golden")
+            buf = io.StringIO()
+            err = io.StringIO()
+            with (
+                redirect_stdout(buf),
+                redirect_stderr(err),
+                patch("strataqemu.image_build.check_host") as ch,
+                patch("subprocess.Popen", side_effect=_refuse_qemu_system),
+                patch("subprocess.run", side_effect=_refuse_qemu_system),
+            ):
+                code = run_image_build("arch", cache_dir=cache)
+            self.assertEqual(code, 0, err.getvalue())
+            self.assertIn(str(golden.resolve()), buf.getvalue())
+            ch.assert_not_called()
+
+    def test_arch_uploads_include_greetd_and_lua(self) -> None:
+        guest = load_guest("arch")
+        names = {p.name for p in recipe_files_to_upload(guest)}
+        self.assertEqual(
+            names, {"setup.sh", "greetd-config.toml", "hyprland.lua"}
+        )
+        ubuntu = load_guest("ubuntu-2404")
+        self.assertEqual(
+            {p.name for p in recipe_files_to_upload(ubuntu)}, {"setup.sh"}
+        )
+
 
 class WorkingDiskArgvTests(unittest.TestCase):
     def test_writeback_not_unsafe_and_scsi_cidata(self) -> None:
@@ -213,6 +247,54 @@ class BootstrapShTests(unittest.TestCase):
             self.assertIn("checksum", proc.stderr.lower())
             self.assertFalse(dest.exists(), dest)
             self.assertFalse(partial.exists(), partial)
+
+    def test_arch_bootstrap_checksum_mismatch_fail_closed(self) -> None:
+        payload = b"arch-cloudimg-fixture-bad\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = tmp / "tiny.bin"
+            src.write_bytes(payload)
+            cache = tmp / "cache"
+            env = os.environ.copy()
+            env["STRATA_QEMU_CACHE"] = str(cache)
+            env["SOURCE_URL"] = src.resolve().as_uri()
+            env["SOURCE_SHA256"] = "0" * 64
+            env["SOURCE_FILENAME"] = "tiny.bin"
+            proc = subprocess.run(
+                ["bash", str(ARCH_BOOTSTRAP)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            dest = cache / "downloads" / "tiny.bin"
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("checksum", proc.stderr.lower())
+            self.assertFalse(dest.exists(), dest)
+
+    def test_arch_bootstrap_matching_sha256(self) -> None:
+        payload = b"arch-cloudimg-fixture\n"
+        digest = hashlib.sha256(payload).hexdigest()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = tmp / "tiny.bin"
+            src.write_bytes(payload)
+            cache = tmp / "cache"
+            env = os.environ.copy()
+            env["STRATA_QEMU_CACHE"] = str(cache)
+            env["SOURCE_URL"] = src.resolve().as_uri()
+            env["SOURCE_SHA256"] = digest
+            env["SOURCE_FILENAME"] = "tiny.bin"
+            proc = subprocess.run(
+                ["bash", str(ARCH_BOOTSTRAP)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            dest = cache / "downloads" / "tiny.bin"
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(dest.read_bytes(), payload)
 
 
 class FreeSpaceFormulaTests(unittest.TestCase):

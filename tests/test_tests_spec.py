@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
+import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +16,8 @@ from strataqemu.guest import load_guest
 from strataqemu.qemu import Machine
 from strataqemu.tests_spec import (
     GDBUS_NAME_HAS_OWNER_ARGV,
+    INSTALL_FROM_FAIL_CLOSED,
+    INSTALL_FROM_RELEASE_STEPS,
     SCREENSHOT_TOOL_MISSING,
     SESSION_ONLY_FORBIDDEN,
     STRATA_BUS_NAME,
@@ -22,14 +28,20 @@ from strataqemu.tests_spec import (
     compositor_process_name,
     extra_qmp_screendump,
     gdbus_name_has_owner_command,
+    hyprctl_class_oracle_command,
+    install_arch_script,
     missing_golden_message,
+    parse_install_sh_sha256,
     parse_name_has_owner,
     parse_session_exports,
+    run_install_from_release_steps,
     run_session_only_steps,
+    screenshot_tool_for_compositor,
     screenshot_tool_missing,
     session_only_step_names,
     smoke_desktop_script,
     smoke_session_script,
+    supports_install_from_release,
     wait_gnome_bus_name,
 )
 
@@ -49,6 +61,7 @@ class _FakeRun:
         self.calls: list[list[str]] = []
         self.remote: list[str] = []
         self.which_screenshot = 0
+        self.which_grim = 0
         self.session_stdout = (
             "SESSION_ID=c1\n"
             "XDG_RUNTIME_DIR=/run/user/1000\n"
@@ -58,6 +71,9 @@ class _FakeRun:
         self.session_code = 0
         self.gdbus_stdout = "(false,)\n"
         self.write_png_on_scp = True
+        self.install_digest = hashlib.sha256(b"fixture-install-sh").hexdigest()
+        self.hyprctl_code = 0
+        self.exec_line = "Exec=/home/tester/.local/bin/strata %U\n"
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
@@ -72,6 +88,11 @@ class _FakeRun:
             return _completed(0)
         remote = str(argv[-1]) if argv else ""
         self.remote.append(remote)
+        if "command -v grim" in remote:
+            return _completed(
+                self.which_grim,
+                stdout="" if self.which_grim else "/usr/bin/grim\n",
+            )
         if "command -v gnome-screenshot" in remote:
             return _completed(
                 self.which_screenshot,
@@ -81,6 +102,20 @@ class _FakeRun:
             return _completed(self.session_code, stdout=self.session_stdout)
         if "gnome-screenshot" in remote:
             return _completed(0)
+        if " grim " in f" {remote} " or remote.strip().startswith("grim "):
+            return _completed(0)
+        if "install-arch.sh" in remote:
+            return _completed(
+                0, stdout=f"INSTALL_SH_SHA256={self.install_digest}\n"
+            )
+        if "Exec=" in remote or STRATA_BUS_NAME + ".desktop" in remote:
+            return _completed(0, stdout=self.exec_line)
+        if "test -x" in remote:
+            return _completed(0)
+        if "gtk-launch" in remote or "gio launch" in remote:
+            return _completed(0)
+        if "hyprctl clients" in remote:
+            return _completed(self.hyprctl_code, stdout='{"class":"ok"}\n')
         if "NameHasOwner" in remote:
             return _completed(0, stdout=self.gdbus_stdout)
         return _completed(0)
@@ -109,6 +144,17 @@ class ParseOracleTests(unittest.TestCase):
         guest = load_guest("ubuntu-2404")
         self.assertEqual(compositor_process_name(guest), "gnome-shell")
         self.assertEqual(compositor_process_name("ubuntu-2404"), "gnome-shell")
+        self.assertEqual(screenshot_tool_for_compositor("gnome-shell"), "gnome-screenshot")
+
+    def test_arch_compositor_is_hyprland_grim(self) -> None:
+        guest = load_guest("arch")
+        self.assertEqual(compositor_process_name(guest), "Hyprland")
+        self.assertEqual(compositor_process_name("arch"), "Hyprland")
+        self.assertEqual(screenshot_tool_for_compositor("Hyprland"), "grim")
+        self.assertTrue(supports_install_from_release(guest))
+        self.assertFalse(supports_install_from_release("ubuntu-2404"))
+        self.assertIn("hyprctl clients", hyprctl_class_oracle_command())
+        self.assertIn(STRATA_BUS_NAME, hyprctl_class_oracle_command())
 
     def test_missing_golden_message_matches_design(self) -> None:
         msg = missing_golden_message("ubuntu-2404")
@@ -240,12 +286,232 @@ class SessionOnlyDriveTests(unittest.TestCase):
         self.assertTrue(smoke_desktop_script().is_file())
         desktop = smoke_desktop_script().read_text(encoding="utf-8")
         self.assertIn("NameHasOwner", desktop)
+        self.assertIn("grim", desktop)
+        self.assertIn("hyprctl clients", desktop)
         body = [
             line
             for line in desktop.splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ]
         self.assertFalse(any("gtk-launch" in line for line in body))
+
+    def test_session_only_arch_uses_grim_not_install(self) -> None:
+        fake = _FakeRun()
+        fake.session_stdout += "HYPRLAND_INSTANCE_SIGNATURE=sig\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            dest = tmp / "screenshot.png"
+            commands: list[str] = []
+            steps = run_session_only_steps(
+                machine,
+                compositor="Hyprland",
+                screenshot_dest=dest,
+                session_timeout=5,
+                run=fake,
+                commands=commands,
+                sleep=lambda _s: None,
+            )
+            names = [s["name"] for s in steps]
+            self.assertEqual(names, ["session", "screenshot"])
+            blob = "\n".join(commands)
+            self.assertIn("grim", blob)
+            self.assertNotIn("gnome-screenshot", blob)
+            self.assertNotIn("install.sh", blob)
+            self.assertNotIn("strata --version", blob)
+            self.assertNotIn("gtk-launch", blob)
+            self.assertNotIn("NameHasOwner", blob)
+            assert_session_only_commands(commands)
+
+    def test_missing_grim_golden_bug_string(self) -> None:
+        fake = _FakeRun()
+        fake.which_grim = 1
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            with self.assertRaises(SessionSmokeError) as ctx:
+                capture_guest_screenshot(
+                    machine,
+                    {"WAYLAND_DISPLAY": "wayland-0"},
+                    tmp / "shot.png",
+                    tool="grim",
+                    run=fake,
+                )
+        self.assertEqual(str(ctx.exception), SCREENSHOT_TOOL_MISSING)
+
+    def test_install_from_release_steps_no_version(self) -> None:
+        fake = _FakeRun()
+        fake.session_stdout += "HYPRLAND_INSTANCE_SIGNATURE=sig\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            dest = tmp / "screenshot.png"
+            commands: list[str] = []
+            steps, extras = run_install_from_release_steps(
+                machine,
+                guest=load_guest("arch"),
+                screenshot_dest=dest,
+                session_timeout=5,
+                run=fake,
+                commands=commands,
+                sleep=lambda _s: None,
+            )
+        names = [s["name"] for s in steps]
+        self.assertEqual(list(names), list(INSTALL_FROM_RELEASE_STEPS))
+        self.assertNotIn("version", names)
+        self.assertEqual(extras["install_sh_sha256"], fake.install_digest)
+        blob = "\n".join(commands)
+        self.assertIn("install-arch.sh", blob)
+        self.assertIn("gtk-launch", blob)
+        self.assertIn("hyprctl clients", blob)
+        self.assertIn("grim", blob)
+        self.assertNotIn("strata --version", blob)
+        self.assertNotIn("NameHasOwner", blob)
+        helper = install_arch_script().read_text(encoding="utf-8")
+        self.assertIn("--non-interactive", helper)
+        self.assertIn("--with-desktop-entry", helper)
+        self.assertIn("--without-file-chooser", helper)
+        self.assertIn(fake.install_digest, extras["install_sh_sha256"])
+
+    def test_install_from_missing_grim_before_window_wait(self) -> None:
+        fake = _FakeRun()
+        fake.which_grim = 1
+        fake.session_stdout += "HYPRLAND_INSTANCE_SIGNATURE=sig\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            commands: list[str] = []
+            with self.assertRaises(SessionSmokeError) as ctx:
+                run_install_from_release_steps(
+                    machine,
+                    guest=load_guest("arch"),
+                    screenshot_dest=tmp / "shot.png",
+                    session_timeout=5,
+                    run=fake,
+                    commands=commands,
+                    sleep=lambda _s: None,
+                )
+        self.assertEqual(str(ctx.exception), SCREENSHOT_TOOL_MISSING)
+        blob = "\n".join(commands)
+        self.assertNotIn("gtk-launch", blob)
+        self.assertNotIn("hyprctl clients", blob)
+
+
+class InstallArchHelperTests(unittest.TestCase):
+    def test_helper_saves_then_execs_existing_flags(self) -> None:
+        helper = install_arch_script()
+        self.assertTrue(helper.is_file())
+        text = helper.read_text(encoding="utf-8")
+        self.assertIn("https://raw.githubusercontent.com/lgse/strata/main/install.sh", text)
+        self.assertIn("--non-interactive", text)
+        self.assertIn("--with-desktop-entry", text)
+        self.assertIn("--without-file-chooser", text)
+        self.assertIn("INSTALL_SH_SHA256", text)
+        commands = [
+            line
+            for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertFalse(any("|" in line and "bash" in line for line in commands))
+        self.assertNotIn("strata --version", text)
+        self.assertIn("omarchy unexpectedly present", text)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            bindir = tmp / "bin"
+            bindir.mkdir()
+            record = tmp / "install-argv"
+            home = tmp / "home"
+            home.mkdir()
+            dest = tmp / "downloaded-install.sh"
+
+            curl = bindir / "curl"
+            curl.write_text(
+                "#!/bin/bash\n"
+                "set -euo pipefail\n"
+                "dest=\"\"\n"
+                "while [[ $# -gt 0 ]]; do\n"
+                "  if [[ \"$1\" == \"-o\" ]]; then dest=\"$2\"; shift 2; continue; fi\n"
+                "  shift\n"
+                "done\n"
+                "cat > \"$dest\" <<'INNER'\n"
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$@\" > \"${INSTALL_ARGV_RECORD:?}\"\n"
+                "mkdir -p \"$HOME/.local/bin\"\n"
+                "echo stub > \"$HOME/.local/bin/strata\"\n"
+                "chmod +x \"$HOME/.local/bin/strata\"\n"
+                "INNER\n"
+                "chmod +x \"$dest\"\n",
+                encoding="utf-8",
+            )
+            curl.chmod(curl.stat().st_mode | stat.S_IXUSR)
+            for name in ("sha256sum", "awk", "bash", "chmod", "mkdir", "cat", "echo"):
+                found = shutil.which(name)
+                self.assertIsNotNone(found, name)
+                assert found is not None
+                os.symlink(found, bindir / name)
+
+            env = os.environ.copy()
+            env["PATH"] = str(bindir)
+            env["HOME"] = str(home)
+            env["INSTALL_SH_DEST"] = str(dest)
+            env["INSTALL_ARGV_RECORD"] = str(record)
+            env["OMARCHY_SHARE"] = str(tmp / "no-omarchy-share")
+            env["OMARCHY_LOCAL"] = str(tmp / "no-omarchy-local")
+            bash = shutil.which("bash")
+            self.assertIsNotNone(bash)
+            assert bash is not None
+            proc = subprocess.run(
+                [bash, str(helper)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+            self.assertEqual(parse_install_sh_sha256(proc.stdout), digest)
+            argv = record.read_text(encoding="utf-8").split()
+            self.assertEqual(
+                argv,
+                [
+                    "--non-interactive",
+                    "--with-desktop-entry",
+                    "--without-file-chooser",
+                ],
+            )
+            self.assertTrue((home / ".local/bin/strata").is_file())
+
+    def test_fail_closed_message_is_stable(self) -> None:
+        self.assertIn("not implemented yet (fail closed)", INSTALL_FROM_FAIL_CLOSED)
 
 
 if __name__ == "__main__":

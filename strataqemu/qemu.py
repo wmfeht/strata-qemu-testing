@@ -193,14 +193,21 @@ def _send_json(sock: socket.socket, payload: dict) -> None:
 
 
 def qga_guest_shutdown(socket_path: Path | str, *, timeout: float = 5.0) -> bool:
-    """Send qemu-ga ``guest-shutdown``. Returns False if the socket/agent fails."""
+    """Send qemu-ga ``guest-shutdown``. Returns False if the socket/agent fails.
+
+    A hang-up after the execute is success: the guest often goes away before
+    a JSON return, and falling through to SSH then prints Connection refused.
+    """
     path = str(Path(socket_path))
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
             sock.connect(path)
             _send_json(sock, {"execute": "guest-shutdown"})
-            reply = _recv_json_line(sock)
+            try:
+                reply = _recv_json_line(sock)
+            except (OSError, json.JSONDecodeError, TimeoutError):
+                return True
     except (OSError, json.JSONDecodeError, TimeoutError) as exc:
         log.debug("qga guest-shutdown failed: %s", exc)
         return False
@@ -386,7 +393,13 @@ class Machine:
             user=self.user,
         )
         try:
-            proc = subprocess.run(argv, check=False, timeout=15)
+            proc = subprocess.run(
+                argv,
+                check=False,
+                timeout=15,
+                capture_output=True,
+                text=True,
+            )
         except (OSError, subprocess.TimeoutExpired):
             return False
         # Guest going away often yields 255 (connection closed).

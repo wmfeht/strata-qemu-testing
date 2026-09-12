@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,13 @@ OVMF_VARS_RELATIVE = (
 RunFn = Callable[..., subprocess.CompletedProcess]
 PopenFn = Callable[..., subprocess.Popen]
 
+RECIPE_UPLOAD_NAMES = (
+    "setup.sh",
+    "greetd-config.toml",
+    "hyprland.lua",
+    "hyprland.conf",
+)
+
 
 class ImageBuildError(RuntimeError):
     """Live image-build failure."""
@@ -69,6 +77,18 @@ def ovmf_vars_candidates(
 
 def find_ovmf_vars(share_roots: Sequence[Path] | None = None) -> Path | None:
     return find_ovmf_code(ovmf_vars_candidates(share_roots))
+
+
+def recipe_files_to_upload(guest: Guest) -> tuple[Path, ...]:
+    """setup.sh plus session drop-ins that setup copies into the guest."""
+    found: list[Path] = []
+    for name in RECIPE_UPLOAD_NAMES:
+        path = guest.recipe_dir / name
+        if path.is_file():
+            found.append(path)
+    if not any(path.name == "setup.sh" for path in found):
+        raise ImageBuildError(f"missing setup.sh in {guest.recipe_dir}")
+    return tuple(found)
 
 
 def golden_filename(guest: Guest) -> str:
@@ -492,8 +512,9 @@ def build_live(
         )
 
         ovmf_vars: Path | None = None
-        ovmf_code = host.ovmf_code
+        ovmf_code: Path | None = None
         if guest.firmware == "uefi":
+            ovmf_code = host.ovmf_code
             vars_template = find_ovmf_vars()
             if vars_template is None:
                 searched = ", ".join(str(p) for p in ovmf_vars_candidates())
@@ -516,11 +537,11 @@ def build_live(
         wait_ssh(machine, timeout=guest.boot_timeout_s, run=run)
         wait_cloud_init(machine, run=run)
 
-        setup = guest.recipe_dir / "setup.sh"
-        _scp_to_guest(machine, setup, "/tmp/setup.sh", run=run)
+        for src in recipe_files_to_upload(guest):
+            _scp_to_guest(machine, src, f"/tmp/{src.name}", run=run)
         env_prefix = ""
         if guest.packages.snapshot_url:
-            env_prefix = f"SNAPSHOT_URL={guest.packages.snapshot_url} "
+            env_prefix = f"SNAPSHOT_URL={shlex.quote(guest.packages.snapshot_url)} "
         _ssh_run(
             machine,
             f"{env_prefix}sudo -n bash /tmp/setup.sh",
