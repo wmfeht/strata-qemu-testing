@@ -318,11 +318,113 @@ class ArchRecipeTests(unittest.TestCase):
             self.assertIn("dated", str(ctx.exception).lower())
 
 
+FEDORA = REPO_ROOT / "images" / "fedora-workstation"
+
+
+class FedoraWorkstationRecipeTests(unittest.TestCase):
+    def test_load_real_recipe(self) -> None:
+        guest = load_guest("fedora-workstation")
+        self.assertEqual(guest.id, "fedora-workstation")
+        self.assertNotIn(".", guest.id)
+        self.assertEqual(guest.arch, "x86_64")
+        self.assertEqual(guest.firmware, "uefi")
+        self.assertEqual(guest.source_kind, "cloud-image")
+        self.assertIn(
+            "download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images",
+            guest.source_url,
+        )
+        self.assertNotIn("/current/", guest.source_url)
+        self.assertNotIn("/latest/", guest.source_url)
+        self.assertNotIn("44-1.7", guest.source_url)
+        self.assertIsNotNone(SHA256_HEX.fullmatch(guest.source_sha256))
+        self.assertEqual(guest.source_filename(), "Fedora-Cloud-Base-Generic.qcow2")
+        self.assertNotIn("44-1.7", guest.source_filename())
+        self.assertEqual(guest.user.name, "tester")
+        self.assertIn("wheel", guest.user.groups)
+        self.assertTrue(guest.session.autologin)
+        self.assertEqual(guest.session.kind, "gnome")
+        self.assertEqual(guest.session.display_manager, "gdm")
+        self.assertEqual(guest.session.compositor, "mutter")
+        self.assertTrue(guest.session.wayland)
+        self.assertEqual(guest.packages.manager, "dnf")
+        runtime = set(guest.packages.runtime)
+        self.assertIn("gnome-screenshot", runtime)
+        self.assertIn("gvfs", runtime)
+        self.assertNotIn("gvfs-daemons", runtime)
+        self.assertIn("xdg-desktop-portal", runtime)
+        self.assertIn("xdg-desktop-portal-gnome", runtime)
+        self.assertTrue(uses_cloud_init_seed(guest.id))
+        self.assertTrue((guest.recipe_dir / "bootstrap.sh").is_file())
+        self.assertTrue((guest.recipe_dir / "setup.sh").is_file())
+        self.assertTrue((guest.recipe_dir / "user-data.yaml.tmpl").is_file())
+        self.assertFalse((guest.recipe_dir / "install.sh").exists())
+        self.assertFalse((guest.recipe_dir / "install.expect").exists())
+
+    def test_bootstrap_scrape_is_not_compose_pin(self) -> None:
+        text = (FEDORA / "bootstrap.sh").read_text(encoding="utf-8")
+        self.assertIn("Fedora-Cloud-Base-Generic", text)
+        self.assertIn("CHECKSUM", text)
+        self.assertNotIn("44-1.7", text)
+        self.assertNotIn("/latest/", text)
+        self.assertNotIn("/current/", text)
+
+    def test_directory_url_without_source_filename_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            copy = Path(td) / "fedora-workstation"
+            shutil.copytree(FEDORA, copy)
+            toml = copy / "image.toml"
+            lines = [
+                line
+                for line in toml.read_text(encoding="utf-8").splitlines()
+                if not line.startswith("source_filename")
+            ]
+            toml.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            with self.assertRaises(GuestError) as ctx:
+                Guest.load(copy)
+            self.assertIn("source_filename", str(ctx.exception))
+
+    def test_setup_sh_configures_workstation_gnome(self) -> None:
+        text = (FEDORA / "setup.sh").read_text(encoding="utf-8")
+        self.assertIn("@workstation-product-environment", text)
+        self.assertIn("gnome-screenshot", text)
+        self.assertIn("gvfs", text)
+        self.assertNotIn("gvfs-daemons", text)
+        self.assertIn("xdg-desktop-portal-gnome", text)
+        self.assertIn("gnome-initial-setup", text)
+        self.assertIn("gnome-tour", text)
+        self.assertIn("welcome-dialog-last-shown-version", text)
+        self.assertIn("gnome-initial-setup-done", text)
+        self.assertIn("AutomaticLogin=tester", text)
+        self.assertIn("/etc/gdm/custom.conf", text)
+        self.assertNotIn("/etc/gdm3/", text)
+        self.assertIn("loginctl enable-linger tester", text)
+        self.assertIn("qemu-guest-agent", text)
+        self.assertIn("firewall-cmd", text)
+        self.assertIn("--add-service=ssh", text)
+        self.assertIn("rpm -qa", text)
+        self.assertIn("nmcli", text)
+        self.assertNotRegex(text, r"(^|[;&|]\s*)(bash\s+|sudo\s+.*)?/?install\.sh")
+        self.assertNotIn("install.sh", text)
+
+    def test_user_data_template_has_tester_wheel_nopasswd(self) -> None:
+        text = (FEDORA / "user-data.yaml.tmpl").read_text(encoding="utf-8")
+        self.assertIn("tester", text)
+        self.assertIn("foobar", text)
+        self.assertIn("NOPASSWD", text)
+        self.assertIn("wheel", text)
+        self.assertIn("{{SSH_AUTHORIZED_KEY}}", text)
+        lowered = text.lower()
+        for needle in ("ghp_", "gh auth", "gh_token", "tskey-", "tailscale"):
+            self.assertNotIn(needle, lowered)
+
+
 class MiseBootstrapBoundaryTests(unittest.TestCase):
     def test_mise_bootstrap_does_not_download_noble_cloudimg(self) -> None:
         text = (REPO_ROOT / "mise.toml").read_text(encoding="utf-8")
         self.assertNotIn("noble-server-cloudimg", text)
         self.assertNotIn("cloud-images.ubuntu.com", text)
+        self.assertNotIn("download.fedoraproject.org", text)
+        self.assertNotIn("Fedora-Cloud-Base-Generic", text)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,41 @@
+id = "fedora-workstation"
+arch = "x86_64"
+firmware = "uefi"
+source_kind = "cloud-image"
+# F44 Cloud images tree, not …/latest/ or a compose filename. bootstrap.sh
+# scrapes Fedora-Cloud-Base-Generic-*.qcow2 and the CHECKSUM sidecar.
+source_url = "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/"
+source_sha256 = "28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f"
+# Cache name after scrape; compose (e.g. 44-1.7) is not pinned here.
+source_filename = "Fedora-Cloud-Base-Generic.qcow2"
+disk_gb = 40
+memory_mib = 8192
+cpus = 4
+build_timeout_s = 3600
+boot_timeout_s = 180
+ovmf_code = "OVMF_CODE.4m.fd"
+ovmf_vars_template = "OVMF_VARS.4m.fd"
+
+[session]
+kind = "gnome"
+display_manager = "gdm"
+compositor = "mutter"
+autologin = true
+wayland = true
+
+[packages]
+manager = "dnf"
+# Fedora has no Ubuntu-style public snapshot of updates. dnf pulls current
+# F44 packages; provenance records rpm -qa and the cloudimg SHA.
+runtime = [
+  "bubblewrap", "ffmpeg-free", "ffmpegthumbnailer", "fontconfig",
+  "gstreamer1-plugin-libav", "gstreamer1-plugins-good",
+  "gtk4", "gtksourceview5", "gvfs",
+  "poppler-glib", "xdg-utils", "desktop-file-utils",
+  "at-spi2-core", "xdg-desktop-portal", "xdg-desktop-portal-gnome",
+  "gnome-screenshot",
+]
+
+[user]
+name = "tester"
+groups = ["wheel"]

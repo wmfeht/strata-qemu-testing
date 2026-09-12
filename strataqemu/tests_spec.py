@@ -17,7 +17,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from strataqemu.guest import Guest
-from strataqemu.qemu import Machine, qmp_screendump
+from strataqemu.qemu import Machine, qmp_screendump, vnc_framebuffer_png
 from strataqemu.ssh import scp_command, scp_download_command
 
 log = logging.getLogger("strataqemu")
@@ -30,6 +30,7 @@ WINDOW_TIMEOUT_S = 45
 DESKTOP_ENTRY_TIMEOUT_S = 10
 GUEST_SCREENSHOT_REMOTE = "/tmp/strata-window.png"
 SCREENSHOT_TOOL_MISSING = "screenshot tool missing; rebuild the golden"
+GNOME_SCREENSHOT_TIMEOUT_S = 15
 STRATA_BUS_NAME = "io.github.lgse.Strata"
 STRATA_DESKTOP_FILE = "io.github.lgse.Strata.desktop"
 STRATA_BIN_REL = ".local/bin/strata"
@@ -390,8 +391,15 @@ def capture_guest_screenshot(
     tool: str | None = None,
     run: RunFn | None = None,
     commands: list[str] | None = None,
+    vnc_capture_fn: Callable[..., bool] | None = None,
+    screenshot_timeout: float = GNOME_SCREENSHOT_TIMEOUT_S,
 ) -> Path:
-    """In-guest ``grim`` or ``gnome-screenshot``. Missing binary is a golden bug."""
+    """In-guest ``grim`` / ``gnome-screenshot``. Missing binary is a golden bug.
+
+    GNOME 50 in QEMU denies ``org.gnome.Shell.Screenshot`` and the screenshot
+    portal never completes; after the in-guest tool is confirmed on PATH,
+    a timed-out ``gnome-screenshot`` falls back to the QEMU VNC framebuffer.
+    """
     binary = tool or "gnome-screenshot"
     which = ssh_run(
         machine,
@@ -405,20 +413,52 @@ def capture_guest_screenshot(
     prefix = env_prefix(env)
     if binary == "grim":
         cmd = f"{prefix} grim {shlex.quote(GUEST_SCREENSHOT_REMOTE)}"
+        ssh_run(
+            machine, cmd, timeout=screenshot_timeout, check=True, run=run, commands=commands
+        )
+        scp_from_guest(
+            machine, GUEST_SCREENSHOT_REMOTE, dest, run=run, commands=commands
+        )
     else:
         cmd = f"{prefix} gnome-screenshot -f {shlex.quote(GUEST_SCREENSHOT_REMOTE)}"
-    ssh_run(
-        machine, cmd, timeout=60, check=True, run=run, commands=commands
-    )
-    scp_from_guest(
-        machine, GUEST_SCREENSHOT_REMOTE, dest, run=run, commands=commands
-    )
+        grabbed = False
+        try:
+            ssh_run(
+                machine,
+                cmd,
+                timeout=screenshot_timeout,
+                check=True,
+                run=run,
+                commands=commands,
+            )
+            scp_from_guest(
+                machine, GUEST_SCREENSHOT_REMOTE, dest, run=run, commands=commands
+            )
+            grabbed = True
+        except (subprocess.TimeoutExpired, SessionSmokeError):
+            grabbed = False
+        if not grabbed or not _png_ok(dest):
+            grabber = vnc_capture_fn or vnc_framebuffer_png
+            if machine.vnc_port is None or not grabber(
+                dest, display=machine.vnc_port
+            ):
+                raise SessionSmokeError(
+                    "gnome-screenshot did not produce a PNG; VNC fallback failed"
+                )
     data = dest.read_bytes() if dest.is_file() else b""
     if len(data) < MIN_PNG_BYTES or not data.startswith(PNG_MAGIC):
         raise SessionSmokeError(
             f"in-guest screenshot is empty or not a PNG ({dest}, {len(data)} bytes)"
         )
     return dest
+
+
+def _png_ok(dest: Path) -> bool:
+    try:
+        data = dest.read_bytes()
+    except OSError:
+        return False
+    return len(data) >= MIN_PNG_BYTES and data.startswith(PNG_MAGIC)
 
 
 def extra_qmp_screendump(machine: Machine, dest: Path) -> bool:

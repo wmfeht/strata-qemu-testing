@@ -79,6 +79,24 @@ def find_ovmf_vars(share_roots: Sequence[Path] | None = None) -> Path | None:
     return find_ovmf_code(ovmf_vars_candidates(share_roots))
 
 
+def inventory_basename(guest: Guest) -> str:
+    """Local inventory filename under the run dir.
+
+    Fedora records ``rpm -qa`` as ``rpm.txt``; Ubuntu (and Arch today)
+    keep the existing ``dpkg.txt`` path.
+    """
+    if guest.packages.manager == "dnf":
+        return "rpm.txt"
+    return "dpkg.txt"
+
+
+def inventory_provenance_key(guest: Guest) -> str:
+    """Provenance JSON key for the package inventory blob."""
+    if guest.packages.manager == "dnf":
+        return "rpm"
+    return "dpkg"
+
+
 def recipe_files_to_upload(guest: Guest) -> tuple[Path, ...]:
     """setup.sh plus session drop-ins that setup copies into the guest."""
     found: list[Path] = []
@@ -552,8 +570,9 @@ def build_live(
 
         inv_dir = run_dir / "inventory"
         inv_dir.mkdir(parents=True, exist_ok=True)
+        inv_name = inventory_basename(guest)
         _scp_from_guest(
-            machine, "/var/tmp/strata-inventory.txt", inv_dir / "dpkg.txt", run=run
+            machine, "/var/tmp/strata-inventory.txt", inv_dir / inv_name, run=run
         )
         _scp_from_guest(
             machine, "/var/tmp/strata-glibc.txt", inv_dir / "glibc.txt", run=run
@@ -582,7 +601,9 @@ def build_live(
             pass
         _install_symlink(golden_symlink(guest, cache), golden)
 
-        dpkg = (inv_dir / "dpkg.txt").read_text(encoding="utf-8", errors="replace")
+        inventory = (inv_dir / inv_name).read_text(
+            encoding="utf-8", errors="replace"
+        )
         glibc = (inv_dir / "glibc.txt").read_text(encoding="utf-8", errors="replace").strip()
         gtk = (inv_dir / "gtk.txt").read_text(encoding="utf-8", errors="replace").strip()
         payload = {
@@ -591,11 +612,12 @@ def build_live(
             "source": {
                 "url": guest.source_url,
                 "sha256": guest.source_sha256,
+                "filename": guest.source_filename(),
             },
             "recipe_digest": guest.recipe_digest(),
             "golden_digest": guest.golden_digest(),
             "built_at": stamp,
-            "dpkg": dpkg,
+            inventory_provenance_key(guest): inventory,
             "glibc": glibc,
             "gtk": gtk,
         }

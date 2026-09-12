@@ -8,7 +8,9 @@ from __future__ import annotations
 import json
 import logging
 import socket
+import struct
 import subprocess
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -287,6 +289,168 @@ def qmp_screendump(
         return dest_path.is_file() and dest_path.stat().st_size > 0
     except OSError:
         return False
+
+
+VNC_BASE_PORT = 5900
+
+
+def vnc_tcp_port(display: int) -> int | None:
+    """QEMU ``-vnc 127.0.0.1:DISPLAY`` listens on ``5900+DISPLAY``."""
+    port = VNC_BASE_PORT + int(display)
+    if port < 1 or port > 65535:
+        return None
+    return port
+
+
+def write_png_rgb(dest: Path, width: int, height: int, rgb: bytes) -> None:
+    """Write an 8-bit RGB PNG. ``rgb`` is ``width*height*3`` bytes."""
+    if width < 1 or height < 1:
+        raise ValueError("png size must be positive")
+    expected = width * height * 3
+    if len(rgb) != expected:
+        raise ValueError(f"rgb length {len(rgb)} != {expected}")
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(tag)
+        crc = zlib.crc32(data, crc) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+    raw = b"".join(
+        b"\x00" + rgb[y * width * 3 : (y + 1) * width * 3] for y in range(height)
+    )
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    dest.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(raw, 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def vnc_framebuffer_png(
+    dest: Path | str,
+    *,
+    display: int,
+    host: str = "127.0.0.1",
+    timeout: float = 8.0,
+) -> bool:
+    """Grab the QEMU VNC framebuffer to ``dest`` as PNG. Stdlib RFB only."""
+    port = vnc_tcp_port(display)
+    if port is None:
+        return False
+    dest_path = Path(dest)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError as exc:
+        log.debug("vnc connect %s:%s failed: %s", host, port, exc)
+        return False
+    sock.settimeout(timeout)
+    try:
+        greeting = sock.recv(12)
+        if not greeting.startswith(b"RFB "):
+            return False
+        sock.sendall(b"RFB 003.008\n")
+        ntypes = sock.recv(1)
+        if len(ntypes) != 1:
+            return False
+        types = sock.recv(ntypes[0])
+        if 1 not in types:
+            return False
+        sock.sendall(b"\x01")
+        result = sock.recv(4)
+        if result != b"\x00\x00\x00\x00":
+            return False
+        sock.sendall(b"\x01")
+        header = _recv_exact(sock, 24)
+        width, height = struct.unpack(">HH", header[:4])
+        bpp, _depth, bigendian, truecolor = header[4:8]
+        _rmax, _gmax, _bmax = struct.unpack(">HHH", header[8:14])
+        rshift, gshift, bshift = header[14:17]
+        name_len = struct.unpack(">I", header[20:24])[0]
+        _recv_exact(sock, name_len)
+        if width < 1 or height < 1 or bpp != 32 or not truecolor:
+            return False
+        # SetEncodings: type=2, pad, nEncodings=1, raw=0
+        sock.sendall(struct.pack(">BBHi", 2, 0, 1, 0))
+        # FramebufferUpdateRequest: type=3, incremental=0, full desktop
+        sock.sendall(struct.pack(">BBHHHH", 3, 0, 0, 0, width, height))
+        pixels = _read_raw_framebuffer(sock, width, height)
+        if pixels is None:
+            return False
+        rgb = _pixels_to_rgb(
+            pixels, width, height, bigendian=bool(bigendian),
+            rshift=rshift, gshift=gshift, bshift=bshift,
+        )
+        write_png_rgb(dest_path, width, height, rgb)
+        return dest_path.is_file() and dest_path.stat().st_size > 0
+    except (OSError, struct.error, TimeoutError, ValueError) as exc:
+        log.debug("vnc framebuffer grab failed: %s", exc)
+        return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise OSError("vnc eof")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _read_raw_framebuffer(
+    sock: socket.socket, width: int, height: int
+) -> bytes | None:
+    """Read one FramebufferUpdate of raw rectangles covering the desktop."""
+    need = width * height * 4
+    out = bytearray(need)
+    got = 0
+    while got < need:
+        msg = _recv_exact(sock, 4)
+        if msg[0] != 0:
+            continue
+        nrects = struct.unpack(">H", msg[2:4])[0]
+        for _ in range(nrects):
+            rh = _recv_exact(sock, 12)
+            x, y, w, h, encoding = struct.unpack(">HHHHI", rh)
+            if encoding != 0:
+                return None
+            raw = _recv_exact(sock, w * h * 4)
+            for row in range(h):
+                dest_y = y + row
+                if dest_y < 0 or dest_y >= height:
+                    continue
+                start = (dest_y * width + x) * 4
+                sl = raw[row * w * 4 : (row + 1) * w * 4]
+                out[start : start + len(sl)] = sl
+                got += len(sl)
+    return bytes(out)
+
+
+def _pixels_to_rgb(
+    pixels: bytes,
+    width: int,
+    height: int,
+    *,
+    bigendian: bool,
+    rshift: int,
+    gshift: int,
+    bshift: int,
+) -> bytes:
+    rgb = bytearray(width * height * 3)
+    endian = ">" if bigendian else "<"
+    for i in range(width * height):
+        (pix,) = struct.unpack_from(endian + "I", pixels, i * 4)
+        rgb[i * 3] = (pix >> rshift) & 0xFF
+        rgb[i * 3 + 1] = (pix >> gshift) & 0xFF
+        rgb[i * 3 + 2] = (pix >> bshift) & 0xFF
+    return bytes(rgb)
 
 
 @dataclass

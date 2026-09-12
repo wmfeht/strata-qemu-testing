@@ -11,6 +11,7 @@ from typing import Literal
 import tomllib
 
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+IMAGE_NAME_SUFFIXES = (".qcow2", ".img", ".iso", ".raw.xz", ".raw")
 DIGEST_BASENAMES = ("image.toml", "bootstrap.sh", "setup.sh")
 # Session drop-ins hashed into the golden so greetd/hyprland.lua edits rebuild.
 DIGEST_OPTIONAL_BASENAMES = (
@@ -117,6 +118,30 @@ def _require_int(data: dict, key: str) -> int:
     return value
 
 
+def _parse_download_name(data: dict, source_url: str) -> str:
+    """Basename written under ``$CACHE/downloads/``.
+
+    File URLs derive it from the path. Directory URLs (Fedora Cloud scrape)
+    must set ``source_filename`` in image.toml.
+    """
+    raw = data.get("source_filename")
+    if raw is not None:
+        if not isinstance(raw, str) or not raw.strip():
+            raise GuestError("source_filename must be a non-empty string")
+        name = raw.strip()
+        if "/" in name or "\\" in name:
+            raise GuestError("source_filename must not contain a path separator")
+        return name
+    path = source_url.split("?", 1)[0].rstrip("/")
+    name = Path(path).name
+    lowered = name.lower()
+    if any(lowered.endswith(suffix) for suffix in IMAGE_NAME_SUFFIXES):
+        return name
+    raise GuestError(
+        "source_url has no image filename; set source_filename in image.toml"
+    )
+
+
 def _parse_source_sha256(data: dict) -> str:
     if "source_sha256" not in data:
         raise GuestError("source_sha256 is required")
@@ -145,6 +170,7 @@ class Guest:
     source_kind: Literal["cloud-image", "iso-autoinstall"]
     source_url: str
     source_sha256: str
+    download_name: str
     disk_gb: int
     memory_mib: int
     cpus: int
@@ -186,6 +212,7 @@ class Guest:
                 "source_url must be a dated tree, not …/current/ or …/latest/"
             )
         source_sha256 = _parse_source_sha256(data)
+        download_name = _parse_download_name(data, source_url)
 
         for name in ("bootstrap.sh", "setup.sh"):
             if not (recipe_dir / name).is_file():
@@ -244,6 +271,7 @@ class Guest:
             source_kind=source_kind,  # type: ignore[arg-type]
             source_url=source_url,
             source_sha256=source_sha256,
+            download_name=download_name,
             disk_gb=_require_int(data, "disk_gb"),
             memory_mib=_require_int(data, "memory_mib"),
             cpus=_require_int(data, "cpus"),
@@ -283,10 +311,7 @@ class Guest:
         return h.hexdigest()
 
     def source_filename(self) -> str:
-        name = Path(self.source_url.split("?", 1)[0]).name
-        if not name:
-            raise GuestError("source_url has no filename")
-        return name
+        return self.download_name
 
 
 def load_guest(

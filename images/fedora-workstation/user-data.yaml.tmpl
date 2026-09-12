@@ -1,0 +1,23 @@
+#cloud-config
+hostname: fedora-workstation
+manage_etc_hosts: true
+users:
+  - name: tester
+    gecos: Tester
+    groups: [wheel]
+    shell: /bin/bash
+    lock_passwd: false
+    sudo: 'ALL=(ALL) NOPASSWD: ALL'
+    ssh_authorized_keys:
+      - {{SSH_AUTHORIZED_KEY}}
+ssh_pwauth: true
+chpasswd:
+  expire: false
+  list: |
+    tester:foobar
+package_update: false
+packages:
+  - qemu-guest-agent
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+  - loginctl enable-linger tester

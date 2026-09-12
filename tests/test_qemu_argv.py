@@ -13,6 +13,8 @@ from strataqemu.qemu import (
     build_qemu_argv,
     uses_cloud_init_seed,
     uses_iso_autoinstall,
+    vnc_tcp_port,
+    write_png_rgb,
 )
 
 
@@ -263,6 +265,22 @@ class GraphicalArgvTests(unittest.TestCase):
         self.assertEqual(_after(argv, "-display"), "sdl,gl=on")
         self.assertIn("virtio-vga-gl", argv)
         self.assertNotIn("-vnc", argv)
+
+
+class VncFramebufferHelperTests(unittest.TestCase):
+    def test_display_maps_to_5900_plus_and_rejects_overflow(self) -> None:
+        self.assertEqual(vnc_tcp_port(1), 5901)
+        self.assertEqual(vnc_tcp_port(33195), 39095)
+        self.assertIsNone(vnc_tcp_port(60587))
+
+    def test_write_png_rgb_magic_and_size(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / "tiny.png"
+            rgb = bytes(b for i in range(32 * 16) for b in (i % 256, 40, 80))
+            write_png_rgb(dest, 32, 16, rgb)
+            data = dest.read_bytes()
+        self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertGreaterEqual(len(data), 256)
 
 
 if __name__ == "__main__":

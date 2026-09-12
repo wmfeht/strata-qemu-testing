@@ -126,6 +126,18 @@ class XorrisoIsoTests(unittest.TestCase):
         self.assertNotIn("{{SSH_AUTHORIZED_KEY}}", rendered)
         self.assertNotIn("omarchy", rendered.lower())
 
+    def test_fedora_template_renders_tester_wheel(self) -> None:
+        guest = load_guest("fedora-workstation")
+        tmpl = (guest.recipe_dir / "user-data.yaml.tmpl").read_text(encoding="utf-8")
+        rendered = render_user_data(tmpl, PUBKEY)
+        self.assertIn("name: tester", rendered)
+        self.assertIn("tester:foobar", rendered)
+        self.assertIn("wheel", rendered)
+        self.assertIn("NOPASSWD", rendered)
+        self.assertIn(PUBKEY, rendered)
+        self.assertNotIn("{{SSH_AUTHORIZED_KEY}}", rendered)
+        self.assertNotIn("install.sh", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

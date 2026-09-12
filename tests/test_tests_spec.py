@@ -146,6 +146,16 @@ class ParseOracleTests(unittest.TestCase):
         self.assertEqual(compositor_process_name("ubuntu-2404"), "gnome-shell")
         self.assertEqual(screenshot_tool_for_compositor("gnome-shell"), "gnome-screenshot")
 
+    def test_fedora_compositor_is_gnome_shell(self) -> None:
+        guest = load_guest("fedora-workstation")
+        self.assertEqual(compositor_process_name(guest), "gnome-shell")
+        self.assertEqual(compositor_process_name("fedora-workstation"), "gnome-shell")
+        self.assertEqual(
+            screenshot_tool_for_compositor("gnome-shell"), "gnome-screenshot"
+        )
+        self.assertFalse(supports_install_from_release(guest))
+        self.assertFalse(supports_install_from_release("fedora-workstation"))
+
     def test_arch_compositor_is_hyprland_grim(self) -> None:
         guest = load_guest("arch")
         self.assertEqual(compositor_process_name(guest), "Hyprland")
@@ -160,6 +170,10 @@ class ParseOracleTests(unittest.TestCase):
         msg = missing_golden_message("ubuntu-2404")
         self.assertEqual(
             msg, "run `mise run image-build -- ubuntu-2404` first"
+        )
+        self.assertEqual(
+            missing_golden_message("fedora-workstation"),
+            "run `mise run image-build -- fedora-workstation` first",
         )
 
     def test_session_only_steps_are_session_and_screenshot(self) -> None:
@@ -218,6 +232,44 @@ class SessionOnlyDriveTests(unittest.TestCase):
             self.assertNotIn("install.sh", blob)
             self.assertNotIn("strata --version", blob)
             assert_session_only_commands(commands)
+            self.assertTrue(dest.is_file())
+            self.assertTrue(dest.read_bytes().startswith(b"\x89PNG"))
+
+    def test_gnome_screenshot_timeout_falls_back_to_vnc(self) -> None:
+        fake = _FakeRun()
+
+        def timeout_run(argv, **kwargs):
+            remote = str(argv[-1]) if argv else ""
+            if "gnome-screenshot" in remote and "command -v" not in remote:
+                raise subprocess.TimeoutExpired(argv, 15)
+            return fake(argv, **kwargs)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                vnc_port=5901,
+                identity=identity,
+            )
+            dest = tmp / "shot.png"
+
+            def vnc_ok(path, *, display):
+                self.assertEqual(display, 5901)
+                dest_path = Path(path)
+                dest_path.write_bytes(PNG)
+                return True
+
+            capture_guest_screenshot(
+                machine,
+                {"WAYLAND_DISPLAY": "wayland-0"},
+                dest,
+                run=timeout_run,
+                vnc_capture_fn=vnc_ok,
+            )
             self.assertTrue(dest.is_file())
             self.assertTrue(dest.read_bytes().startswith(b"\x89PNG"))
 

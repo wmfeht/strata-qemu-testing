@@ -89,7 +89,29 @@ def allocate_ssh_port(*, bind: _Bind | None = None) -> int:
 
 
 def allocate_vnc_port(*, bind: _Bind | None = None) -> int:
-    return allocate_port(fallback=VNC_FALLBACK, bind=bind)
+    """Allocate a QEMU VNC *display* number.
+
+    QEMU ``-vnc 127.0.0.1:DISPLAY`` listens on TCP ``5900+DISPLAY``. An
+    ephemeral bind above ``65535-5900`` would overflow, so those are
+    rejected in favor of the 5900-5999 fallback range.
+    """
+    binder = bind if bind is not None else bind_localhost
+    try:
+        port = _bind_and_release(BIND_HOST, 0, binder)
+        if 0 < port and port + 5900 <= 65535:
+            return port
+    except OSError:
+        pass
+    last: OSError | None = None
+    for candidate in VNC_FALLBACK:
+        try:
+            return _bind_and_release(BIND_HOST, candidate, binder)
+        except OSError as exc:
+            last = exc
+            continue
+    if last is not None:
+        raise last
+    raise OSError("could not allocate a VNC display")
 
 
 def retry_on_addr_in_use(

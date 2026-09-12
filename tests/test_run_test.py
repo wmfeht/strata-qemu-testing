@@ -186,6 +186,60 @@ class MissingGoldenTests(unittest.TestCase):
         self.assertEqual(texts[0], texts[1])
         self.assertFalse(golden_qcow2(guest, cache).exists())
 
+    def test_fedora_session_only_missing_golden_twice(self) -> None:
+        guest = load_guest("fedora-workstation")
+        msg = missing_golden_message("fedora-workstation")
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "empty-cache"
+            cache.mkdir()
+            old = os.environ.get(config.CACHE_ENV)
+            os.environ[config.CACHE_ENV] = str(cache)
+            texts = []
+            try:
+                for _ in range(2):
+                    buf = io.StringIO()
+                    err = io.StringIO()
+                    with (
+                        redirect_stdout(buf),
+                        redirect_stderr(err),
+                        patch(
+                            "subprocess.Popen", side_effect=_refuse_qemu_system
+                        ) as popen,
+                        patch(
+                            "subprocess.run", side_effect=_refuse_qemu_system
+                        ) as run,
+                        patch(
+                            "strataqemu.image_build.run_image_build"
+                        ) as build,
+                        patch(
+                            "strataqemu.image_build.build_live"
+                        ) as live,
+                    ):
+                        code = main(
+                            [
+                                "run-test",
+                                "--",
+                                "fedora-workstation",
+                                "--session-only",
+                            ]
+                        )
+                    self.assertEqual(code, 1)
+                    text = buf.getvalue() + err.getvalue()
+                    texts.append(text)
+                    self.assertIn(msg, text)
+                    self.assertNotIn("not implemented", text)
+                    popen.assert_not_called()
+                    run.assert_not_called()
+                    build.assert_not_called()
+                    live.assert_not_called()
+            finally:
+                if old is None:
+                    os.environ.pop(config.CACHE_ENV, None)
+                else:
+                    os.environ[config.CACHE_ENV] = old
+        self.assertEqual(texts[0], texts[1])
+        self.assertFalse(golden_qcow2(guest, cache).exists())
+
     def test_vm_run_missing_golden_same_message(self) -> None:
         msg = missing_golden_message("ubuntu-2404")
         with tempfile.TemporaryDirectory() as td:
@@ -626,6 +680,24 @@ class ArchInstallFromTests(unittest.TestCase):
         popen.assert_not_called()
         run.assert_not_called()
 
+    def test_fedora_install_from_release_fail_closed(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with (
+            redirect_stdout(buf),
+            redirect_stderr(err),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+            patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+        ):
+            code = main(
+                ["run-test", "--", "fedora-workstation", "--install-from", "release"]
+            )
+        self.assertEqual(code, 2)
+        text = buf.getvalue() + err.getvalue()
+        self.assertIn(INSTALL_FROM_FAIL_CLOSED, text)
+        popen.assert_not_called()
+        run.assert_not_called()
+
     def test_arch_local_archive_fail_closed(self) -> None:
         buf = io.StringIO()
         err = io.StringIO()
@@ -755,6 +827,58 @@ class ArchInstallFromTests(unittest.TestCase):
             blob = " ".join(str(c) for c in fake.calls)
             self.assertIn("grim", blob)
             self.assertNotIn("install-arch.sh", blob)
+            self.assertNotIn("install.sh", blob)
+            self.assertNotIn("strata --version", blob)
+            self.assertNotIn("gtk-launch", blob)
+            self.assertNotIn("NameHasOwner", blob)
+
+    def test_session_only_fedora_uses_gnome_screenshot_not_install(self) -> None:
+        fake = _FakeRun()
+
+        def popen(argv, **kwargs):
+            name = Path(str(argv[0])).name if argv else ""
+            if name.startswith("qemu-system"):
+                return _DummyProc()
+            raise AssertionError(f"unexpected Popen: {argv}")
+
+        def fake_overlay(golden, overlay, **kwargs):
+            dest = Path(overlay)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"overlay")
+            return dest
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cache, _golden = _cache_with_golden(tmp, "fedora-workstation")
+            vars_template = tmp / "OVMF_VARS.4m.fd"
+            vars_template.write_bytes(b"vars")
+            host = _host_ok(tmp)
+            err = io.StringIO()
+            with (
+                redirect_stderr(err),
+                patch(
+                    "strataqemu.run_test.find_ovmf_vars",
+                    return_value=vars_template,
+                ),
+                patch.object(Machine, "shutdown", return_value=None),
+                patch(
+                    "strataqemu.tests_spec.qmp_screendump", return_value=False
+                ),
+            ):
+                code = run_run_test(
+                    "fedora-workstation",
+                    session_only=True,
+                    keep=True,
+                    cache_dir=cache,
+                    check_host_fn=lambda: host,
+                    run=fake,
+                    popen=popen,
+                    create_overlay_fn=fake_overlay,
+                    settle_s=0,
+                )
+            self.assertEqual(code, 0, err.getvalue())
+            blob = " ".join(str(c) for c in fake.calls)
+            self.assertIn("gnome-screenshot", blob)
             self.assertNotIn("install.sh", blob)
             self.assertNotIn("strata --version", blob)
             self.assertNotIn("gtk-launch", blob)
