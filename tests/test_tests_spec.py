@@ -14,7 +14,9 @@ from unittest.mock import patch
 
 from strataqemu.guest import load_guest
 from strataqemu.qemu import Machine
+from strataqemu import config
 from strataqemu.tests_spec import (
+    DEFAULT_UPDATE_FROM_VERSIONS,
     GDBUS_NAME_HAS_OWNER_ARGV,
     GUEST_ARCHIVE_REMOTE,
     INSTALL_FROM_RELEASE_STEPS,
@@ -28,6 +30,10 @@ from strataqemu.tests_spec import (
     STRATA_BUS_NAME,
     STRATA_VERSION_COMMAND,
     SessionSmokeError,
+    UPDATE_FROM_EMPTY_LIST,
+    UPDATE_FROM_MISSING_VERSION,
+    UPDATE_FROM_SAME_AS_LATEST,
+    UPDATE_FROM_STEPS,
     assert_session_only_commands,
     capture_guest_screenshot,
     command_is_forbidden_for_session_only,
@@ -49,9 +55,14 @@ from strataqemu.tests_spec import (
     parse_observed_version,
     parse_session_exports,
     parse_smoke_kv,
+    parse_update_from_version,
+    parse_update_from_versions,
+    previous_release_archive_name,
+    previous_release_url,
     run_install_from_release_steps,
     run_omarchy_bindings_steps,
     run_session_only_steps,
+    run_update_from_steps,
     screenshot_tool_for_compositor,
     sha256_file,
     smoke_desktop_script,
@@ -59,8 +70,12 @@ from strataqemu.tests_spec import (
     smoke_omarchy_bindings_script,
     smoke_omarchy_detect_script,
     smoke_session_script,
+    smoke_update_script,
     strata_version_is_cli,
     supports_install_from_release,
+    supports_update_from,
+    update_from_versions,
+    update_smoke_command,
     versions_match,
     wait_gnome_bus_name,
 )
@@ -95,7 +110,19 @@ class _FakeRun:
         self.hyprctl_code = 0
         self.exec_line = "Exec=/home/tester/.local/bin/strata %U\n"
         self.version_stdout = "0.9.0\n"
+        self._version_i = 0
+        self.from_version = "0.15.0"
         self.detected_major = "4"
+
+    def _version_reply(self) -> str:
+        value = self.version_stdout
+        if isinstance(value, (list, tuple)):
+            if not value:
+                return "0.9.0\n"
+            idx = min(self._version_i, len(value) - 1)
+            self._version_i += 1
+            return value[idx]
+        return value
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
@@ -146,6 +173,18 @@ class _FakeRun:
             return _completed(0)
         if " grim " in f" {remote} " or remote.strip().startswith("grim "):
             return _completed(0)
+        if "smoke-update.sh" in remote:
+            if "SMOKE_UPDATE_PHASE=previous" in remote:
+                return _completed(
+                    0, stdout=f"FROM_VERSION={self.from_version}\n"
+                )
+            return _completed(
+                0,
+                stdout=(
+                    f"INSTALL_SH_SHA256={self.install_digest}\n"
+                    "Installed Strata v9.9.9\n"
+                ),
+            )
         if "smoke-install.sh" in remote or "install-arch.sh" in remote:
             return _completed(
                 0,
@@ -159,7 +198,7 @@ class _FakeRun:
         if "test -x" in remote:
             return _completed(0)
         if "--version" in remote and "strata" in remote:
-            return _completed(0, stdout=self.version_stdout)
+            return _completed(0, stdout=self._version_reply())
         if "gtk-launch" in remote or "gio launch" in remote:
             return _completed(0)
         if "hyprctl clients" in remote:
@@ -385,6 +424,8 @@ class SessionOnlyDriveTests(unittest.TestCase):
         self.assertTrue(smoke_desktop_script().is_file())
         self.assertTrue(smoke_install_script().is_file())
         self.assertTrue(os.access(smoke_install_script(), os.X_OK))
+        self.assertTrue(smoke_update_script().is_file())
+        self.assertTrue(os.access(smoke_update_script(), os.X_OK))
         desktop = smoke_desktop_script().read_text(encoding="utf-8")
         self.assertIn("NameHasOwner", desktop)
         self.assertIn("grim", desktop)
@@ -722,6 +763,46 @@ class VersionParseTests(unittest.TestCase):
         )
         with self.assertRaises(SessionSmokeError):
             parse_archive_version("/tmp/not-an-archive.tar.gz")
+
+    def test_update_from_version_normalizes_and_rejects_junk(self) -> None:
+        self.assertEqual(parse_update_from_version("v0.15.0"), "0.15.0")
+        self.assertEqual(parse_update_from_version("0.14.0"), "0.14.0")
+        with self.assertRaises(SessionSmokeError) as ctx:
+            parse_update_from_version("")
+        self.assertEqual(str(ctx.exception), UPDATE_FROM_MISSING_VERSION)
+        with self.assertRaises(SessionSmokeError) as ctx:
+            parse_update_from_version("latest")
+        self.assertIn("not a Strata release tag", str(ctx.exception))
+
+    def test_update_from_versions_default_and_env_override(self) -> None:
+        self.assertEqual(parse_update_from_versions(None), DEFAULT_UPDATE_FROM_VERSIONS)
+        self.assertEqual(parse_update_from_versions("  "), DEFAULT_UPDATE_FROM_VERSIONS)
+        self.assertGreaterEqual(len(DEFAULT_UPDATE_FROM_VERSIONS), 1)
+        self.assertEqual(
+            parse_update_from_versions("0.15.0, 0.14.0,0.15.0"),
+            ("0.15.0", "0.14.0"),
+        )
+        self.assertEqual(
+            update_from_versions(environ={config.UPDATE_FROM_ENV: "v0.13.0,0.12.0"}),
+            ("0.13.0", "0.12.0"),
+        )
+        with self.assertRaises(SessionSmokeError) as ctx:
+            parse_update_from_versions(",")
+        self.assertEqual(str(ctx.exception), UPDATE_FROM_EMPTY_LIST)
+
+    def test_configured_previous_versions_have_pinned_release_urls(self) -> None:
+        for version in update_from_versions(environ={}):
+            with self.subTest(version=version):
+                parsed = parse_update_from_version(version)
+                url = previous_release_url(parsed)
+                self.assertIn(f"/download/v{parsed}/", url)
+                self.assertNotIn("/latest/", url)
+                self.assertNotIn("/current/", url)
+                self.assertEqual(
+                    previous_release_archive_name(parsed),
+                    f"strata-{parsed}-x86_64-unknown-linux-gnu.tar.gz",
+                )
+                self.assertTrue(url.endswith(previous_release_archive_name(parsed)))
 
     def test_github_latest_version_uses_injected_opener(self) -> None:
         class _Resp:
@@ -1159,6 +1240,199 @@ class OmarchyHelperTests(unittest.TestCase):
         self.assertTrue(smoke_omarchy_bindings_script().is_file())
         self.assertEqual(parse_smoke_kv("DETECTED_MAJOR=\n", "DETECTED_MAJOR"), "")
         self.assertEqual(parse_smoke_kv("DETECTED_MAJOR=4\n", "DETECTED_MAJOR"), "4")
+
+
+class UpdateFromStepsTests(unittest.TestCase):
+    def test_update_smoke_command_quotes_phase_and_version(self) -> None:
+        remote = update_smoke_command(phase="previous", from_version="0.15.0")
+        self.assertIn("SMOKE_UPDATE_PHASE=previous", remote)
+        self.assertIn("UPDATE_FROM_VERSION=0.15.0", remote)
+        self.assertIn("bash /tmp/smoke-update.sh", remote)
+        self.assertNotIn("SMOKE_FORBID_OMARCHY", remote)
+        arch = update_smoke_command(
+            phase="latest", forbid_omarchy=True, archive="/tmp/prev.tar.gz"
+        )
+        self.assertIn("SMOKE_FORBID_OMARCHY=1", arch)
+        self.assertIn("UPDATE_FROM_ARCHIVE=/tmp/prev.tar.gz", arch)
+        self.assertIn("SMOKE_UPDATE_PHASE=latest", arch)
+
+    def test_supports_same_guests_as_install_from(self) -> None:
+        for guest_id in (
+            "arch",
+            "ubuntu-2404",
+            "fedora-workstation",
+            "omarchy-4",
+            "omarchy-3",
+        ):
+            with self.subTest(guest=guest_id):
+                self.assertTrue(supports_update_from(guest_id))
+                self.assertTrue(supports_install_from_release(guest_id))
+
+    def _drive(
+        self,
+        guest_id: str,
+        *,
+        from_version: str,
+        latest: str,
+        fake: _FakeRun | None = None,
+    ) -> tuple[list[dict], dict, list[str]]:
+        responder = fake if fake is not None else _FakeRun()
+        responder.from_version = from_version
+        responder.version_stdout = [f"{from_version}\n", f"{latest}\n"]
+        if guest_id in {"arch", "omarchy-4", "omarchy-3"}:
+            responder.session_stdout += "HYPRLAND_INSTANCE_SIGNATURE=sig\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            commands: list[str] = []
+            steps, extras = run_update_from_steps(
+                machine,
+                guest=load_guest(guest_id),
+                from_version=from_version,
+                screenshot_dest=tmp / "screenshot.png",
+                session_timeout=5,
+                run=responder,
+                commands=commands,
+                sleep=lambda _s: None,
+                intended_version=latest,
+            )
+        return steps, extras, commands
+
+    def test_each_configured_previous_version_records_update_steps(self) -> None:
+        latest = "0.16.0"
+        for from_version in DEFAULT_UPDATE_FROM_VERSIONS:
+            with self.subTest(from_version=from_version):
+                steps, extras, commands = self._drive(
+                    "ubuntu-2404", from_version=from_version, latest=latest
+                )
+                self.assertEqual([s["name"] for s in steps], list(UPDATE_FROM_STEPS))
+                blob = "\n".join(commands)
+                self.assertIn("smoke-update.sh", blob)
+                self.assertIn("SMOKE_UPDATE_PHASE=previous", blob)
+                self.assertIn(f"UPDATE_FROM_VERSION={from_version}", blob)
+                self.assertIn("SMOKE_UPDATE_PHASE=latest", blob)
+                self.assertNotIn("SMOKE_FORBID_OMARCHY", blob)
+                self.assertIn("NameHasOwner", blob)
+                self.assertIn("gtk-launch", blob)
+                self.assertEqual(extras["from_version"], from_version)
+                self.assertEqual(extras["intended_version"], latest)
+                self.assertEqual(extras["observed_previous_version"], from_version)
+                self.assertEqual(extras["observed_version"], latest)
+                self.assertEqual(extras["install_method"], "install.sh")
+                prev = [s for s in steps if s["name"] == "version-previous"][0]
+                self.assertEqual(prev["status"], "pass")
+                self.assertEqual(prev["observed"], from_version)
+                latest_step = [s for s in steps if s["name"] == "version"][0]
+                self.assertEqual(latest_step["status"], "pass")
+                self.assertEqual(latest_step["observed"], latest)
+
+    def test_arch_update_from_forbids_omarchy_and_uses_hyprland(self) -> None:
+        from_version = DEFAULT_UPDATE_FROM_VERSIONS[0]
+        steps, extras, commands = self._drive(
+            "arch", from_version=from_version, latest="0.16.0"
+        )
+        blob = "\n".join(commands)
+        self.assertIn("SMOKE_FORBID_OMARCHY=1", blob)
+        self.assertIn("hyprctl clients", blob)
+        self.assertIn("grim", blob)
+        self.assertNotIn("NameHasOwner", blob)
+        self.assertEqual([s["name"] for s in steps], list(UPDATE_FROM_STEPS))
+        self.assertEqual(extras["from_version"], from_version)
+
+    def test_env_override_is_the_matrix_the_suite_iterates(self) -> None:
+        override = ("0.13.0", "0.12.1")
+        parsed = update_from_versions(
+            environ={config.UPDATE_FROM_ENV: ",".join(override)}
+        )
+        self.assertEqual(parsed, override)
+        for from_version in parsed:
+            with self.subTest(from_version=from_version):
+                steps, extras, _commands = self._drive(
+                    "fedora-workstation",
+                    from_version=from_version,
+                    latest="0.16.0",
+                )
+                self.assertEqual(extras["from_version"], from_version)
+                self.assertEqual([s["name"] for s in steps], list(UPDATE_FROM_STEPS))
+
+    def test_from_equals_latest_fails_closed_before_guest_commands(self) -> None:
+        fake = _FakeRun()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2", tmp, ssh_port=22022, identity=identity
+            )
+            with self.assertRaises(SessionSmokeError) as ctx:
+                run_update_from_steps(
+                    machine,
+                    guest=load_guest("ubuntu-2404"),
+                    from_version="0.16.0",
+                    screenshot_dest=tmp / "shot.png",
+                    run=fake,
+                    intended_version="0.16.0",
+                )
+        self.assertIn(UPDATE_FROM_SAME_AS_LATEST, str(ctx.exception))
+        self.assertEqual(fake.remote, [])
+
+    def test_previous_version_mismatch_fails(self) -> None:
+        fake = _FakeRun()
+        fake.from_version = "0.14.0"
+        fake.version_stdout = ["0.14.0\n", "0.16.0\n"]
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2", tmp, ssh_port=22022, identity=identity
+            )
+            with self.assertRaises(SessionSmokeError) as ctx:
+                run_update_from_steps(
+                    machine,
+                    guest=load_guest("ubuntu-2404"),
+                    from_version="0.15.0",
+                    screenshot_dest=tmp / "shot.png",
+                    session_timeout=5,
+                    run=fake,
+                    sleep=lambda _s: None,
+                    intended_version="0.16.0",
+                )
+        self.assertIn("install-previous", str(ctx.exception))
+        self.assertIn("0.15.0", str(ctx.exception))
+
+    def test_latest_version_mismatch_fails(self) -> None:
+        fake = _FakeRun()
+        fake.from_version = "0.15.0"
+        fake.version_stdout = ["0.15.0\n", "0.15.0\n"]
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2", tmp, ssh_port=22022, identity=identity
+            )
+            with self.assertRaises(SessionSmokeError) as ctx:
+                run_update_from_steps(
+                    machine,
+                    guest=load_guest("ubuntu-2404"),
+                    from_version="0.15.0",
+                    screenshot_dest=tmp / "shot.png",
+                    session_timeout=5,
+                    run=fake,
+                    sleep=lambda _s: None,
+                    intended_version="0.16.0",
+                )
+        self.assertIn("version mismatch", str(ctx.exception))
+        self.assertIn("0.16.0", str(ctx.exception))
+        self.assertIn("0.15.0", str(ctx.exception))
 
 
 if __name__ == "__main__":

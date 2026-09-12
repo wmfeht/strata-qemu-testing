@@ -35,7 +35,7 @@ strataqemu/               host-side Python package
   overlay.py              qcow2 overlay creation, OVMF vars copy, cache prune
   image_build.py          golden build pipeline
   run_test.py             run-test and vm-run
-  tests_spec.py           smoke steps (session, screenshot, install, version, window)
+  tests_spec.py           smoke steps (session, screenshot, install, update-from, version, window)
   session.py              pure loginctl/runtime-dir parsing (used by the spike)
   spike.py                hidden spike-wayland-ubuntu command
 images/<guest>/           one recipe directory per guest
@@ -57,7 +57,7 @@ nothing builds a golden implicitly.
 | --- | --- | --- |
 | `check-host` | `check-host` | Host capability check. Generates the SSH key on first success. |
 | `image-build` | `image-build [--force] <guest>` | Build or reuse a golden. Prints the golden path. |
-| `run-test` | `run-test <guest> (--session-only \| --install-from release \| --install-from local-archive PATH \| --omarchy-bindings) [--keep]` | Boot an overlay and run smokes. |
+| `run-test` | `run-test <guest> (--session-only \| --install-from release \| --install-from local-archive PATH \| --omarchy-bindings \| --update-from VERSION) [--keep]` | Boot an overlay and run smokes. |
 | `vm-run` | `vm-run [--graphical] [--keep] <guest>` | Interactive throwaway overlay. |
 | `image-prune` | `image-prune [--images]` | Delete run dirs; with `--images` also goldens. Never `keys/`. |
 | `test` | `python -m unittest discover -s tests -t .` | Host unit tests. |
@@ -302,10 +302,13 @@ machine down and exits 130. Timeouts inside the wait loops capture
 
 Argument validation happens before anything touches the cache:
 
-- Exactly one of `--session-only`, `--install-from`, or
-  `--omarchy-bindings` is required.
+- Exactly one of `--session-only`, `--install-from`, `--omarchy-bindings`,
+  or `--update-from VERSION` is required.
 - `--omarchy-bindings` is Omarchy-only (`omarchy-3`, `omarchy-4`) and
-  cannot be combined with the other two flows.
+  cannot be combined with the other flows.
+- `--update-from` is exclusive with the other three. VERSION is a previous
+  release tag (`0.15.0` or `v0.15.0`). The default previous-version list is
+  `0.15.0,0.14.0`; override with `STRATA_QEMU_UPDATE_FROM`.
 - `--install-from local-archive` requires an existing host path;
   `--install-from release` refuses a path.
 - `--omarchy-bindings` optionally uploads `STRATA_QEMU_INSTALL_SH`
@@ -326,7 +329,8 @@ Then:
 4. Run steps (see below). Each step records `name`, `status`, `seconds`,
    and step-specific fields into `result.json`.
 5. On success print `run-test: session ok (<id>)`, `run-test: ok (<id>)`,
-   or `run-test: omarchy-bindings ok (<id>)` and the screenshot path, shut
+   `run-test: update-from VERSION ok (<id>)`, or
+   `run-test: omarchy-bindings ok (<id>)` and the screenshot path, shut
    down, delete the overlay, vars copy, and sockets (unless `--keep`), and
    print `run dir: <path>`. Logs, `result.json`, and screenshots stay.
 6. On failure record `error` and the recorded guest commands in
@@ -390,6 +394,24 @@ version step passed), and `archive_sha256` (for `local-archive`).
 GNOME/Arch. It does not run Omarchy detection or rewrite Hyprland
 bindings.
 
+**update-from** (`--update-from VERSION`): same guests as `--install-from`.
+Resolve latest from GitHub `/releases/latest` (or an injected intended
+version). Fail closed if VERSION equals latest. Upload
+`guest-tests/smoke-update.sh`. Steps: session → install-previous (download
+the GitHub archive for VERSION, or a host-uploaded tarball, extract, install
+the binary and desktop entry) → version-previous (`strata --version` must
+match VERSION) → update (move the previous binary aside because
+`install.sh --non-interactive` refuses an existing `~/.local/bin/strata`,
+then run current `install.sh` with the same flags as `--install-from`) →
+version (must match latest) → desktop-entry → window.
+
+`result.json` for this flow records `from_version`, `intended_version`,
+`observed_previous_version` (when the previous version step passed),
+`observed_version` (when the latest version step passed), and
+`install_sh_sha256`. The default VERSION list is
+`DEFAULT_UPDATE_FROM_VERSIONS` (`0.15.0`, `0.14.0`); override with
+`STRATA_QEMU_UPDATE_FROM`.
+
 **omarchy-detect** (`--omarchy-bindings`): upload
 `guest-tests/smoke-omarchy-detect.sh` and a staged `install.sh`. The
 script sources the installer under `STRATA_INSTALLER_TESTING=1` and
@@ -425,6 +447,8 @@ the run dir is deleted unless `--keep`; on error it is kept. There is no
 - `guest-tests/smoke-session.sh`: session selection and env export, as
   described above.
 - `guest-tests/smoke-install.sh`: `install.sh` download, digest, and run.
+- `guest-tests/smoke-update.sh`: seed a previous GitHub release, then run
+  current `install.sh` to latest. Phases `previous` / `latest` / `all`.
 - `guest-tests/smoke-omarchy-detect.sh`: source a staged `install.sh` and
   print `DETECTED_MAJOR=` for live / token / fake-command cases
   (lgse/strata#743). Used only by `--omarchy-bindings`.

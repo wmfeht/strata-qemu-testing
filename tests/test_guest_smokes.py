@@ -3,27 +3,32 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import re
 import shutil
 import socket
 import stat
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
 
 from strataqemu.tests_spec import (
+    DEFAULT_UPDATE_FROM_VERSIONS,
     OMARCHY_DEV_HASH_OUTPUT,
     OMARCHY_TOKEN_CASES,
     parse_install_sh_sha256,
     parse_smoke_kv,
+    previous_release_archive_name,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SMOKE_SESSION = REPO_ROOT / "guest-tests" / "smoke-session.sh"
 SMOKE_DESKTOP = REPO_ROOT / "guest-tests" / "smoke-desktop.sh"
 SMOKE_INSTALL = REPO_ROOT / "guest-tests" / "smoke-install.sh"
+SMOKE_UPDATE = REPO_ROOT / "guest-tests" / "smoke-update.sh"
 SMOKE_OMARCHY_DETECT = REPO_ROOT / "guest-tests" / "smoke-omarchy-detect.sh"
 SMOKE_OMARCHY_BINDINGS = REPO_ROOT / "guest-tests" / "smoke-omarchy-bindings.sh"
 FIXTURE_PR743 = REPO_ROOT / "tests" / "fixtures" / "omarchy-detect" / "install-pr743.sh"
@@ -731,6 +736,197 @@ class SmokeOmarchyBindingsScriptTests(unittest.TestCase):
             self.assertFalse((home / ".config" / "hypr" / "bindings.conf").exists())
             lua = (home / ".config" / "hypr" / "bindings.lua").read_text(encoding="utf-8")
             self.assertIn("strata-installer: file-manager start", lua)
+
+
+def _write_previous_archive(path: Path, version: str) -> None:
+    """Minimal GitHub-style Strata release tarball for smoke-update.sh."""
+    inner = f"strata-{version}-x86_64-unknown-linux-gnu"
+    with tarfile.open(path, "w:gz") as tar:
+        payload = f"stub-binary-{version}\n".encode()
+        info = tarfile.TarInfo(name=f"{inner}/strata")
+        info.size = len(payload)
+        info.mode = 0o755
+        tar.addfile(info, fileobj=io.BytesIO(payload))
+        desktop = (
+            "[Desktop Entry]\n"
+            "Name=Strata\n"
+            "Exec=strata %U\n"
+            "Type=Application\n"
+        ).encode()
+        dinfo = tarfile.TarInfo(name=f"{inner}/io.github.lgse.Strata.desktop")
+        dinfo.size = len(desktop)
+        tar.addfile(dinfo, fileobj=io.BytesIO(desktop))
+
+
+class SmokeUpdateScriptTests(unittest.TestCase):
+    def test_script_is_executable(self) -> None:
+        self.assertTrue(SMOKE_UPDATE.is_file())
+        self.assertTrue(os.access(SMOKE_UPDATE, os.X_OK))
+
+    def _bindir(self, tmp: Path) -> Path:
+        bindir = tmp / "bin"
+        bindir.mkdir()
+        for name in (
+            "sha256sum",
+            "awk",
+            "bash",
+            "chmod",
+            "mkdir",
+            "cat",
+            "echo",
+            "test",
+            "tar",
+            "install",
+            "cp",
+            "mv",
+            "sed",
+            "uname",
+            "mktemp",
+            "rm",
+            "dirname",
+            "gzip",
+            "gunzip",
+        ):
+            found = shutil.which(name)
+            self.assertIsNotNone(found, name)
+            assert found is not None
+            os.symlink(found, bindir / name)
+        return bindir
+
+    def test_previous_phase_installs_each_configured_version_from_archive(self) -> None:
+        for version in DEFAULT_UPDATE_FROM_VERSIONS:
+            with self.subTest(version=version):
+                tmp = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+                bindir = self._bindir(tmp)
+                home = tmp / "home"
+                home.mkdir()
+                archive = tmp / previous_release_archive_name(version)
+                _write_previous_archive(archive, version)
+                env = os.environ.copy()
+                env["PATH"] = str(bindir)
+                env["HOME"] = str(home)
+                env.pop("XDG_DATA_HOME", None)
+                env["SMOKE_UPDATE_PHASE"] = "previous"
+                env["UPDATE_FROM_VERSION"] = version
+                env["UPDATE_FROM_ARCHIVE"] = str(archive)
+                proc = subprocess.run(
+                    ["bash", str(SMOKE_UPDATE)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertEqual(
+                    parse_smoke_kv(proc.stdout, "FROM_VERSION"), version
+                )
+                installed = home / ".local" / "bin" / "strata"
+                self.assertTrue(installed.is_file())
+                self.assertTrue(os.access(installed, os.X_OK))
+                self.assertEqual(
+                    installed.read_text(encoding="utf-8"),
+                    f"stub-binary-{version}\n",
+                )
+                desktop = (
+                    home
+                    / ".local"
+                    / "share"
+                    / "applications"
+                    / "io.github.lgse.Strata.desktop"
+                )
+                self.assertTrue(desktop.is_file())
+                self.assertIn(str(installed), desktop.read_text(encoding="utf-8"))
+
+    def test_latest_phase_moves_previous_binary_and_runs_install_sh(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        bindir = self._bindir(tmp)
+        home = tmp / "home"
+        (home / ".local" / "bin").mkdir(parents=True)
+        previous = home / ".local" / "bin" / "strata"
+        previous.write_text("old-binary\n", encoding="utf-8")
+        previous.chmod(0o755)
+        dest = tmp / "downloaded-install.sh"
+        record = tmp / "install-argv"
+        curl = bindir / "curl"
+        curl.write_text(
+            "#!/bin/bash\n"
+            "set -euo pipefail\n"
+            "dest=\"\"\n"
+            "while [[ $# -gt 0 ]]; do\n"
+            "  if [[ \"$1\" == \"-o\" ]]; then dest=\"$2\"; shift 2; continue; fi\n"
+            "  shift\n"
+            "done\n"
+            "cat > \"$dest\" <<'INNER'\n"
+            "#!/usr/bin/env bash\n"
+            "printf '%s\\n' \"$@\" > \"${INSTALL_ARGV_RECORD:?}\"\n"
+            "mkdir -p \"$HOME/.local/bin\"\n"
+            "echo new-binary > \"$HOME/.local/bin/strata\"\n"
+            "chmod +x \"$HOME/.local/bin/strata\"\n"
+            "INNER\n"
+            "chmod +x \"$dest\"\n",
+            encoding="utf-8",
+        )
+        curl.chmod(curl.stat().st_mode | stat.S_IXUSR)
+        env = os.environ.copy()
+        env["PATH"] = str(bindir)
+        env["HOME"] = str(home)
+        env.pop("XDG_DATA_HOME", None)
+        env["SMOKE_UPDATE_PHASE"] = "latest"
+        env["INSTALL_SH_DEST"] = str(dest)
+        env["INSTALL_ARGV_RECORD"] = str(record)
+        proc = subprocess.run(
+            ["bash", str(SMOKE_UPDATE)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+        self.assertEqual(parse_install_sh_sha256(proc.stdout), digest)
+        self.assertEqual(
+            record.read_text(encoding="utf-8").split(),
+            [
+                "--non-interactive",
+                "--with-desktop-entry",
+                "--without-file-chooser",
+            ],
+        )
+        self.assertEqual(
+            previous.read_text(encoding="utf-8"), "new-binary\n"
+        )
+        self.assertEqual(
+            (home / ".local" / "bin" / "strata.previous").read_text(
+                encoding="utf-8"
+            ),
+            "old-binary\n",
+        )
+
+    def test_previous_phase_requires_version(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        bindir = self._bindir(tmp)
+        env = os.environ.copy()
+        env["PATH"] = str(bindir)
+        env["HOME"] = str(tmp / "home")
+        env["SMOKE_UPDATE_PHASE"] = "previous"
+        proc = subprocess.run(
+            ["bash", str(SMOKE_UPDATE)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("UPDATE_FROM_VERSION", proc.stderr)
+
+    def test_does_not_pipe_curl_into_bash(self) -> None:
+        body = SMOKE_UPDATE.read_text(encoding="utf-8")
+        self.assertNotIn("| bash", body)
+        self.assertNotIn("curl |", body)
+        self.assertIn("sha256sum --check", body)
 
 
 if __name__ == "__main__":

@@ -316,6 +316,15 @@ def build_parser() -> argparse.ArgumentParser:
             "uploads a host install.sh instead of curling main."
         ),
     )
+    run_test.add_argument(
+        "--update-from",
+        metavar="VERSION",
+        help=(
+            "Install a previous Strata release (e.g. 0.15.0), then run current "
+            "install.sh to update to latest. Override the default previous-version "
+            "list with STRATA_QEMU_UPDATE_FROM (comma-separated)."
+        ),
+    )
 
     vm_run = sub.add_parser(
         "vm-run",
@@ -467,6 +476,7 @@ def main(argv: list[str] | None = None) -> int:
             archive_path=archive_path,
             keep=args.keep,
             omarchy_bindings=args.omarchy_bindings,
+            update_from=args.update_from,
         )
 
     if args.command == "vm-run":

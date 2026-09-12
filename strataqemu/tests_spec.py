@@ -5,8 +5,10 @@ runs session + in-guest screenshot; it does not gtk-launch Strata, run
 ``install.sh``, or wait on the application bus name. ``--install-from``
 release/local-archive on ``arch``, ``ubuntu-2404``, ``fedora-workstation``,
 ``omarchy-3``, and ``omarchy-4`` runs session → install → version →
-desktop-entry → window. ``--omarchy-bindings`` is a separate Omarchy-only
-flow (lgse/strata#743): session → detect → write/check Hyprland bindings.
+desktop-entry → window. ``--update-from VERSION`` on the same guests seeds
+that previous release, then runs current ``install.sh`` to latest.
+``--omarchy-bindings`` is a separate Omarchy-only flow (lgse/strata#743):
+session → detect → write/check Hyprland bindings.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shlex
 import subprocess
@@ -23,6 +26,7 @@ import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
+from strataqemu import config
 from strataqemu.guest import Guest
 from strataqemu.qemu import Machine, qmp_screendump, vnc_framebuffer_png
 from strataqemu.ssh import scp_command, scp_download_command
@@ -50,6 +54,15 @@ SESSION_ONLY_STEPS = ("session", "screenshot")
 INSTALL_FROM_RELEASE_STEPS = (
     "session",
     "install",
+    "version",
+    "desktop-entry",
+    "window",
+)
+UPDATE_FROM_STEPS = (
+    "session",
+    "install-previous",
+    "version-previous",
+    "update",
     "version",
     "desktop-entry",
     "window",
@@ -93,7 +106,7 @@ OMARCHY_BINDINGS_FAIL_CLOSED = (
 )
 OMARCHY_BINDINGS_EXCLUSIVE = (
     "run-test: --omarchy-bindings cannot be combined with "
-    "--session-only or --install-from"
+    "--session-only, --install-from, or --update-from"
 )
 INSTALL_SH_SHA256_PREFIX = "INSTALL_SH_SHA256="
 INSTALL_SH_URL = "https://raw.githubusercontent.com/lgse/strata/main/install.sh"
@@ -117,6 +130,32 @@ LOCAL_ARCHIVE_MISSING_PATH = (
 )
 INSTALL_SH_MISSING_PATH = (
     "run-test: STRATA_QEMU_INSTALL_SH is set but the file is missing"
+)
+UPDATE_FROM_ENV = config.UPDATE_FROM_ENV
+# Previous releases the update-from flow is written against. Override with
+# STRATA_QEMU_UPDATE_FROM (comma-separated tags such as 0.15.0,0.14.0).
+DEFAULT_UPDATE_FROM_VERSIONS = ("0.15.0", "0.14.0")
+STRATA_RELEASE_TARGET = "x86_64-unknown-linux-gnu"
+GITHUB_RELEASE_DOWNLOAD = "https://github.com/lgse/strata/releases/download"
+UPDATE_FROM_MISSING_VERSION = (
+    "run-test: --update-from requires a previous version (e.g. 0.15.0)"
+)
+UPDATE_FROM_BAD_VERSION = (
+    "run-test: --update-from version is not a Strata release tag"
+)
+UPDATE_FROM_EMPTY_LIST = (
+    f"run-test: {UPDATE_FROM_ENV} did not list any versions"
+)
+UPDATE_FROM_EXCLUSIVE = (
+    "run-test: --update-from cannot be combined with "
+    "--session-only, --install-from, or --omarchy-bindings"
+)
+UPDATE_FROM_FAIL_CLOSED = (
+    "run-test: --update-from is not supported for this guest; "
+    "use --session-only"
+)
+UPDATE_FROM_SAME_AS_LATEST = (
+    "run-test: --update-from version is already the latest release"
 )
 # Substrings that must not appear in --session-only guest commands.
 SESSION_ONLY_FORBIDDEN = (
@@ -163,6 +202,10 @@ def smoke_desktop_script() -> Path:
 
 def smoke_install_script() -> Path:
     return guest_tests_dir() / "smoke-install.sh"
+
+
+def smoke_update_script() -> Path:
+    return guest_tests_dir() / "smoke-update.sh"
 
 
 def smoke_omarchy_detect_script() -> Path:
@@ -226,6 +269,10 @@ def screenshot_tool_for_compositor(compositor: str) -> str:
 def supports_install_from_release(guest: Guest | str) -> bool:
     guest_id = guest.id if isinstance(guest, Guest) else guest
     return guest_id in INSTALL_FROM_RELEASE_GUESTS
+
+
+def supports_update_from(guest: Guest | str) -> bool:
+    return supports_install_from_release(guest)
 
 
 def install_arch_script() -> Path:
@@ -306,6 +353,25 @@ def install_smoke_command(
     prefix = "SMOKE_FORBID_OMARCHY=1 " if forbid_omarchy else ""
     flags = " ".join(shlex.quote(part) for part in install_sh_argv(archive=archive))
     return f"{prefix}bash /tmp/smoke-install.sh {flags}".rstrip()
+
+
+def update_smoke_command(
+    *,
+    phase: str,
+    from_version: str | None = None,
+    archive: str | None = None,
+    forbid_omarchy: bool = False,
+) -> str:
+    """Host-side SSH command that runs the uploaded guest update smoke."""
+    parts: list[str] = [f"SMOKE_UPDATE_PHASE={shlex.quote(phase)}"]
+    if from_version:
+        parts.append(f"UPDATE_FROM_VERSION={shlex.quote(from_version)}")
+    if archive:
+        parts.append(f"UPDATE_FROM_ARCHIVE={shlex.quote(archive)}")
+    if forbid_omarchy:
+        parts.append("SMOKE_FORBID_OMARCHY=1")
+    parts.append("bash /tmp/smoke-update.sh")
+    return " ".join(parts)
 
 
 def omarchy_detect_command(
@@ -635,6 +701,65 @@ def normalize_version(value: str) -> str:
 
 def versions_match(observed: str, intended: str) -> bool:
     return normalize_version(observed) == normalize_version(intended)
+
+
+def parse_update_from_version(value: str) -> str:
+    """Normalize ``--update-from VERSION``. Fail closed on empty or junk."""
+    text = (value or "").strip()
+    if not text:
+        raise SessionSmokeError(UPDATE_FROM_MISSING_VERSION)
+    normalized = normalize_version(text)
+    if not re.match(r"\d+\.\d+", normalized):
+        raise SessionSmokeError(f"{UPDATE_FROM_BAD_VERSION}: {value!r}")
+    return normalized
+
+
+def parse_update_from_versions(raw: str | None) -> tuple[str, ...]:
+    """Parse a comma-separated previous-version list.
+
+    ``None`` or blank uses ``DEFAULT_UPDATE_FROM_VERSIONS``.
+    """
+    if raw is None or not str(raw).strip():
+        return DEFAULT_UPDATE_FROM_VERSIONS
+    versions: list[str] = []
+    seen: set[str] = set()
+    for part in str(raw).split(","):
+        token = part.strip()
+        if not token:
+            continue
+        ver = parse_update_from_version(token)
+        if ver in seen:
+            continue
+        seen.add(ver)
+        versions.append(ver)
+    if not versions:
+        raise SessionSmokeError(UPDATE_FROM_EMPTY_LIST)
+    return tuple(versions)
+
+
+def update_from_versions(
+    *, environ: Mapping[str, str] | None = None
+) -> tuple[str, ...]:
+    """Configured previous versions for ``--update-from``.
+
+    Override with ``STRATA_QEMU_UPDATE_FROM`` (comma-separated).
+    """
+    env = os.environ if environ is None else environ
+    return parse_update_from_versions(env.get(UPDATE_FROM_ENV))
+
+
+def previous_release_archive_name(
+    version: str, *, target: str = STRATA_RELEASE_TARGET
+) -> str:
+    return f"strata-{normalize_version(version)}-{target}.tar.gz"
+
+
+def previous_release_url(
+    version: str, *, target: str = STRATA_RELEASE_TARGET
+) -> str:
+    ver = normalize_version(version)
+    name = previous_release_archive_name(ver, target=target)
+    return f"{GITHUB_RELEASE_DOWNLOAD}/v{ver}/{name}"
 
 
 def parse_archive_version(filename: str) -> str:
@@ -1180,6 +1305,63 @@ def _desktop_entry_probe_command() -> str:
     return f"test -f {path} && grep -E '^Exec=' {path}"
 
 
+def run_version_oracle(
+    machine: Machine,
+    *,
+    intended: str,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+    name: str = "version",
+) -> tuple[dict, str | None]:
+    """``strata --version`` vs ``intended``. Skip when it is not a CLI."""
+    started = time.monotonic()
+    observed: str | None = None
+    version_status = "skip"
+    version_reason = "strata --version is not a CLI"
+    try:
+        ver = ssh_run(
+            machine,
+            STRATA_VERSION_COMMAND,
+            timeout=VERSION_TIMEOUT_S,
+            check=False,
+            run=run,
+            commands=commands,
+        )
+        if strata_version_is_cli(ver.returncode, ver.stdout):
+            if ver.returncode != 0:
+                raise SessionSmokeError(
+                    f"ssh command failed ({ver.returncode}): "
+                    f"{STRATA_VERSION_COMMAND}\n{ver.stdout}{ver.stderr}"
+                )
+            observed = parse_observed_version(ver.stdout)
+            if not versions_match(observed, intended):
+                raise SessionSmokeError(
+                    f"version mismatch: intended {intended}, observed {observed} "
+                    f"(from {STRATA_VERSION_COMMAND})"
+                )
+            version_status = "pass"
+            version_reason = ""
+    except subprocess.TimeoutExpired:
+        version_status = "skip"
+        version_reason = "strata --version is not a CLI"
+    version_step: dict = {
+        "name": name,
+        "status": version_status,
+        "seconds": round(time.monotonic() - started, 1),
+    }
+    if version_status == "pass":
+        version_step.update(
+            {
+                "oracle": "strata --version",
+                "intended": intended,
+                "observed": observed,
+            }
+        )
+    else:
+        version_step["reason"] = version_reason
+    return version_step, observed
+
+
 def run_install_from_release_steps(
     machine: Machine,
     *,
@@ -1286,51 +1468,12 @@ def run_install_from_release_steps(
         }
     )
 
-    started = time.monotonic()
-    observed: str | None = None
-    version_status = "skip"
-    version_reason = "strata --version is not a CLI"
-    try:
-        ver = ssh_run(
-            machine,
-            STRATA_VERSION_COMMAND,
-            timeout=VERSION_TIMEOUT_S,
-            check=False,
-            run=run,
-            commands=recorded,
-        )
-        if strata_version_is_cli(ver.returncode, ver.stdout):
-            if ver.returncode != 0:
-                raise SessionSmokeError(
-                    f"ssh command failed ({ver.returncode}): "
-                    f"{STRATA_VERSION_COMMAND}\n{ver.stdout}{ver.stderr}"
-                )
-            observed = parse_observed_version(ver.stdout)
-            if not versions_match(observed, intended):
-                raise SessionSmokeError(
-                    f"version mismatch: intended {intended}, observed {observed} "
-                    f"(from {STRATA_VERSION_COMMAND})"
-                )
-            version_status = "pass"
-            version_reason = ""
-    except subprocess.TimeoutExpired:
-        version_status = "skip"
-        version_reason = "strata --version is not a CLI"
-    version_step: dict = {
-        "name": "version",
-        "status": version_status,
-        "seconds": round(time.monotonic() - started, 1),
-    }
-    if version_status == "pass":
-        version_step.update(
-            {
-                "oracle": "strata --version",
-                "intended": intended,
-                "observed": observed,
-            }
-        )
-    else:
-        version_step["reason"] = version_reason
+    version_step, observed = run_version_oracle(
+        machine,
+        intended=intended,
+        run=run,
+        commands=recorded,
+    )
     steps.append(version_step)
 
     started = time.monotonic()
@@ -1423,6 +1566,263 @@ def run_install_from_release_steps(
         "intended_version": intended,
         "screenshot": str(screenshot_dest),
     }
+    if observed is not None:
+        extras["observed_version"] = observed
+    if archive_digest is not None:
+        extras["archive_sha256"] = archive_digest
+    return steps, extras
+
+
+def run_update_from_steps(
+    machine: Machine,
+    *,
+    guest: Guest,
+    from_version: str,
+    screenshot_dest: Path,
+    qmp_dest: Path | None = None,
+    session_timeout: float = SESSION_TIMEOUT_S,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    intended_version: str | None = None,
+    intended_version_fn: Callable[[], str] | None = None,
+    previous_archive: Path | str | None = None,
+) -> tuple[list[dict], dict]:
+    """session → previous install → version-previous → update → version → desktop → window."""
+    if not supports_update_from(guest):
+        raise SessionSmokeError(UPDATE_FROM_FAIL_CLOSED)
+    from_ver = parse_update_from_version(from_version)
+    archive: Path | None = (
+        Path(previous_archive) if previous_archive is not None else None
+    )
+    if archive is not None and not archive.is_file():
+        raise SessionSmokeError(f"run-test: previous archive not found: {archive}")
+    intended = resolve_intended_version(
+        install_from="release",
+        intended_version=intended_version,
+        intended_version_fn=intended_version_fn,
+    )
+    if versions_match(from_ver, intended):
+        raise SessionSmokeError(f"{UPDATE_FROM_SAME_AS_LATEST} ({intended})")
+
+    compositor = compositor_process_name(guest)
+    tool = screenshot_tool_for_compositor(compositor)
+    recorded = commands if commands is not None else []
+    steps: list[dict] = []
+
+    started = time.monotonic()
+    exports = run_session_step(
+        machine,
+        compositor=compositor,
+        timeout=session_timeout,
+        run=run,
+        commands=recorded,
+        sleep=sleep,
+    )
+    steps.append(
+        {
+            "name": "session",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+            "sid": exports.get("SESSION_ID"),
+        }
+    )
+    env = session_env_from_exports(exports)
+
+    helper = smoke_update_script()
+    if not helper.is_file():
+        raise SessionSmokeError(f"missing update smoke script {helper}")
+    scp_to_guest(
+        machine, helper, "/tmp/smoke-update.sh", run=run, commands=recorded
+    )
+    remote_archive: str | None = None
+    archive_digest: str | None = None
+    if archive is not None:
+        archive_digest = sha256_file(archive)
+        remote_archive = GUEST_ARCHIVE_REMOTE
+        scp_to_guest(
+            machine, archive, remote_archive, run=run, commands=recorded
+        )
+
+    started = time.monotonic()
+    prev = ssh_run(
+        machine,
+        update_smoke_command(
+            phase="previous",
+            from_version=from_ver,
+            archive=remote_archive,
+            forbid_omarchy=guest.id == "arch",
+        ),
+        timeout=INSTALL_TIMEOUT_S,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    seeded = parse_smoke_kv(f"{prev.stdout}{prev.stderr}", "FROM_VERSION")
+    if not versions_match(seeded, from_ver):
+        raise SessionSmokeError(
+            f"install-previous: FROM_VERSION {seeded!r}, expected {from_ver}"
+        )
+    ssh_run(
+        machine,
+        f"test -x \"$HOME/{STRATA_BIN_REL}\"",
+        timeout=15,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    steps.append(
+        {
+            "name": "install-previous",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+            "from_version": from_ver,
+            "archive": previous_release_archive_name(from_ver),
+        }
+    )
+
+    prev_version_step, prev_observed = run_version_oracle(
+        machine,
+        intended=from_ver,
+        run=run,
+        commands=recorded,
+        name="version-previous",
+    )
+    steps.append(prev_version_step)
+
+    started = time.monotonic()
+    latest = ssh_run(
+        machine,
+        update_smoke_command(
+            phase="latest",
+            forbid_omarchy=guest.id == "arch",
+        ),
+        timeout=INSTALL_TIMEOUT_S,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    digest = parse_install_sh_sha256(f"{latest.stdout}{latest.stderr}")
+    ssh_run(
+        machine,
+        f"test -x \"$HOME/{STRATA_BIN_REL}\"",
+        timeout=15,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    steps.append(
+        {
+            "name": "update",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+            "install_sh_sha256": digest,
+            "install_method": "install.sh",
+        }
+    )
+
+    version_step, observed = run_version_oracle(
+        machine,
+        intended=intended,
+        run=run,
+        commands=recorded,
+    )
+    steps.append(version_step)
+
+    started = time.monotonic()
+    entry = ssh_run(
+        machine,
+        _desktop_entry_probe_command(),
+        timeout=DESKTOP_ENTRY_TIMEOUT_S,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    exec_blob = f"{entry.stdout}{entry.stderr}"
+    if STRATA_BIN_REL not in exec_blob:
+        raise SessionSmokeError(
+            f"desktop Exec= does not point at ~/{STRATA_BIN_REL}: {exec_blob}"
+        )
+    steps.append(
+        {
+            "name": "desktop-entry",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+        }
+    )
+
+    started = time.monotonic()
+    which = ssh_run(
+        machine,
+        f"command -v {shlex.quote(tool)}",
+        timeout=15,
+        run=run,
+        commands=recorded,
+    )
+    if screenshot_tool_missing(which.returncode):
+        raise SessionSmokeError(SCREENSHOT_TOOL_MISSING)
+    ssh_run(
+        machine,
+        launch_desktop_entry_command(env),
+        timeout=30,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    window_error: BaseException | None = None
+    window_oracle = "hyprctl-class" if compositor == "Hyprland" else "bus-name"
+    try:
+        if compositor == "Hyprland":
+            wait_hyprland_class(
+                machine,
+                env,
+                timeout=WINDOW_TIMEOUT_S,
+                run=run,
+                commands=recorded,
+                sleep=sleep,
+            )
+        else:
+            wait_gnome_bus_name(
+                machine,
+                env=env,
+                timeout=WINDOW_TIMEOUT_S,
+                run=run,
+                commands=recorded,
+                sleep=sleep,
+            )
+    except (TimeoutError, SessionSmokeError) as exc:
+        window_error = exc
+    capture_guest_screenshot(
+        machine,
+        env,
+        screenshot_dest,
+        tool=tool,
+        run=run,
+        commands=recorded,
+    )
+    if qmp_dest is not None:
+        extra_qmp_screendump(machine, qmp_dest)
+    if window_error is not None:
+        raise window_error
+    steps.append(
+        {
+            "name": "window",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+            "path": str(screenshot_dest),
+            "oracle": window_oracle,
+        }
+    )
+    extras: dict = {
+        "install_method": "install.sh",
+        "install_sh_sha256": digest,
+        "from_version": from_ver,
+        "intended_version": intended,
+        "screenshot": str(screenshot_dest),
+        "update_from": from_ver,
+    }
+    if prev_observed is not None:
+        extras["observed_previous_version"] = prev_observed
     if observed is not None:
         extras["observed_version"] = observed
     if archive_digest is not None:

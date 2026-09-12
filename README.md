@@ -121,6 +121,27 @@ behave like a command-line flag.
 `--install-from` does not probe Omarchy version detection or rewrite
 Hyprland bindings. Use `--omarchy-bindings` for that.
 
+### Update from a previous version
+
+```bash
+mise run run-test -- ubuntu-2404 --update-from 0.15.0
+STRATA_QEMU_UPDATE_FROM=0.15.0,0.14.0 mise run test
+```
+
+Installs the given previous Strata release inside the guest, then runs
+current `install.sh` to update to latest. The host checks `strata --version`
+against the seeded previous tag, then against the latest GitHub release,
+and continues with the desktop-entry and window oracles from
+`--install-from`.
+
+`--update-from` is exclusive with `--session-only`, `--install-from`, and
+`--omarchy-bindings`. Same guests as `--install-from`.
+
+The default previous versions the suite is written against are `0.15.0` and
+`0.14.0`. Override that list with `STRATA_QEMU_UPDATE_FROM` (comma-separated
+tags). Live `run-test` still takes one `--update-from VERSION` per overlay;
+the env var is the configurable matrix host unit tests iterate.
+
 ### Omarchy bindings
 
 ```bash
@@ -233,6 +254,7 @@ the command.
 | `mise run run-test -- <guest> --session-only [--keep]` | Session and screenshot smoke. |
 | `mise run run-test -- <guest> --install-from release [--keep]` | Install from the latest GitHub release. |
 | `mise run run-test -- <guest> --install-from local-archive PATH [--keep]` | Install from a host tarball. |
+| `mise run run-test -- <guest> --update-from VERSION [--keep]` | Seed a previous release, then run current `install.sh` to latest. |
 | `mise run run-test -- omarchy-3\|omarchy-4 --omarchy-bindings [--keep]` | Probe Omarchy detection and Hyprland bindings (optional `STRATA_QEMU_INSTALL_SH`). |
 | `mise run vm-run -- <guest> [--graphical] [--keep]` | Interactive throwaway overlay. |
 | `mise run image-prune [-- --images]` | Delete run directories (and goldens). |

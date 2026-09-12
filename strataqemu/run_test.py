@@ -44,13 +44,18 @@ from strataqemu.tests_spec import (
     OMARCHY_BINDINGS_FAIL_CLOSED,
     SESSION_TIMEOUT_S,
     SessionSmokeError,
+    UPDATE_FROM_EXCLUSIVE,
+    UPDATE_FROM_FAIL_CLOSED,
     compositor_process_name,
     missing_golden_message,
+    parse_update_from_version,
     run_install_from_release_steps,
     run_omarchy_bindings_steps,
     run_session_only_steps,
+    run_update_from_steps,
     supports_install_from_release,
     supports_omarchy_bindings,
+    supports_update_from,
 )
 
 log = logging.getLogger("strataqemu")
@@ -344,7 +349,8 @@ def _load_or_usage(guest_id: str | None, command: str) -> Guest | int:
             print(
                 "usage: python -m strataqemu run-test "
                 "[--session-only | --install-from release | "
-                "--install-from local-archive PATH | --omarchy-bindings] "
+                "--install-from local-archive PATH | --omarchy-bindings | "
+                "--update-from VERSION] "
                 "[--keep] <guest>",
                 file=sys.stderr,
             )
@@ -373,6 +379,7 @@ def run_run_test(
     intended_version_fn: Callable[[], str] | None = None,
     install_sh_path: Path | str | None = None,
     omarchy_bindings: bool = False,
+    update_from: str | None = None,
 ) -> int:
     """CLI body for ``run-test``. Never calls ``image-build``."""
     loaded = _load_or_usage(guest_id, "run-test")
@@ -380,18 +387,33 @@ def run_run_test(
         return loaded
     guest = loaded
 
-    if omarchy_bindings and (session_only or install_from):
+    if omarchy_bindings and (session_only or install_from or update_from):
         print(OMARCHY_BINDINGS_EXCLUSIVE, file=sys.stderr)
         return 2
     if omarchy_bindings and not supports_omarchy_bindings(guest):
         print(OMARCHY_BINDINGS_FAIL_CLOSED, file=sys.stderr)
         return 2
+    if update_from and (session_only or install_from or omarchy_bindings):
+        print(UPDATE_FROM_EXCLUSIVE, file=sys.stderr)
+        return 2
+
+    resolved_from: str | None = None
+    if update_from is not None:
+        try:
+            resolved_from = parse_update_from_version(update_from)
+        except SessionSmokeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if not supports_update_from(guest):
+            print(UPDATE_FROM_FAIL_CLOSED, file=sys.stderr)
+            return 2
 
     install_ok = (
         install_from in {"release", "local-archive"}
         and supports_install_from_release(guest)
         and not session_only
         and not omarchy_bindings
+        and not update_from
     )
     if install_from and not session_only and not install_ok:
         print(INSTALL_FROM_FAIL_CLOSED, file=sys.stderr)
@@ -424,10 +446,15 @@ def run_run_test(
                 file=sys.stderr,
             )
             return 2
-    if not session_only and not install_ok and not omarchy_bindings:
+    if (
+        not session_only
+        and not install_ok
+        and not omarchy_bindings
+        and not resolved_from
+    ):
         print(
-            "run-test: pass --session-only, --omarchy-bindings, or "
-            "--install-from release|local-archive",
+            "run-test: pass --session-only, --omarchy-bindings, "
+            "--install-from release|local-archive, or --update-from VERSION",
             file=sys.stderr,
         )
         return 2
@@ -503,6 +530,19 @@ def run_run_test(
                 intended_version=intended_version,
                 intended_version_fn=intended_version_fn,
             )
+        elif resolved_from:
+            steps, extras = run_update_from_steps(
+                machine,
+                guest=guest,
+                from_version=resolved_from,
+                screenshot_dest=shot,
+                qmp_dest=qmp_path,
+                session_timeout=SESSION_TIMEOUT_S,
+                run=run,
+                commands=recorded,
+                intended_version=intended_version,
+                intended_version_fn=intended_version_fn,
+            )
         elif omarchy_bindings:
             steps, extras = run_omarchy_bindings_steps(
                 machine,
@@ -536,6 +576,8 @@ def run_run_test(
         _write_result(arts.result_json, result)
         if install_ok:
             print(f"run-test: ok ({guest.id})")
+        elif resolved_from:
+            print(f"run-test: update-from {resolved_from} ok ({guest.id})")
         elif omarchy_bindings:
             print(f"run-test: omarchy-bindings ok ({guest.id})")
         else:

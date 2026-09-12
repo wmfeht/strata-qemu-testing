@@ -150,6 +150,25 @@ class CliHelpTests(unittest.TestCase):
         text = buf.getvalue() + err.getvalue()
         self.assertIn("--omarchy-bindings", text)
 
+    def test_run_test_help_includes_update_from(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            code = main(["run-test", "--help"])
+        self.assertEqual(code, 0)
+        text = buf.getvalue() + err.getvalue()
+        self.assertIn("--update-from", text)
+        self.assertIn("STRATA_QEMU_UPDATE_FROM", text)
+
+    def test_update_from_binds_version(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            ["run-test", "ubuntu-2404", "--update-from", "0.15.0"]
+        )
+        self.assertEqual(args.update_from, "0.15.0")
+        self.assertFalse(args.session_only)
+        self.assertIsNone(args.install_from)
+
     def test_install_from_local_archive_binds_path(self) -> None:
         parser = build_parser()
         args = parser.parse_args(
