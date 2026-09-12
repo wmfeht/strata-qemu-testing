@@ -27,8 +27,9 @@ from strataqemu.run_test import (
     vm_run_qemu_argv,
 )
 from strataqemu.tests_spec import (
-    INSTALL_FROM_FAIL_CLOSED,
+    LOCAL_ARCHIVE_MISSING_PATH,
     missing_golden_message,
+    sha256_file,
 )
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 256
@@ -96,19 +97,26 @@ class _FakeRun:
                 "HYPRLAND_INSTANCE_SIGNATURE=sig\n",
                 "",
             )
-        if "install-arch.sh" in remote:
+        if "smoke-install.sh" in remote or "install-arch.sh" in remote:
             digest = "ab" * 32
             return subprocess.CompletedProcess(
-                argv, 0, f"INSTALL_SH_SHA256={digest}\n", ""
+                argv,
+                0,
+                f"INSTALL_SH_SHA256={digest}\nInstalled Strata v9.9.9\n",
+                "",
             )
         if "Exec=" in remote or "Strata.desktop" in remote:
             return subprocess.CompletedProcess(
                 argv, 0, "Exec=/home/tester/.local/bin/strata %U\n", ""
             )
+        if "--version" in remote and "strata" in remote:
+            return subprocess.CompletedProcess(argv, 0, "0.9.0\n", "")
         if "gtk-launch" in remote or "gio launch" in remote:
             return subprocess.CompletedProcess(argv, 0, "", "")
         if "hyprctl clients" in remote:
             return subprocess.CompletedProcess(argv, 0, "{}\n", "")
+        if "NameHasOwner" in remote:
+            return subprocess.CompletedProcess(argv, 0, "(true,)\n", "")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
 
@@ -664,23 +672,94 @@ class ArchInstallFromTests(unittest.TestCase):
         self.assertEqual(texts[0], texts[1])
         self.assertFalse(golden_qcow2(guest, cache).exists())
 
-    def test_ubuntu_install_from_release_fail_closed(self) -> None:
-        buf = io.StringIO()
-        err = io.StringIO()
-        with (
-            redirect_stdout(buf),
-            redirect_stderr(err),
-            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
-            patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
-        ):
-            code = main(["run-test", "--", "ubuntu-2404", "--install-from", "release"])
-        self.assertEqual(code, 2)
-        text = buf.getvalue() + err.getvalue()
-        self.assertIn(INSTALL_FROM_FAIL_CLOSED, text)
+    def test_ubuntu_install_from_release_missing_golden_twice(self) -> None:
+        guest = load_guest("ubuntu-2404")
+        msg = missing_golden_message("ubuntu-2404")
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "empty-cache"
+            cache.mkdir()
+            old = os.environ.get(config.CACHE_ENV)
+            os.environ[config.CACHE_ENV] = str(cache)
+            texts = []
+            try:
+                for _ in range(2):
+                    buf = io.StringIO()
+                    err = io.StringIO()
+                    with (
+                        redirect_stdout(buf),
+                        redirect_stderr(err),
+                        patch(
+                            "subprocess.Popen", side_effect=_refuse_qemu_system
+                        ) as popen,
+                        patch(
+                            "subprocess.run", side_effect=_refuse_qemu_system
+                        ) as run,
+                        patch(
+                            "strataqemu.image_build.run_image_build"
+                        ) as build,
+                    ):
+                        code = main(
+                            [
+                                "run-test",
+                                "--",
+                                "ubuntu-2404",
+                                "--install-from",
+                                "release",
+                            ]
+                        )
+                    self.assertEqual(code, 1)
+                    text = buf.getvalue() + err.getvalue()
+                    texts.append(text)
+                    self.assertIn(msg, text)
+                    self.assertNotIn("not implemented", text)
+                    popen.assert_not_called()
+                    run.assert_not_called()
+                    build.assert_not_called()
+            finally:
+                if old is None:
+                    os.environ.pop(config.CACHE_ENV, None)
+                else:
+                    os.environ[config.CACHE_ENV] = old
+        self.assertEqual(texts[0], texts[1])
+        self.assertFalse(golden_qcow2(guest, cache).exists())
+
+    def test_fedora_install_from_release_missing_golden(self) -> None:
+        msg = missing_golden_message("fedora-workstation")
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "empty-cache"
+            cache.mkdir()
+            old = os.environ.get(config.CACHE_ENV)
+            os.environ[config.CACHE_ENV] = str(cache)
+            err = io.StringIO()
+            try:
+                with (
+                    redirect_stderr(err),
+                    patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+                    patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+                    patch("strataqemu.image_build.run_image_build") as build,
+                ):
+                    code = main(
+                        [
+                            "run-test",
+                            "--",
+                            "fedora-workstation",
+                            "--install-from",
+                            "release",
+                        ]
+                    )
+            finally:
+                if old is None:
+                    os.environ.pop(config.CACHE_ENV, None)
+                else:
+                    os.environ[config.CACHE_ENV] = old
+        self.assertEqual(code, 1)
+        self.assertIn(msg, err.getvalue())
+        self.assertNotIn("not implemented", err.getvalue())
         popen.assert_not_called()
         run.assert_not_called()
+        build.assert_not_called()
 
-    def test_fedora_install_from_release_fail_closed(self) -> None:
+    def test_local_archive_missing_path_fail_closed_no_qemu(self) -> None:
         buf = io.StringIO()
         err = io.StringIO()
         with (
@@ -690,30 +769,44 @@ class ArchInstallFromTests(unittest.TestCase):
             patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
         ):
             code = main(
-                ["run-test", "--", "fedora-workstation", "--install-from", "release"]
+                ["run-test", "--", "ubuntu-2404", "--install-from", "local-archive"]
             )
         self.assertEqual(code, 2)
         text = buf.getvalue() + err.getvalue()
-        self.assertIn(INSTALL_FROM_FAIL_CLOSED, text)
+        self.assertIn(LOCAL_ARCHIVE_MISSING_PATH, text)
+        self.assertNotIn("not implemented yet (fail closed)", text)
         popen.assert_not_called()
         run.assert_not_called()
 
-    def test_arch_local_archive_fail_closed(self) -> None:
+    def test_local_archive_missing_file_fail_closed_no_qemu(self) -> None:
+        missing = "/no/such/strata-archive-missing.tar.gz"
         buf = io.StringIO()
         err = io.StringIO()
         with (
             redirect_stdout(buf),
             redirect_stderr(err),
             patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+            patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
         ):
             code = main(
-                ["run-test", "--", "arch", "--install-from", "local-archive"]
+                [
+                    "run-test",
+                    "--",
+                    "fedora-workstation",
+                    "--install-from",
+                    "local-archive",
+                    missing,
+                ]
             )
         self.assertEqual(code, 2)
-        self.assertIn(INSTALL_FROM_FAIL_CLOSED, buf.getvalue() + err.getvalue())
+        text = buf.getvalue() + err.getvalue()
+        self.assertIn("archive not found", text)
+        self.assertIn(missing, text)
+        self.assertNotIn("not implemented yet (fail closed)", text)
         popen.assert_not_called()
+        run.assert_not_called()
 
-    def test_install_from_release_records_helper_not_version(self) -> None:
+    def test_install_from_release_records_five_steps_and_version(self) -> None:
         fake = _FakeRun()
         recorded_argv: list[list[str]] = []
 
@@ -754,21 +847,25 @@ class ArchInstallFromTests(unittest.TestCase):
                     popen=popen,
                     create_overlay_fn=fake_overlay,
                     settle_s=0,
+                    intended_version="0.9.0",
                 )
             self.assertEqual(code, 0, err.getvalue())
             self.assertTrue(recorded_argv)
             qemu_argv = recorded_argv[0]
             self.assertNotIn("if=pflash", " ".join(qemu_argv))
             blob = " ".join(str(c) for c in fake.calls)
-            self.assertIn("install-arch.sh", blob)
+            self.assertIn("smoke-install.sh", blob)
+            self.assertIn("--non-interactive", blob)
+            self.assertIn("--with-desktop-entry", blob)
+            self.assertIn("--without-file-chooser", blob)
             self.assertIn("gtk-launch", blob)
             self.assertIn("hyprctl clients", blob)
-            self.assertNotIn("strata --version", blob)
+            self.assertIn("$HOME/.local/bin/strata --version", blob)
+            self.assertNotIn("NameHasOwner", blob)
             helper = (
                 Path(__file__).resolve().parents[1]
-                / "images"
-                / "common"
-                / "install-arch.sh"
+                / "guest-tests"
+                / "smoke-install.sh"
             ).read_text(encoding="utf-8")
             self.assertIn("--non-interactive", helper)
             self.assertIn("--with-desktop-entry", helper)
@@ -778,12 +875,151 @@ class ArchInstallFromTests(unittest.TestCase):
             text = result_files[0].read_text(encoding="utf-8")
             self.assertIn('"name": "session"', text)
             self.assertIn('"name": "install"', text)
+            self.assertIn('"name": "version"', text)
             self.assertIn('"name": "desktop-entry"', text)
             self.assertIn('"name": "window"', text)
-            self.assertNotIn('"name": "version"', text)
             self.assertIn("install_sh_sha256", text)
+            self.assertIn("intended_version", text)
+            self.assertIn("observed_version", text)
+            self.assertIn("0.9.0", text)
             self.assertIn("abababab", text)
+            self.assertNotIn("9.9.9", text)
             del golden
+
+    def test_ubuntu_install_from_release_records_gnome_bus_and_version(self) -> None:
+        fake = _FakeRun()
+        recorded_argv: list[list[str]] = []
+
+        def popen(argv, **kwargs):
+            name = Path(str(argv[0])).name if argv else ""
+            if name.startswith("qemu-system"):
+                recorded_argv.append(list(argv))
+                return _DummyProc()
+            raise AssertionError(f"unexpected Popen: {argv}")
+
+        def fake_overlay(golden, overlay, **kwargs):
+            dest = Path(overlay)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"overlay")
+            return dest
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cache, _golden = _cache_with_golden(tmp, "ubuntu-2404")
+            vars_template = tmp / "OVMF_VARS.4m.fd"
+            vars_template.write_bytes(b"vars")
+            host = _host_ok(tmp)
+            err = io.StringIO()
+            with (
+                redirect_stderr(err),
+                patch(
+                    "strataqemu.run_test.find_ovmf_vars",
+                    return_value=vars_template,
+                ),
+                patch.object(Machine, "shutdown", return_value="kill"),
+                patch(
+                    "strataqemu.tests_spec.qmp_screendump", return_value=False
+                ),
+            ):
+                code = run_run_test(
+                    "ubuntu-2404",
+                    install_from="release",
+                    keep=True,
+                    cache_dir=cache,
+                    check_host_fn=lambda: host,
+                    run=fake,
+                    popen=popen,
+                    create_overlay_fn=fake_overlay,
+                    settle_s=0,
+                    intended_version="0.9.0",
+                )
+            self.assertEqual(code, 0, err.getvalue())
+            blob = " ".join(str(c) for c in fake.calls)
+            self.assertIn("smoke-install.sh", blob)
+            self.assertIn("--non-interactive", blob)
+            self.assertIn("--with-desktop-entry", blob)
+            self.assertIn("--without-file-chooser", blob)
+            self.assertIn("$HOME/.local/bin/strata --version", blob)
+            self.assertIn("NameHasOwner", blob)
+            self.assertIn("io.github.lgse.Strata", blob)
+            self.assertNotIn("hyprctl clients", blob)
+            result_files = list((cache / "runs").glob("*/result.json"))
+            self.assertTrue(result_files)
+            text = result_files[0].read_text(encoding="utf-8")
+            for name in (
+                "session",
+                "install",
+                "version",
+                "desktop-entry",
+                "window",
+            ):
+                self.assertIn(f'"name": "{name}"', text)
+            self.assertIn("install_sh_sha256", text)
+            self.assertIn("intended_version", text)
+            self.assertIn("observed_version", text)
+
+    def test_local_archive_scps_and_records_archive_sha(self) -> None:
+        fake = _FakeRun()
+
+        def popen(argv, **kwargs):
+            name = Path(str(argv[0])).name if argv else ""
+            if name.startswith("qemu-system"):
+                return _DummyProc()
+            raise AssertionError(f"unexpected Popen: {argv}")
+
+        def fake_overlay(golden, overlay, **kwargs):
+            dest = Path(overlay)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"overlay")
+            return dest
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cache, _golden = _cache_with_golden(tmp, "fedora-workstation")
+            vars_template = tmp / "OVMF_VARS.4m.fd"
+            vars_template.write_bytes(b"vars")
+            host = _host_ok(tmp)
+            archive = tmp / "strata-0.9.0-x86_64-unknown-linux-gnu.tar.gz"
+            payload = b"local-archive-fixture"
+            archive.write_bytes(payload)
+            err = io.StringIO()
+            with (
+                redirect_stderr(err),
+                patch(
+                    "strataqemu.run_test.find_ovmf_vars",
+                    return_value=vars_template,
+                ),
+                patch.object(Machine, "shutdown", return_value="kill"),
+                patch(
+                    "strataqemu.tests_spec.qmp_screendump", return_value=False
+                ),
+            ):
+                code = run_run_test(
+                    "fedora-workstation",
+                    install_from="local-archive",
+                    archive_path=archive,
+                    keep=True,
+                    cache_dir=cache,
+                    check_host_fn=lambda: host,
+                    run=fake,
+                    popen=popen,
+                    create_overlay_fn=fake_overlay,
+                    settle_s=0,
+                )
+            self.assertEqual(code, 0, err.getvalue())
+            blob = " ".join(str(c) for c in fake.calls)
+            self.assertIn("--archive", blob)
+            self.assertIn(str(archive), blob)
+            self.assertIn("smoke-install.sh", blob)
+            self.assertIn("NameHasOwner", blob)
+            result_files = list((cache / "runs").glob("*/result.json"))
+            self.assertTrue(result_files)
+            text = result_files[0].read_text(encoding="utf-8")
+            digest = sha256_file(archive)
+            self.assertIn("archive_sha256", text)
+            self.assertIn(digest, text)
+            self.assertIn('"intended_version": "0.9.0"', text)
+            self.assertIn('"observed_version": "0.9.0"', text)
 
     def test_session_only_arch_does_not_install(self) -> None:
         fake = _FakeRun()

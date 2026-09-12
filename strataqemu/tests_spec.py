@@ -1,18 +1,23 @@
-"""Session, screenshot, and desktop-oracle steps for ``run-test``.
+"""Session, screenshot, install, version, and desktop-oracle steps for ``run-test``.
 
 Injectable SSH/run-dir so host unittests never spawn QEMU. ``--session-only``
-runs session + in-guest screenshot; it does not gtk-launch Strata or wait on
-the application bus name. ``--install-from release`` on ``arch`` adds install,
-desktop-entry, and Hyprland window steps (no ``strata --version``).
+runs session + in-guest screenshot; it does not gtk-launch Strata, run
+``install.sh``, or wait on the application bus name. ``--install-from``
+release/local-archive on ``arch``, ``ubuntu-2404``, and ``fedora-workstation``
+runs session → install → version → desktop-entry → window.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 import shlex
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
@@ -28,23 +33,52 @@ SESSION_TIMEOUT_S = 60
 INSTALL_TIMEOUT_S = 180
 WINDOW_TIMEOUT_S = 45
 DESKTOP_ENTRY_TIMEOUT_S = 10
+VERSION_TIMEOUT_S = 10
 GUEST_SCREENSHOT_REMOTE = "/tmp/strata-window.png"
+GUEST_ARCHIVE_REMOTE = "/tmp/strata-archive.tar.gz"
 SCREENSHOT_TOOL_MISSING = "screenshot tool missing; rebuild the golden"
 GNOME_SCREENSHOT_TIMEOUT_S = 15
 STRATA_BUS_NAME = "io.github.lgse.Strata"
 STRATA_DESKTOP_FILE = "io.github.lgse.Strata.desktop"
 STRATA_BIN_REL = ".local/bin/strata"
+STRATA_VERSION_COMMAND = f"$HOME/{STRATA_BIN_REL} --version"
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 MIN_PNG_BYTES = 256
 SESSION_ONLY_STEPS = ("session", "screenshot")
-INSTALL_FROM_RELEASE_STEPS = ("session", "install", "desktop-entry", "window")
-INSTALL_FROM_RELEASE_GUESTS = frozenset({"arch"})
+INSTALL_FROM_RELEASE_STEPS = (
+    "session",
+    "install",
+    "version",
+    "desktop-entry",
+    "window",
+)
+INSTALL_FROM_RELEASE_GUESTS = frozenset(
+    {"arch", "ubuntu-2404", "fedora-workstation"}
+)
 INSTALL_FROM_FAIL_CLOSED = (
     "run-test --install-from is not implemented yet (fail closed). "
     "See docs/design.md."
 )
 INSTALL_SH_SHA256_PREFIX = "INSTALL_SH_SHA256="
 INSTALL_SH_URL = "https://raw.githubusercontent.com/lgse/strata/main/install.sh"
+INSTALL_SH_FLAGS = (
+    "--non-interactive",
+    "--with-desktop-entry",
+    "--without-file-chooser",
+)
+GITHUB_LATEST_RELEASE = "https://github.com/lgse/strata/releases/latest"
+ARCHIVE_VERSION_RE = re.compile(r"^strata-v?(.+)$", re.IGNORECASE)
+_ARCHIVE_TARGET_MARKERS = (
+    "-x86_64-",
+    "-aarch64-",
+    "-arm64-",
+    "-x86_64.",
+    "-aarch64.",
+    "-arm64.",
+)
+LOCAL_ARCHIVE_MISSING_PATH = (
+    "run-test: --install-from local-archive requires a host archive path"
+)
 # Substrings that must not appear in --session-only guest commands.
 SESSION_ONLY_FORBIDDEN = (
     "install.sh",
@@ -86,6 +120,10 @@ def smoke_session_script() -> Path:
 
 def smoke_desktop_script() -> Path:
     return guest_tests_dir() / "smoke-desktop.sh"
+
+
+def smoke_install_script() -> Path:
+    return guest_tests_dir() / "smoke-install.sh"
 
 
 def missing_golden_message(guest_id: str) -> str:
@@ -180,8 +218,151 @@ def screenshot_tool_missing(which_returncode: int) -> bool:
     return which_returncode != 0
 
 
-def gdbus_name_has_owner_command() -> str:
-    return " ".join(shlex.quote(part) for part in GDBUS_NAME_HAS_OWNER_ARGV)
+def gdbus_name_has_owner_command(env: Mapping[str, str] | None = None) -> str:
+    body = " ".join(shlex.quote(part) for part in GDBUS_NAME_HAS_OWNER_ARGV)
+    if env:
+        return f"{env_prefix(env)} {body}"
+    return body
+
+
+def install_sh_argv(*, archive: str | None = None) -> list[str]:
+    argv = list(INSTALL_SH_FLAGS)
+    if archive:
+        argv.extend(["--archive", archive])
+    return argv
+
+
+def install_smoke_command(
+    *,
+    archive: str | None = None,
+    forbid_omarchy: bool = False,
+) -> str:
+    """Host-side SSH command that runs the uploaded guest install smoke."""
+    prefix = "SMOKE_FORBID_OMARCHY=1 " if forbid_omarchy else ""
+    flags = " ".join(shlex.quote(part) for part in install_sh_argv(archive=archive))
+    return f"{prefix}bash /tmp/smoke-install.sh {flags}".rstrip()
+
+
+def parse_observed_version(text: str) -> str:
+    """First line of ``strata --version``. Not an installer-log parse."""
+    line = ""
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if stripped:
+            line = stripped
+            break
+    if not line:
+        raise SessionSmokeError("strata --version produced empty stdout")
+    line = re.sub(r"^strata\s+", "", line, flags=re.IGNORECASE)
+    return _strip_v_prefix(line)
+
+
+def _strip_v_prefix(value: str) -> str:
+    text = value.strip()
+    if len(text) > 1 and text[0] in "vV" and text[1].isdigit():
+        return text[1:]
+    return text
+
+
+def normalize_version(value: str) -> str:
+    return _strip_v_prefix(value.strip())
+
+
+def versions_match(observed: str, intended: str) -> bool:
+    return normalize_version(observed) == normalize_version(intended)
+
+
+def parse_archive_version(filename: str) -> str:
+    """Version from ``strata-VERSION-x86_64-unknown-linux-gnu.tar.gz``."""
+    name = Path(filename).name
+    for ext in (".tar.gz", ".tar.xz", ".tgz", ".zip", ".tar"):
+        if name.lower().endswith(ext):
+            name = name[: -len(ext)]
+            break
+    match = ARCHIVE_VERSION_RE.match(name)
+    if not match:
+        raise SessionSmokeError(
+            f"cannot parse intended version from archive name {Path(filename).name!r}"
+        )
+    rest = match.group(1)
+    for marker in _ARCHIVE_TARGET_MARKERS:
+        idx = rest.lower().find(marker)
+        if idx != -1:
+            rest = rest[:idx]
+            break
+    else:
+        rest = re.sub(r"-(x86_64|aarch64|arm64)$", "", rest, flags=re.IGNORECASE)
+    rest = rest.strip()
+    if not re.match(r"\d+\.\d+", rest):
+        raise SessionSmokeError(
+            f"cannot parse intended version from archive name {Path(filename).name!r}"
+        )
+    return rest
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def github_latest_version(
+    url: str = GITHUB_LATEST_RELEASE,
+    *,
+    opener: Callable[..., object] | None = None,
+) -> str:
+    """Resolve GitHub ``/releases/latest`` to a tag (no leading ``v``)."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "strata-qemu-testing",
+        },
+    )
+    open_fn = opener or urllib.request.urlopen
+    try:
+        with open_fn(req, timeout=15) as resp:  # type: ignore[misc]
+            body = resp.read()
+            final = resp.geturl() if hasattr(resp, "geturl") else url
+    except (OSError, urllib.error.URLError) as exc:
+        raise SessionSmokeError(
+            f"could not resolve latest Strata release from {url}: {exc}"
+        ) from exc
+    text = body.decode("utf-8") if isinstance(body, bytes) else str(body)
+    tag = ""
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            tag = str(data.get("tag_name") or data.get("tag") or "")
+    except json.JSONDecodeError:
+        tag = ""
+    if not tag and final:
+        tag = str(final).rstrip("/").rsplit("/", 1)[-1]
+    if not tag or tag in {"latest", "releases"}:
+        raise SessionSmokeError(
+            f"could not resolve latest Strata release from {url}"
+        )
+    return normalize_version(tag)
+
+
+def resolve_intended_version(
+    *,
+    install_from: str,
+    archive_path: Path | None = None,
+    intended_version: str | None = None,
+    intended_version_fn: Callable[[], str] | None = None,
+) -> str:
+    if intended_version:
+        return normalize_version(intended_version)
+    if intended_version_fn is not None:
+        return normalize_version(intended_version_fn())
+    if install_from == "local-archive":
+        if archive_path is None:
+            raise SessionSmokeError("local-archive requires a host archive path")
+        return parse_archive_version(str(archive_path))
+    return github_latest_version()
 
 
 def parse_install_sh_sha256(text: str) -> str:
@@ -473,6 +654,7 @@ def extra_qmp_screendump(machine: Machine, dest: Path) -> bool:
 def wait_gnome_bus_name(
     machine: Machine,
     *,
+    env: Mapping[str, str] | None = None,
     timeout: float = 45,
     run: RunFn | None = None,
     commands: list[str] | None = None,
@@ -480,9 +662,9 @@ def wait_gnome_bus_name(
 ) -> None:
     """Wait until the session bus owns ``io.github.lgse.Strata``.
 
-    Not used by ``--session-only`` (window-after-install is a later PR).
+    Not used by ``--session-only``.
     """
-    remote = gdbus_name_has_owner_command()
+    remote = gdbus_name_has_owner_command(env)
     deadline = time.monotonic() + timeout
     last = "no probe yet"
     nap = sleep or time.sleep
@@ -643,12 +825,34 @@ def run_install_from_release_steps(
     run: RunFn | None = None,
     commands: list[str] | None = None,
     sleep: Callable[[float], None] | None = None,
+    install_from: str = "release",
+    archive_path: Path | str | None = None,
+    intended_version: str | None = None,
+    intended_version_fn: Callable[[], str] | None = None,
 ) -> tuple[list[dict], dict]:
-    """session → install → desktop-entry → window. No version step."""
+    """session → install → version → desktop-entry → window."""
     if not supports_install_from_release(guest):
         raise SessionSmokeError(
-            f"--install-from release is not implemented for {guest.id}"
+            f"--install-from {install_from} is not implemented for {guest.id}"
         )
+    if install_from not in {"release", "local-archive"}:
+        raise SessionSmokeError(
+            f"--install-from {install_from} is not implemented for {guest.id}"
+        )
+    archive: Path | None = Path(archive_path) if archive_path is not None else None
+    if install_from == "local-archive":
+        if archive is None:
+            raise SessionSmokeError(LOCAL_ARCHIVE_MISSING_PATH)
+        if not archive.is_file():
+            raise SessionSmokeError(f"run-test: archive not found: {archive}")
+
+    intended = resolve_intended_version(
+        install_from=install_from,
+        archive_path=archive,
+        intended_version=intended_version,
+        intended_version_fn=intended_version_fn,
+    )
+
     compositor = compositor_process_name(guest)
     tool = screenshot_tool_for_compositor(compositor)
     recorded = commands if commands is not None else []
@@ -674,15 +878,26 @@ def run_install_from_release_steps(
     env = session_env_from_exports(exports)
 
     started = time.monotonic()
-    helper = install_arch_script()
+    helper = smoke_install_script()
     if not helper.is_file():
-        raise SessionSmokeError(f"missing Arch install helper {helper}")
+        raise SessionSmokeError(f"missing install smoke script {helper}")
     scp_to_guest(
-        machine, helper, "/tmp/install-arch.sh", run=run, commands=recorded
+        machine, helper, "/tmp/smoke-install.sh", run=run, commands=recorded
     )
+    archive_digest: str | None = None
+    remote_archive: str | None = None
+    if archive is not None:
+        archive_digest = sha256_file(archive)
+        remote_archive = GUEST_ARCHIVE_REMOTE
+        scp_to_guest(
+            machine, archive, remote_archive, run=run, commands=recorded
+        )
     proc = ssh_run(
         machine,
-        "bash /tmp/install-arch.sh",
+        install_smoke_command(
+            archive=remote_archive,
+            forbid_omarchy=guest.id == "arch",
+        ),
         timeout=INSTALL_TIMEOUT_S,
         check=True,
         run=run,
@@ -703,6 +918,32 @@ def run_install_from_release_steps(
             "status": "pass",
             "seconds": round(time.monotonic() - started, 1),
             "install_sh_sha256": digest,
+        }
+    )
+
+    started = time.monotonic()
+    ver = ssh_run(
+        machine,
+        STRATA_VERSION_COMMAND,
+        timeout=VERSION_TIMEOUT_S,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    observed = parse_observed_version(ver.stdout)
+    if not versions_match(observed, intended):
+        raise SessionSmokeError(
+            f"version mismatch: intended {intended}, observed {observed} "
+            f"(from {STRATA_VERSION_COMMAND})"
+        )
+    steps.append(
+        {
+            "name": "version",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+            "oracle": "strata --version",
+            "intended": intended,
+            "observed": observed,
         }
     )
 
@@ -746,18 +987,29 @@ def run_install_from_release_steps(
         run=run,
         commands=recorded,
     )
-    class_error: BaseException | None = None
+    window_error: BaseException | None = None
+    window_oracle = "hyprctl-class" if compositor == "Hyprland" else "bus-name"
     try:
-        wait_hyprland_class(
-            machine,
-            env,
-            timeout=WINDOW_TIMEOUT_S,
-            run=run,
-            commands=recorded,
-            sleep=sleep,
-        )
+        if compositor == "Hyprland":
+            wait_hyprland_class(
+                machine,
+                env,
+                timeout=WINDOW_TIMEOUT_S,
+                run=run,
+                commands=recorded,
+                sleep=sleep,
+            )
+        else:
+            wait_gnome_bus_name(
+                machine,
+                env=env,
+                timeout=WINDOW_TIMEOUT_S,
+                run=run,
+                commands=recorded,
+                sleep=sleep,
+            )
     except (TimeoutError, SessionSmokeError) as exc:
-        class_error = exc
+        window_error = exc
     capture_guest_screenshot(
         machine,
         env,
@@ -768,24 +1020,24 @@ def run_install_from_release_steps(
     )
     if qmp_dest is not None:
         extra_qmp_screendump(machine, qmp_dest)
-    if class_error is not None:
-        raise class_error
+    if window_error is not None:
+        raise window_error
     steps.append(
         {
             "name": "window",
             "status": "pass",
             "seconds": round(time.monotonic() - started, 1),
             "path": str(screenshot_dest),
+            "oracle": window_oracle,
         }
     )
-    for command in recorded:
-        if "strata --version" in command:
-            raise SessionSmokeError(
-                f"--install-from release invoked strata --version: {command}"
-            )
-    extras = {
+    extras: dict = {
         "install_method": "install.sh",
         "install_sh_sha256": digest,
+        "intended_version": intended,
+        "observed_version": observed,
         "screenshot": str(screenshot_dest),
     }
+    if archive_digest is not None:
+        extras["archive_sha256"] = archive_digest
     return steps, extras

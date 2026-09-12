@@ -37,6 +37,7 @@ from strataqemu.ports import (
 from strataqemu.qemu import Machine, build_qemu_argv
 from strataqemu.tests_spec import (
     INSTALL_FROM_FAIL_CLOSED,
+    LOCAL_ARCHIVE_MISSING_PATH,
     SESSION_TIMEOUT_S,
     SessionSmokeError,
     compositor_process_name,
@@ -340,7 +341,8 @@ def _load_or_usage(guest_id: str | None, command: str) -> Guest | int:
         else:
             print(
                 "usage: python -m strataqemu run-test "
-                "[--session-only | --install-from release] [--keep] <guest>",
+                "[--session-only | --install-from release | "
+                "--install-from local-archive PATH] [--keep] <guest>",
                 file=sys.stderr,
             )
         return 2
@@ -356,6 +358,7 @@ def run_run_test(
     *,
     session_only: bool = False,
     install_from: str | None = None,
+    archive_path: Path | str | None = None,
     keep: bool = False,
     cache_dir: Path | None = None,
     check_host_fn: Callable[[], CheckHostResult] | None = None,
@@ -363,6 +366,8 @@ def run_run_test(
     popen: PopenFn | None = None,
     create_overlay_fn: CreateOverlayFn | None = None,
     settle_s: float = SETTLE_S,
+    intended_version: str | None = None,
+    intended_version_fn: Callable[[], str] | None = None,
 ) -> int:
     """CLI body for ``run-test``. Not a stub. Never calls ``image-build``."""
     loaded = _load_or_usage(guest_id, "run-test")
@@ -370,18 +375,34 @@ def run_run_test(
         return loaded
     guest = loaded
 
-    install_release = (
-        install_from == "release"
+    install_ok = (
+        install_from in {"release", "local-archive"}
         and supports_install_from_release(guest)
         and not session_only
     )
-    if install_from and not session_only and not install_release:
+    if install_from and not session_only and not install_ok:
         print(INSTALL_FROM_FAIL_CLOSED, file=sys.stderr)
         return 2
-    if not session_only and not install_release:
+    if archive_path and install_from != "local-archive":
         print(
-            "run-test: pass --session-only "
-            "(install / version / window-after-install are later PRs)",
+            "run-test: archive path is only valid with "
+            "--install-from local-archive",
+            file=sys.stderr,
+        )
+        return 2
+    archive: Path | None = None
+    if install_ok and install_from == "local-archive":
+        if not archive_path:
+            print(LOCAL_ARCHIVE_MISSING_PATH, file=sys.stderr)
+            return 2
+        archive = Path(archive_path)
+        if not archive.is_file():
+            print(f"run-test: archive not found: {archive}", file=sys.stderr)
+            return 2
+    if not session_only and not install_ok:
+        print(
+            "run-test: pass --session-only or "
+            "--install-from release|local-archive",
             file=sys.stderr,
         )
         return 2
@@ -443,7 +464,7 @@ def run_run_test(
         shot = run_dir / "screenshot.png"
         qmp_path = run_dir / "qmp-session.png"
         extras: dict = {}
-        if install_release:
+        if install_ok:
             steps, extras = run_install_from_release_steps(
                 machine,
                 guest=guest,
@@ -452,6 +473,10 @@ def run_run_test(
                 session_timeout=SESSION_TIMEOUT_S,
                 run=run,
                 commands=recorded,
+                install_from=install_from or "release",
+                archive_path=archive,
+                intended_version=intended_version,
+                intended_version_fn=intended_version_fn,
             )
         else:
             steps = run_session_only_steps(
@@ -473,7 +498,7 @@ def run_run_test(
         )
         result.update(extras)
         _write_result(arts.result_json, result)
-        if install_release:
+        if install_ok:
             print(f"run-test: ok ({guest.id})")
         else:
             print(f"run-test: session ok ({guest.id})")

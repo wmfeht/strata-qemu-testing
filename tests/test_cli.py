@@ -23,6 +23,7 @@ from strataqemu.cli import (
     find_ovmf_code,
     main,
     ovmf_code_candidates,
+    parse_install_from,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -139,6 +140,30 @@ class CliHelpTests(unittest.TestCase):
             self.assertIn(flag, text)
             self.assertNotIn("not implemented", text)
             self.assertNotIn("SystemExit", text)
+
+    def test_install_from_local_archive_binds_path(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "run-test",
+                "ubuntu-2404",
+                "--install-from",
+                "local-archive",
+                "/tmp/strata-0.9.0-x86_64-unknown-linux-gnu.tar.gz",
+            ]
+        )
+        source, path, err = parse_install_from(args.install_from)
+        self.assertIsNone(err)
+        self.assertEqual(source, "local-archive")
+        self.assertEqual(
+            path, "/tmp/strata-0.9.0-x86_64-unknown-linux-gnu.tar.gz"
+        )
+        source, path, err = parse_install_from(["local-archive"])
+        self.assertIsNone(err)
+        self.assertEqual(source, "local-archive")
+        self.assertIsNone(path)
+        source, path, err = parse_install_from(["release"])
+        self.assertEqual((source, path, err), ("release", None, None))
 
     def test_run_test_without_guest_is_not_stub(self) -> None:
         buf = io.StringIO()

@@ -16,11 +16,14 @@ from strataqemu.guest import load_guest
 from strataqemu.qemu import Machine
 from strataqemu.tests_spec import (
     GDBUS_NAME_HAS_OWNER_ARGV,
+    GUEST_ARCHIVE_REMOTE,
     INSTALL_FROM_FAIL_CLOSED,
     INSTALL_FROM_RELEASE_STEPS,
+    INSTALL_SH_FLAGS,
     SCREENSHOT_TOOL_MISSING,
     SESSION_ONLY_FORBIDDEN,
     STRATA_BUS_NAME,
+    STRATA_VERSION_COMMAND,
     SessionSmokeError,
     assert_session_only_commands,
     capture_guest_screenshot,
@@ -28,20 +31,28 @@ from strataqemu.tests_spec import (
     compositor_process_name,
     extra_qmp_screendump,
     gdbus_name_has_owner_command,
+    github_latest_version,
     hyprctl_class_oracle_command,
     install_arch_script,
+    install_sh_argv,
+    install_smoke_command,
     missing_golden_message,
+    parse_archive_version,
     parse_install_sh_sha256,
     parse_name_has_owner,
+    parse_observed_version,
     parse_session_exports,
     run_install_from_release_steps,
     run_session_only_steps,
     screenshot_tool_for_compositor,
     screenshot_tool_missing,
     session_only_step_names,
+    sha256_file,
     smoke_desktop_script,
+    smoke_install_script,
     smoke_session_script,
     supports_install_from_release,
+    versions_match,
     wait_gnome_bus_name,
 )
 
@@ -69,11 +80,12 @@ class _FakeRun:
             "WAYLAND_DISPLAY=wayland-0\n"
         )
         self.session_code = 0
-        self.gdbus_stdout = "(false,)\n"
+        self.gdbus_stdout = "(true,)\n"
         self.write_png_on_scp = True
         self.install_digest = hashlib.sha256(b"fixture-install-sh").hexdigest()
         self.hyprctl_code = 0
         self.exec_line = "Exec=/home/tester/.local/bin/strata %U\n"
+        self.version_stdout = "0.9.0\n"
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
@@ -104,14 +116,20 @@ class _FakeRun:
             return _completed(0)
         if " grim " in f" {remote} " or remote.strip().startswith("grim "):
             return _completed(0)
-        if "install-arch.sh" in remote:
+        if "smoke-install.sh" in remote or "install-arch.sh" in remote:
             return _completed(
-                0, stdout=f"INSTALL_SH_SHA256={self.install_digest}\n"
+                0,
+                stdout=(
+                    f"INSTALL_SH_SHA256={self.install_digest}\n"
+                    "Installed Strata v9.9.9\n"
+                ),
             )
         if "Exec=" in remote or STRATA_BUS_NAME + ".desktop" in remote:
             return _completed(0, stdout=self.exec_line)
         if "test -x" in remote:
             return _completed(0)
+        if "--version" in remote and "strata" in remote:
+            return _completed(0, stdout=self.version_stdout)
         if "gtk-launch" in remote or "gio launch" in remote:
             return _completed(0)
         if "hyprctl clients" in remote:
@@ -153,8 +171,8 @@ class ParseOracleTests(unittest.TestCase):
         self.assertEqual(
             screenshot_tool_for_compositor("gnome-shell"), "gnome-screenshot"
         )
-        self.assertFalse(supports_install_from_release(guest))
-        self.assertFalse(supports_install_from_release("fedora-workstation"))
+        self.assertTrue(supports_install_from_release(guest))
+        self.assertTrue(supports_install_from_release("fedora-workstation"))
 
     def test_arch_compositor_is_hyprland_grim(self) -> None:
         guest = load_guest("arch")
@@ -162,7 +180,7 @@ class ParseOracleTests(unittest.TestCase):
         self.assertEqual(compositor_process_name("arch"), "Hyprland")
         self.assertEqual(screenshot_tool_for_compositor("Hyprland"), "grim")
         self.assertTrue(supports_install_from_release(guest))
-        self.assertFalse(supports_install_from_release("ubuntu-2404"))
+        self.assertTrue(supports_install_from_release("ubuntu-2404"))
         self.assertIn("hyprctl clients", hyprctl_class_oracle_command())
         self.assertIn(STRATA_BUS_NAME, hyprctl_class_oracle_command())
 
@@ -336,6 +354,8 @@ class SessionOnlyDriveTests(unittest.TestCase):
     def test_scripts_exist(self) -> None:
         self.assertTrue(smoke_session_script().is_file())
         self.assertTrue(smoke_desktop_script().is_file())
+        self.assertTrue(smoke_install_script().is_file())
+        self.assertTrue(os.access(smoke_install_script(), os.X_OK))
         desktop = smoke_desktop_script().read_text(encoding="utf-8")
         self.assertIn("NameHasOwner", desktop)
         self.assertIn("grim", desktop)
@@ -405,7 +425,7 @@ class SessionOnlyDriveTests(unittest.TestCase):
                 )
         self.assertEqual(str(ctx.exception), SCREENSHOT_TOOL_MISSING)
 
-    def test_install_from_release_steps_no_version(self) -> None:
+    def test_install_from_release_steps_include_version_hyprland(self) -> None:
         fake = _FakeRun()
         fake.session_stdout += "HYPRLAND_INSTANCE_SIGNATURE=sig\n"
         with tempfile.TemporaryDirectory() as td:
@@ -428,19 +448,27 @@ class SessionOnlyDriveTests(unittest.TestCase):
                 run=fake,
                 commands=commands,
                 sleep=lambda _s: None,
+                intended_version="0.9.0",
             )
         names = [s["name"] for s in steps]
         self.assertEqual(list(names), list(INSTALL_FROM_RELEASE_STEPS))
-        self.assertNotIn("version", names)
         self.assertEqual(extras["install_sh_sha256"], fake.install_digest)
+        self.assertEqual(extras["intended_version"], "0.9.0")
+        self.assertEqual(extras["observed_version"], "0.9.0")
+        self.assertNotEqual(extras["observed_version"], "9.9.9")
+        self.assertEqual(extras["install_method"], "install.sh")
         blob = "\n".join(commands)
-        self.assertIn("install-arch.sh", blob)
+        self.assertIn("smoke-install.sh", blob)
+        self.assertIn("--non-interactive", blob)
+        self.assertIn("--with-desktop-entry", blob)
+        self.assertIn("--without-file-chooser", blob)
         self.assertIn("gtk-launch", blob)
         self.assertIn("hyprctl clients", blob)
         self.assertIn("grim", blob)
-        self.assertNotIn("strata --version", blob)
+        self.assertIn(STRATA_VERSION_COMMAND, blob)
         self.assertNotIn("NameHasOwner", blob)
-        helper = install_arch_script().read_text(encoding="utf-8")
+        self.assertNotIn("--archive", blob)
+        helper = smoke_install_script().read_text(encoding="utf-8")
         self.assertIn("--non-interactive", helper)
         self.assertIn("--with-desktop-entry", helper)
         self.assertIn("--without-file-chooser", helper)
@@ -470,11 +498,241 @@ class SessionOnlyDriveTests(unittest.TestCase):
                     run=fake,
                     commands=commands,
                     sleep=lambda _s: None,
+                    intended_version="0.9.0",
                 )
         self.assertEqual(str(ctx.exception), SCREENSHOT_TOOL_MISSING)
         blob = "\n".join(commands)
         self.assertNotIn("gtk-launch", blob)
         self.assertNotIn("hyprctl clients", blob)
+
+
+    def test_ubuntu_install_from_release_uses_gnome_bus_name(self) -> None:
+        fake = _FakeRun()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            dest = tmp / "screenshot.png"
+            commands: list[str] = []
+            steps, extras = run_install_from_release_steps(
+                machine,
+                guest=load_guest("ubuntu-2404"),
+                screenshot_dest=dest,
+                session_timeout=5,
+                run=fake,
+                commands=commands,
+                sleep=lambda _s: None,
+                intended_version="0.9.0",
+            )
+        names = [s["name"] for s in steps]
+        self.assertEqual(list(names), list(INSTALL_FROM_RELEASE_STEPS))
+        blob = "\n".join(commands)
+        self.assertIn("smoke-install.sh", blob)
+        self.assertIn("--non-interactive", blob)
+        self.assertIn("--with-desktop-entry", blob)
+        self.assertIn("--without-file-chooser", blob)
+        self.assertIn(STRATA_VERSION_COMMAND, blob)
+        self.assertIn("NameHasOwner", blob)
+        self.assertIn(STRATA_BUS_NAME, blob)
+        self.assertIn("gtk-launch", blob)
+        self.assertIn("gnome-screenshot", blob)
+        self.assertNotIn("hyprctl clients", blob)
+        self.assertNotIn("--archive", blob)
+        self.assertEqual(extras["observed_version"], "0.9.0")
+        self.assertEqual(extras["intended_version"], "0.9.0")
+        self.assertNotIn("archive_sha256", extras)
+
+    def test_fedora_install_from_release_uses_gnome_bus_name(self) -> None:
+        fake = _FakeRun()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            commands: list[str] = []
+            steps, extras = run_install_from_release_steps(
+                machine,
+                guest=load_guest("fedora-workstation"),
+                screenshot_dest=tmp / "screenshot.png",
+                session_timeout=5,
+                run=fake,
+                commands=commands,
+                sleep=lambda _s: None,
+                intended_version="v0.9.0",
+            )
+        names = [s["name"] for s in steps]
+        self.assertEqual(list(names), list(INSTALL_FROM_RELEASE_STEPS))
+        blob = "\n".join(commands)
+        self.assertIn("NameHasOwner", blob)
+        self.assertIn("gnome-screenshot", blob)
+        self.assertNotIn("hyprctl clients", blob)
+        self.assertEqual(extras["intended_version"], "0.9.0")
+        self.assertEqual(extras["observed_version"], "0.9.0")
+
+    def test_local_archive_scps_host_path_and_passes_archive_flag(self) -> None:
+        fake = _FakeRun()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            archive = tmp / "strata-0.9.0-x86_64-unknown-linux-gnu.tar.gz"
+            payload = b"fixture-archive-bytes"
+            archive.write_bytes(payload)
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            commands: list[str] = []
+            steps, extras = run_install_from_release_steps(
+                machine,
+                guest=load_guest("ubuntu-2404"),
+                screenshot_dest=tmp / "screenshot.png",
+                session_timeout=5,
+                run=fake,
+                commands=commands,
+                sleep=lambda _s: None,
+                install_from="local-archive",
+                archive_path=archive,
+            )
+            names = [s["name"] for s in steps]
+            self.assertEqual(list(names), list(INSTALL_FROM_RELEASE_STEPS))
+            blob = "\n".join(commands)
+            self.assertIn("--archive", blob)
+            self.assertIn(GUEST_ARCHIVE_REMOTE, blob)
+            self.assertIn(str(archive), blob)
+            self.assertIn("smoke-install.sh", blob)
+            self.assertEqual(extras["archive_sha256"], sha256_file(archive))
+            self.assertEqual(
+                extras["archive_sha256"], hashlib.sha256(payload).hexdigest()
+            )
+            self.assertEqual(extras["intended_version"], "0.9.0")
+            self.assertEqual(extras["observed_version"], "0.9.0")
+
+    def test_local_archive_missing_path_fail_closed(self) -> None:
+        fake = _FakeRun()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2", tmp, ssh_port=22022, identity=identity
+            )
+            with self.assertRaises(SessionSmokeError) as ctx:
+                run_install_from_release_steps(
+                    machine,
+                    guest=load_guest("ubuntu-2404"),
+                    screenshot_dest=tmp / "shot.png",
+                    run=fake,
+                    install_from="local-archive",
+                    intended_version="0.9.0",
+                )
+        self.assertIn("archive", str(ctx.exception).lower())
+        self.assertNotIn("not implemented", str(ctx.exception))
+
+    def test_version_mismatch_fails(self) -> None:
+        fake = _FakeRun()
+        fake.version_stdout = "0.1.0\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2", tmp, ssh_port=22022, identity=identity
+            )
+            with self.assertRaises(SessionSmokeError) as ctx:
+                run_install_from_release_steps(
+                    machine,
+                    guest=load_guest("arch"),
+                    screenshot_dest=tmp / "shot.png",
+                    session_timeout=5,
+                    run=fake,
+                    sleep=lambda _s: None,
+                    intended_version="0.9.0",
+                )
+        self.assertIn("version mismatch", str(ctx.exception))
+        self.assertIn("0.9.0", str(ctx.exception))
+        self.assertIn("0.1.0", str(ctx.exception))
+
+
+class VersionParseTests(unittest.TestCase):
+    def test_observed_version_strips_prefix(self) -> None:
+        self.assertEqual(parse_observed_version("0.9.0\n"), "0.9.0")
+        self.assertEqual(parse_observed_version("strata 0.9.0\n"), "0.9.0")
+        self.assertEqual(parse_observed_version("v0.9.0\n"), "0.9.0")
+        self.assertTrue(versions_match("v0.9.0", "0.9.0"))
+        with self.assertRaises(SessionSmokeError):
+            parse_observed_version("\n")
+
+    def test_archive_version_from_filename(self) -> None:
+        self.assertEqual(
+            parse_archive_version(
+                "/tmp/strata-0.9.0-x86_64-unknown-linux-gnu.tar.gz"
+            ),
+            "0.9.0",
+        )
+        self.assertEqual(
+            parse_archive_version("strata-v1.2.3-aarch64-unknown-linux-gnu.tar.gz"),
+            "1.2.3",
+        )
+        self.assertEqual(
+            parse_archive_version("strata-0.9.0-rc.1-x86_64-unknown-linux-gnu.tar.gz"),
+            "0.9.0-rc.1",
+        )
+        with self.assertRaises(SessionSmokeError):
+            parse_archive_version("/tmp/not-an-archive.tar.gz")
+
+    def test_github_latest_version_uses_injected_opener(self) -> None:
+        class _Resp:
+            def __init__(self) -> None:
+                self._url = (
+                    "https://github.com/lgse/strata/releases/tag/v1.2.3"
+                )
+
+            def read(self) -> bytes:
+                return b'{"tag_name":"v1.2.3"}'
+
+            def geturl(self) -> str:
+                return self._url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc) -> bool:
+                return False
+
+        def opener(_req, timeout=15):
+            del timeout
+            return _Resp()
+
+        self.assertEqual(github_latest_version(opener=opener), "1.2.3")
+
+    def test_install_argv_helpers(self) -> None:
+        self.assertEqual(
+            install_sh_argv(),
+            list(INSTALL_SH_FLAGS),
+        )
+        argv = install_sh_argv(archive=GUEST_ARCHIVE_REMOTE)
+        self.assertEqual(argv[:3], list(INSTALL_SH_FLAGS))
+        self.assertEqual(argv[3:], ["--archive", GUEST_ARCHIVE_REMOTE])
+        cmd = install_smoke_command(archive=GUEST_ARCHIVE_REMOTE)
+        self.assertIn("--archive", cmd)
+        self.assertIn(GUEST_ARCHIVE_REMOTE, cmd)
+        self.assertIn("smoke-install.sh", cmd)
+        arch_cmd = install_smoke_command(forbid_omarchy=True)
+        self.assertIn("SMOKE_FORBID_OMARCHY=1", arch_cmd)
 
 
 class InstallArchHelperTests(unittest.TestCase):

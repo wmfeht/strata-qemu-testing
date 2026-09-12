@@ -1,7 +1,8 @@
-"""Fixture-drive guest-tests/smoke-session.sh and smoke-desktop.sh. No KVM."""
+"""Fixture-drive guest-tests smokes. No KVM."""
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import socket
@@ -11,9 +12,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from strataqemu.tests_spec import parse_install_sh_sha256
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SMOKE_SESSION = REPO_ROOT / "guest-tests" / "smoke-session.sh"
 SMOKE_DESKTOP = REPO_ROOT / "guest-tests" / "smoke-desktop.sh"
+SMOKE_INSTALL = REPO_ROOT / "guest-tests" / "smoke-install.sh"
 UID = 1000
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
@@ -461,6 +465,131 @@ class SmokeDesktopHyprlandTests(unittest.TestCase):
         blob = proc.stdout + proc.stderr
         self.assertNotIn("NameHasOwner", blob)
         self.assertNotIn("gnome-screenshot", blob)
+
+
+class SmokeInstallScriptTests(unittest.TestCase):
+    def test_script_is_executable_and_not_curl_pipe(self) -> None:
+        self.assertTrue(SMOKE_INSTALL.is_file())
+        self.assertTrue(os.access(SMOKE_INSTALL, os.X_OK))
+        text = SMOKE_INSTALL.read_text(encoding="utf-8")
+        self.assertIn("--non-interactive", text)
+        self.assertIn("--with-desktop-entry", text)
+        self.assertIn("--without-file-chooser", text)
+        self.assertIn("INSTALL_SH_SHA256", text)
+        self.assertIn("--archive", text)
+        commands = [
+            line
+            for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertFalse(any("|" in line and "bash" in line for line in commands))
+        self.assertNotIn("pexpect", text)
+        self.assertNotIn("expect", text.lower().replace("expected", ""))
+
+    def _run_with_fake_curl(
+        self, extra_args: list[str] | None = None, extra_env: dict[str, str] | None = None
+    ) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        bindir = tmp / "bin"
+        bindir.mkdir()
+        record = tmp / "install-argv"
+        home = tmp / "home"
+        home.mkdir()
+        dest = tmp / "downloaded-install.sh"
+
+        curl = bindir / "curl"
+        curl.write_text(
+            "#!/bin/bash\n"
+            "set -euo pipefail\n"
+            "dest=\"\"\n"
+            "while [[ $# -gt 0 ]]; do\n"
+            "  if [[ \"$1\" == \"-o\" ]]; then dest=\"$2\"; shift 2; continue; fi\n"
+            "  shift\n"
+            "done\n"
+            "cat > \"$dest\" <<'INNER'\n"
+            "#!/usr/bin/env bash\n"
+            "printf '%s\\n' \"$@\" > \"${INSTALL_ARGV_RECORD:?}\"\n"
+            "mkdir -p \"$HOME/.local/bin\"\n"
+            "echo stub > \"$HOME/.local/bin/strata\"\n"
+            "chmod +x \"$HOME/.local/bin/strata\"\n"
+            "INNER\n"
+            "chmod +x \"$dest\"\n",
+            encoding="utf-8",
+        )
+        curl.chmod(curl.stat().st_mode | stat.S_IXUSR)
+        for name in ("sha256sum", "awk", "bash", "chmod", "mkdir", "cat", "echo", "test"):
+            found = shutil.which(name)
+            self.assertIsNotNone(found, name)
+            assert found is not None
+            os.symlink(found, bindir / name)
+
+        env = os.environ.copy()
+        env["PATH"] = str(bindir)
+        env["HOME"] = str(home)
+        env["INSTALL_SH_DEST"] = str(dest)
+        env["INSTALL_ARGV_RECORD"] = str(record)
+        if extra_env:
+            env.update(extra_env)
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        assert bash is not None
+        argv = [bash, str(SMOKE_INSTALL)]
+        if extra_args:
+            argv.extend(extra_args)
+        proc = subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        return proc, dest, record, home
+
+    def test_save_then_exec_contract_flags(self) -> None:
+        proc, dest, record, home = self._run_with_fake_curl()
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+        self.assertEqual(parse_install_sh_sha256(proc.stdout), digest)
+        argv = record.read_text(encoding="utf-8").split()
+        self.assertEqual(
+            argv,
+            [
+                "--non-interactive",
+                "--with-desktop-entry",
+                "--without-file-chooser",
+            ],
+        )
+        self.assertTrue((home / ".local/bin/strata").is_file())
+        self.assertTrue(os.access(home / ".local/bin/strata", os.X_OK))
+        self.assertNotIn("| bash", proc.stdout)
+        self.assertNotIn("curl |", proc.stdout)
+
+    def test_archive_flag_is_forwarded(self) -> None:
+        proc, dest, record, home = self._run_with_fake_curl(
+            extra_args=[
+                "--non-interactive",
+                "--with-desktop-entry",
+                "--without-file-chooser",
+                "--archive",
+                "/tmp/strata-archive.tar.gz",
+            ]
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+        self.assertEqual(parse_install_sh_sha256(proc.stdout), digest)
+        argv = record.read_text(encoding="utf-8").split()
+        self.assertEqual(
+            argv,
+            [
+                "--non-interactive",
+                "--with-desktop-entry",
+                "--without-file-chooser",
+                "--archive",
+                "/tmp/strata-archive.tar.gz",
+            ],
+        )
+        self.assertTrue((home / ".local/bin/strata").is_file())
 
 
 if __name__ == "__main__":

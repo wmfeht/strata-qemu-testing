@@ -299,8 +299,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_test.add_argument(
         "--install-from",
-        choices=("release", "local-archive"),
-        help="Install Strata from GitHub latest or a local archive",
+        nargs="+",
+        metavar=("SOURCE", "PATH"),
+        help=(
+            "Install Strata from GitHub latest (release) "
+            "or a host tarball (local-archive PATH)"
+        ),
     )
     run_test.add_argument(
         "--keep",
@@ -377,6 +381,39 @@ def normalize_cli_argv(argv: Sequence[str]) -> list[str]:
     return [a for a in argv if a != "--"]
 
 
+def parse_install_from(
+    raw: Sequence[str] | None,
+) -> tuple[str | None, str | None, str | None]:
+    """Split ``--install-from release|local-archive [PATH]``.
+
+    Returns ``(source, archive_path, error)``. A missing local-archive path
+    is left for ``run_run_test`` so the fail-closed message stays in one place.
+    """
+    if not raw:
+        return None, None, None
+    source = raw[0]
+    rest = list(raw[1:])
+    if source not in ("release", "local-archive"):
+        return (
+            None,
+            None,
+            "run-test: --install-from must be 'release' or 'local-archive'",
+        )
+    if source == "local-archive":
+        if len(rest) > 1:
+            extra = " ".join(rest[1:])
+            return None, None, f"run-test: unexpected extra arguments: {extra}"
+        path = rest[0] if rest else None
+        return source, path, None
+    if rest:
+        return (
+            None,
+            None,
+            "run-test: --install-from release does not take a path",
+        )
+    return source, None, None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     raw = sys.argv[1:] if argv is None else argv
@@ -414,10 +451,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run-test":
         from strataqemu.run_test import run_run_test
 
+        install_from, archive_path, parse_err = parse_install_from(
+            args.install_from
+        )
+        if parse_err is not None:
+            print(parse_err, file=sys.stderr)
+            return 2
+
         return run_run_test(
             args.guest,
             session_only=args.session_only,
-            install_from=args.install_from,
+            install_from=install_from,
+            archive_path=archive_path,
             keep=args.keep,
         )
 
