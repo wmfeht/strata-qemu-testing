@@ -1,0 +1,38 @@
+id = "ubuntu-2404"
+arch = "x86_64"
+firmware = "uefi"
+source_kind = "cloud-image"
+# Dated daily, not …/noble/current/. 20260901 404s on cloud-images.ubuntu.com.
+source_url = "https://cloud-images.ubuntu.com/noble/20260911/noble-server-cloudimg-amd64.img"
+source_sha256 = "612b2c0cc1bc413a6cb8c38fd611794caf0f2b436c50013d8b3794db12ad7354"
+disk_gb = 40
+memory_mib = 8192
+cpus = 4
+build_timeout_s = 3600
+boot_timeout_s = 180
+ovmf_code = "OVMF_CODE.4m.fd"
+ovmf_vars_template = "OVMF_VARS.4m.fd"
+
+[session]
+kind = "gnome"
+display_manager = "gdm"
+compositor = "mutter"
+autologin = true
+wayland = true
+
+[packages]
+manager = "apt"
+# Same snapshot service the Strata E2E Dockerfile uses.
+snapshot_url = "http://snapshot.ubuntu.com/ubuntu/20260901T000000Z"
+runtime = [
+  "bubblewrap", "ffmpeg", "ffmpegthumbnailer", "fontconfig",
+  "gstreamer1.0-libav", "gstreamer1.0-plugins-good",
+  "libgtk-4-1", "libgtksourceview-5-0", "gvfs-daemons",
+  "libpoppler-glib8", "xdg-utils", "desktop-file-utils",
+  "at-spi2-core", "xdg-desktop-portal", "xdg-desktop-portal-gnome",
+  "gnome-screenshot",
+]
+
+[user]
+name = "tester"
+groups = ["sudo"]

@@ -128,13 +128,36 @@ class CliHelpTests(unittest.TestCase):
                 self.assertEqual(args.command, name)
 
     def test_stub_subcommands_fail_closed(self) -> None:
-        for name in ("image-build", "run-test", "vm-run"):
+        for name in ("run-test", "vm-run"):
             err = io.StringIO()
             with self.subTest(name=name), redirect_stderr(err):
                 code = main([name])
             self.assertEqual(code, 2)
             self.assertIn(name, err.getvalue())
             self.assertIn("not implemented", err.getvalue())
+
+    def test_image_build_help_is_not_exit2_stub(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            code = main(["image-build", "--help"])
+        self.assertEqual(code, 0)
+        text = buf.getvalue() + err.getvalue()
+        self.assertIn("image-build", text)
+        self.assertIn("--force", text)
+        self.assertIn("guest", text.lower())
+        self.assertNotIn("not implemented", text)
+        self.assertNotIn("SystemExit", text)
+
+    def test_image_build_without_guest_is_not_stub(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            code = main(["image-build"])
+        self.assertEqual(code, 2)
+        text = buf.getvalue() + err.getvalue()
+        self.assertNotIn("not implemented", text)
+        self.assertIn("guest", text.lower())
 
     def test_spike_wayland_ubuntu_help_is_not_exit2_stub(self) -> None:
         buf = io.StringIO()

@@ -1,4 +1,4 @@
-"""Argparse CLI: check-host, image-prune, spike-wayland-ubuntu, later-PR stubs."""
+"""Argparse CLI: check-host, image-build, image-prune, spike-wayland-ubuntu, later-PR stubs."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ DEFAULT_FIRMWARE_SHARE_ROOTS: tuple[Path, ...] = (Path("/usr/share"),)
 # Generic floor when no guest is selected: 8 GiB guest + 1 GiB host slack.
 GENERIC_MEM_FLOOR_MIB = 9 * 1024
 
-STUB_COMMANDS = ("image-build", "run-test", "vm-run")
+STUB_COMMANDS = ("run-test", "vm-run")
 
 # Named when qemu-system-x86_64 is missing. Not a generic "install qemu".
 QEMU_BOOTSTRAP_HINT = """\
@@ -280,9 +280,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     image_build = sub.add_parser(
         "image-build",
-        help="Build or refresh a golden from its recipe (later PR)",
+        help="Build or refresh a golden from its recipe. Incremental; --force rebuilds.",
     )
-    image_build.add_argument("guest", nargs="?", help="Guest id")
+    image_build.add_argument("guest", nargs="?", help="Guest id (e.g. ubuntu-2404)")
     image_build.add_argument(
         "--force",
         action="store_true",
@@ -401,6 +401,11 @@ def main(argv: list[str] | None = None) -> int:
         from strataqemu.spike import run_spike_wayland_ubuntu
 
         return run_spike_wayland_ubuntu(keep=args.keep)
+
+    if args.command == "image-build":
+        from strataqemu.image_build import run_image_build
+
+        return run_image_build(args.guest, force=args.force)
 
     if args.command in STUB_COMMANDS:
         print(
