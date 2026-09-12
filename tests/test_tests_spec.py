@@ -51,6 +51,7 @@ from strataqemu.tests_spec import (
     smoke_desktop_script,
     smoke_install_script,
     smoke_session_script,
+    strata_version_is_cli,
     supports_install_from_release,
     versions_match,
     wait_gnome_bus_name,
@@ -183,6 +184,18 @@ class ParseOracleTests(unittest.TestCase):
         self.assertTrue(supports_install_from_release("ubuntu-2404"))
         self.assertIn("hyprctl clients", hyprctl_class_oracle_command())
         self.assertIn(STRATA_BUS_NAME, hyprctl_class_oracle_command())
+
+    def test_omarchy4_compositor_is_hyprland_grim(self) -> None:
+        guest = load_guest("omarchy-4")
+        self.assertEqual(compositor_process_name(guest), "Hyprland")
+        self.assertEqual(compositor_process_name("omarchy-4"), "Hyprland")
+        self.assertEqual(screenshot_tool_for_compositor("Hyprland"), "grim")
+        self.assertTrue(supports_install_from_release(guest))
+        self.assertTrue(supports_install_from_release("omarchy-4"))
+        self.assertEqual(
+            missing_golden_message("omarchy-4"),
+            "run `mise run image-build -- omarchy-4` first",
+        )
 
     def test_missing_golden_message_matches_design(self) -> None:
         msg = missing_golden_message("ubuntu-2404")
@@ -733,6 +746,24 @@ class VersionParseTests(unittest.TestCase):
         self.assertIn("smoke-install.sh", cmd)
         arch_cmd = install_smoke_command(forbid_omarchy=True)
         self.assertIn("SMOKE_FORBID_OMARCHY=1", arch_cmd)
+        omarchy_cmd = install_smoke_command(forbid_omarchy=False)
+        self.assertNotIn("SMOKE_FORBID_OMARCHY", omarchy_cmd)
+        self.assertEqual(
+            list(INSTALL_SH_FLAGS),
+            [
+                "--non-interactive",
+                "--with-desktop-entry",
+                "--without-file-chooser",
+            ],
+        )
+        self.assertNotIn("--with-omarchy-keybinds", INSTALL_SH_FLAGS)
+        self.assertNotIn("--with-omarchy-keybinds", install_sh_argv())
+        self.assertTrue(strata_version_is_cli(0, "0.9.0\n"))
+        self.assertTrue(strata_version_is_cli(0, "strata 1.2.3\n"))
+        self.assertFalse(strata_version_is_cli(0, ""))
+        self.assertFalse(
+            strata_version_is_cli(0, "Gtk-Message: Failed to connect\n")
+        )
 
 
 class InstallArchHelperTests(unittest.TestCase):
@@ -822,6 +853,81 @@ class InstallArchHelperTests(unittest.TestCase):
 
     def test_fail_closed_message_is_stable(self) -> None:
         self.assertIn("not implemented yet (fail closed)", INSTALL_FROM_FAIL_CLOSED)
+
+
+class Omarchy4InstallFromTests(unittest.TestCase):
+    def test_install_from_release_hyprland_oracle_existing_flags(self) -> None:
+        fake = _FakeRun()
+        fake.session_stdout += "HYPRLAND_INSTANCE_SIGNATURE=sig\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            dest = tmp / "screenshot.png"
+            commands: list[str] = []
+            steps, extras = run_install_from_release_steps(
+                machine,
+                guest=load_guest("omarchy-4"),
+                screenshot_dest=dest,
+                session_timeout=5,
+                run=fake,
+                commands=commands,
+                sleep=lambda _s: None,
+                intended_version="0.9.0",
+            )
+        names = [s["name"] for s in steps]
+        self.assertEqual(list(names), list(INSTALL_FROM_RELEASE_STEPS))
+        blob = "\n".join(commands)
+        self.assertIn("smoke-install.sh", blob)
+        self.assertIn("--non-interactive", blob)
+        self.assertIn("--with-desktop-entry", blob)
+        self.assertIn("--without-file-chooser", blob)
+        self.assertNotIn("--with-omarchy-keybinds", blob)
+        self.assertNotIn("SMOKE_FORBID_OMARCHY", blob)
+        self.assertIn("hyprctl clients", blob)
+        self.assertIn("grim", blob)
+        self.assertIn("gtk-launch", blob)
+        self.assertNotIn("NameHasOwner", blob)
+        self.assertEqual(extras["install_method"], "install.sh")
+
+    def test_version_step_skipped_when_not_cli(self) -> None:
+        fake = _FakeRun()
+        fake.version_stdout = "Gtk-Message: Failed to open display\n"
+        fake.session_stdout += "HYPRLAND_INSTANCE_SIGNATURE=sig\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            commands: list[str] = []
+            steps, extras = run_install_from_release_steps(
+                machine,
+                guest=load_guest("omarchy-4"),
+                screenshot_dest=tmp / "screenshot.png",
+                session_timeout=5,
+                run=fake,
+                commands=commands,
+                sleep=lambda _s: None,
+                intended_version="0.9.0",
+            )
+        version = [s for s in steps if s["name"] == "version"][0]
+        self.assertEqual(version["status"], "skip")
+        self.assertIn("not a CLI", version["reason"])
+        self.assertNotIn("observed_version", extras)
+        self.assertIn("session", [s["name"] for s in steps])
+        self.assertIn("install", [s["name"] for s in steps])
+        self.assertIn("window", [s["name"] for s in steps])
 
 
 if __name__ == "__main__":

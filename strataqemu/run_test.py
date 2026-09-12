@@ -23,6 +23,7 @@ from strataqemu.image_build import (
     ImageBuildError,
     find_ovmf_vars,
     golden_qcow2,
+    golden_vars_fd,
     ovmf_vars_candidates,
     wait_ssh,
 )
@@ -57,10 +58,6 @@ SETTLE_S = 0.4
 
 class RunTestError(RuntimeError):
     """Fail-closed run-test / vm-run error."""
-
-
-def golden_vars_fd(guest: Guest, cache: Path) -> Path:
-    return artifacts.images_dir(cache) / f"{guest.id}.vars.fd"
 
 
 def require_golden(guest: Guest, cache: Path) -> Path:

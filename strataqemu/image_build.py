@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -25,7 +26,10 @@ from strataqemu.cli import (
     check_host,
     find_ovmf_code,
 )
-from strataqemu.cloudinit import write_cidata_iso_from_recipe
+from strataqemu.cloudinit import (
+    write_cidata_iso_from_recipe,
+    write_omarchy_cidata_iso,
+)
 from strataqemu.guest import Guest, GuestError, load_guest
 from strataqemu.overlay import copy_uefi_vars
 from strataqemu.ports import (
@@ -35,7 +39,13 @@ from strataqemu.ports import (
     is_address_already_in_use,
     retry_on_addr_in_use,
 )
-from strataqemu.qemu import Machine, build_qemu_argv
+from strataqemu.qemu import (
+    Machine,
+    build_qemu_argv,
+    qmp_screendump,
+    uses_iso_autoinstall,
+    vnc_framebuffer_png,
+)
 from strataqemu.ssh import scp_command, scp_download_command
 
 log = logging.getLogger("strataqemu")
@@ -43,6 +53,13 @@ log = logging.getLogger("strataqemu")
 # Noble GDM / cloud-init first boot can exceed boot_timeout_s; wait cloud-init
 # with a separate budget, then setup.sh uses build_timeout_s.
 CLOUD_INIT_TIMEOUT_S = 600
+# Consecutive pubkey rejects (sshd is up but tester cannot log in). The live
+# ISO wizard answers SSH this way forever if cidata was not loaded. A healthy
+# autoinstall also rejects tester until reboot; qcow2 growth cancels the streak.
+SSH_AUTH_REJECT_MAX = 30
+# qcow2 actual size after partitioning/mkfs; empty working disks stay ~200KiB.
+ISO_AUTOINSTALL_DISK_PROGRESS_BYTES = 1024 * 1024
+SSH_WAIT_SLEEP_S = 2.0
 GIB = 1024**3
 # When the cloudimg is not on disk yet, assume 1 GiB for the free-space floor.
 UNKNOWN_SOURCE_BYTES = GIB
@@ -62,6 +79,9 @@ RECIPE_UPLOAD_NAMES = (
     "hyprland.lua",
     "hyprland.conf",
 )
+# Well-known test password (docs/design.md). ISO autoinstall sudoers is
+# password sudo until setup.sh writes NOPASSWD.
+WELL_KNOWN_TEST_PASSWORD = "foobar"
 
 
 class ImageBuildError(RuntimeError):
@@ -97,6 +117,27 @@ def inventory_provenance_key(guest: Guest) -> str:
     return "dpkg"
 
 
+def setup_ssh_command(guest: Guest) -> str:
+    """Remote command that runs the uploaded recipe ``setup.sh``.
+
+    Cloud-init goldens already have NOPASSWD from user-data, so ``sudo -n``
+    works. ISO autoinstall (Omarchy) only grants password sudo
+    (``ALL=(ALL) ALL``) until setup.sh writes NOPASSWD, so authenticate
+    with the well-known test password via ``sudo -S``.
+    """
+    env_prefix = ""
+    if guest.packages.snapshot_url:
+        env_prefix = f"SNAPSHOT_URL={shlex.quote(guest.packages.snapshot_url)} "
+    script = "bash /tmp/setup.sh"
+    if guest.source_kind == "iso-autoinstall":
+        password = shlex.quote(WELL_KNOWN_TEST_PASSWORD)
+        return (
+            f"{env_prefix}printf '%s\\n' {password} "
+            f"| sudo -S -p '' {script}"
+        )
+    return f"{env_prefix}sudo -n {script}"
+
+
 def recipe_files_to_upload(guest: Guest) -> tuple[Path, ...]:
     """setup.sh plus session drop-ins that setup copies into the guest."""
     found: list[Path] = []
@@ -115,6 +156,11 @@ def golden_filename(guest: Guest) -> str:
 
 def golden_qcow2(guest: Guest, cache: Path) -> Path:
     return artifacts.images_dir(cache) / golden_filename(guest)
+
+
+def golden_vars_fd(guest: Guest, cache: Path) -> Path:
+    """Post-install OVMF vars; golden pair is ``(qcow2, vars.fd)``."""
+    return artifacts.images_dir(cache) / f"{guest.id}.vars.fd"
 
 
 def golden_symlink(guest: Guest, cache: Path) -> Path:
@@ -150,6 +196,7 @@ def working_qemu_argv(
     ovmf_code: Path | str | None,
     ovmf_vars: Path | str | None,
     cidata_iso: Path | str,
+    install_iso: Path | str | None = None,
 ) -> list[str]:
     """Frozen GL argv for the image-build working disk (``cache=writeback``)."""
     return build_qemu_argv(
@@ -164,6 +211,7 @@ def working_qemu_argv(
         ovmf_code=ovmf_code,
         ovmf_vars=ovmf_vars,
         cidata_iso=cidata_iso,
+        install_iso=install_iso,
     )
 
 
@@ -212,15 +260,72 @@ def _ssh_run(
     return proc
 
 
+def ssh_auth_rejected(returncode: int, output: str) -> bool:
+    """True when sshd answered but tester cannot log in.
+
+    The live ISO drops unauthenticated sessions after a few pubkey
+    failures (``Connection closed``). That is still a reject, not
+    "sshd is not up yet" — resetting the streak on close never reached
+    ``SSH_AUTH_REJECT_MAX``.
+    """
+    if returncode == 0:
+        return False
+    blob = output.lower()
+    if "permission denied" in blob:
+        return True
+    if "connection closed" in blob:
+        return True
+    if "connection reset" in blob:
+        return True
+    return False
+
+
+def working_disk_bytes(machine: Machine) -> int:
+    """Actual qcow2 file size. Grows once autoinstall starts writing ``/dev/vda``."""
+    try:
+        return machine.overlay.stat().st_size
+    except OSError:
+        return 0
+
+
+def ssh_not_listening(output: str) -> bool:
+    """True when sshd has not answered yet (keep waiting, reset reject streak)."""
+    blob = output.lower()
+    if "connection refused" in blob:
+        return True
+    if "timed out" in blob or "timeout" in blob:
+        return True
+    if "banner" in blob:
+        return True
+    return False
+
+
+def _default_max_attempts(timeout: float) -> int:
+    """One loop body per sleep; never unbounded even if timeout is huge."""
+    return max(1, int(timeout // SSH_WAIT_SLEEP_S) + 1)
+
+
 def wait_ssh(
     machine: Machine,
     *,
     timeout: float,
     run: RunFn | None = None,
+    sleep: Callable[[float], None] | None = None,
+    max_attempts: int | None = None,
+    auth_reject_max: int = SSH_AUTH_REJECT_MAX,
 ) -> None:
     deadline = time.monotonic() + timeout
     last = ""
+    attempts = 0
+    auth_rejects = 0
+    limit = _default_max_attempts(timeout) if max_attempts is None else max_attempts
+    nap = sleep or time.sleep
     while time.monotonic() < deadline:
+        attempts += 1
+        if attempts > limit:
+            raise TimeoutError(
+                f"SSH did not become ready after {limit} attempts: {last}"
+            )
         if machine._proc is not None and machine._proc.poll() is not None:
             qemu_log = ""
             try:
@@ -237,12 +342,30 @@ def wait_ssh(
             proc = _ssh_run(machine, "true", timeout=15, run=run)
         except (OSError, subprocess.TimeoutExpired) as exc:
             last = str(exc)
-            time.sleep(2)
+            if ssh_not_listening(last):
+                auth_rejects = 0
+            nap(SSH_WAIT_SLEEP_S)
             continue
         if proc.returncode == 0:
             return
         last = (proc.stderr or proc.stdout or "").strip()
-        time.sleep(2)
+        if ssh_auth_rejected(proc.returncode, last):
+            auth_rejects += 1
+            log.warning(
+                "SSH auth rejected (%s/%s): %s",
+                auth_rejects,
+                auth_reject_max,
+                last.splitlines()[-1] if last else last,
+            )
+            if auth_rejects >= auth_reject_max:
+                capture_build_timeout_evidence(machine)
+                raise ImageBuildError(
+                    f"SSH rejected tester {auth_rejects} times "
+                    f"(authorized_keys not installed?): {last}"
+                )
+        elif ssh_not_listening(last):
+            auth_rejects = 0
+        nap(SSH_WAIT_SLEEP_S)
     raise TimeoutError(f"SSH did not become ready in {timeout}s: {last}")
 
 
@@ -269,6 +392,111 @@ def wait_cloud_init(
         )
 
 
+def capture_build_timeout_evidence(machine: Machine) -> None:
+    """Keep serial (already in the run dir), a screenshot, and best-effort QMP."""
+    shot = machine.artifacts.root / "timeout.png"
+    try:
+        if machine.vnc_port is not None:
+            vnc_framebuffer_png(shot, display=machine.vnc_port)
+    except OSError:
+        pass
+    try:
+        qmp_screendump(
+            machine.artifacts.qmp_sock,
+            machine.artifacts.root / "qmp-timeout.png",
+        )
+    except OSError:
+        pass
+
+
+def wait_iso_autoinstall(
+    machine: Machine,
+    *,
+    major: int,
+    timeout: float,
+    run: RunFn | None = None,
+    sleep: Callable[[float], None] | None = None,
+    max_attempts: int | None = None,
+) -> str:
+    """Wait until SSH accepts tester and ``omarchy version`` is ``{major}.x``.
+
+    The live ISO's sshd rejects ``tester`` both on the wizard and during a
+    healthy autoinstall until reboot. Do not fail-fast on pubkey rejection;
+    wait until ``timeout`` (omarchy-4: 3600s). Log qcow2 growth so a stuck
+    wizard is distinguishable from an install in progress.
+    """
+    deadline = time.monotonic() + timeout
+    last = ""
+    ssh_ready = False
+    attempts = 0
+    logged_progress = False
+    limit = _default_max_attempts(timeout) if max_attempts is None else max_attempts
+    nap = sleep or time.sleep
+    while time.monotonic() < deadline:
+        attempts += 1
+        if attempts > limit:
+            capture_build_timeout_evidence(machine)
+            raise TimeoutError(
+                f"omarchy version {major}.x not ready after {limit} attempts: {last}"
+            )
+        if machine._proc is not None and machine._proc.poll() is not None:
+            qemu_log = ""
+            try:
+                qemu_log = machine.artifacts.qemu_log.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                pass
+            raise ImageBuildError(
+                f"qemu exited {machine._proc.returncode} while waiting for "
+                f"omarchy {major}.x\n{qemu_log[-4000:]}"
+            )
+        if not ssh_ready:
+            try:
+                proc = _ssh_run(machine, "true", timeout=15, run=run)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                last = str(exc)
+                nap(SSH_WAIT_SLEEP_S)
+                continue
+            if proc.returncode == 0:
+                ssh_ready = True
+            else:
+                last = (proc.stderr or proc.stdout or "").strip()
+                disk = working_disk_bytes(machine)
+                if (
+                    disk >= ISO_AUTOINSTALL_DISK_PROGRESS_BYTES
+                    and not logged_progress
+                ):
+                    logged_progress = True
+                    log.info(
+                        "SSH rejected tester; working disk %s bytes "
+                        "(autoinstall writing, waiting for reboot)",
+                        disk,
+                    )
+                elif ssh_auth_rejected(proc.returncode, last):
+                    log.info(
+                        "SSH rejected tester (live ISO, waiting): %s",
+                        last.splitlines()[-1] if last else last,
+                    )
+                nap(SSH_WAIT_SLEEP_S)
+                continue
+        try:
+            proc = _ssh_run(machine, "omarchy version", timeout=15, run=run)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            last = str(exc)
+            nap(SSH_WAIT_SLEEP_S)
+            continue
+        blob = f"{proc.stdout}{proc.stderr}"
+        if omarchy_version_matches_major(blob, major):
+            return blob.strip()
+        last = blob.strip() or f"exit {proc.returncode}"
+        nap(SSH_WAIT_SLEEP_S)
+    capture_build_timeout_evidence(machine)
+    raise TimeoutError(
+        f"omarchy version {major}.x not ready in {timeout}s: {last}"
+    )
+
+
 def convert_and_resize(
     src: Path,
     dest: Path,
@@ -292,6 +520,64 @@ def convert_and_resize(
         text=True,
     )
     return dest
+
+
+def create_blank_qcow2_argv(
+    dest: Path | str,
+    disk_gb: int,
+    *,
+    qemu_img: str = "qemu-img",
+) -> list[str]:
+    """Blank disk for ISO autoinstall. Never ``qemu-img convert`` the ISO."""
+    return [qemu_img, "create", "-f", "qcow2", str(dest), f"{disk_gb}G"]
+
+
+def create_blank_qcow2(
+    dest: Path,
+    disk_gb: int,
+    *,
+    run: RunFn | None = None,
+) -> Path:
+    """Create an empty qcow2. Do not convert the install ISO into the disk."""
+    runner = run or subprocess.run
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    runner(
+        create_blank_qcow2_argv(dest, disk_gb),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return dest
+
+
+def omarchy_major_for_guest(guest: Guest | str) -> int:
+    guest_id = guest.id if isinstance(guest, Guest) else guest
+    if guest_id == "omarchy-4":
+        return 4
+    if guest_id == "omarchy-3":
+        return 3
+    raise ImageBuildError(f"{guest_id} is not an ISO autoinstall guest")
+
+
+def omarchy_version_matches_major(output: str, major: int) -> bool:
+    """True when ``omarchy version`` prints a ``{major}.x`` string.
+
+    Rejects the other major, empty output, and configurator/wizard hang text.
+    """
+    text = output.strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    for needle in ("configurator", "wizard", "waiting for", "interactive"):
+        if needle in lowered:
+            return False
+    match = re.search(r"\b(\d+)\.(\d+)", text)
+    if match:
+        return int(match.group(1)) == major
+    match = re.search(r"\bomarchy\s+(\d+)\b", lowered)
+    if match:
+        return int(match.group(1)) == major
+    return False
 
 
 def run_bootstrap(
@@ -335,6 +621,7 @@ def _spawn_qemu(
     cidata_iso: Path,
     identity: Path,
     popen: PopenFn | None = None,
+    install_iso: Path | None = None,
 ) -> Machine:
     arts = artifacts.RunArtifacts(run_dir)
     launcher = popen or subprocess.Popen
@@ -353,6 +640,7 @@ def _spawn_qemu(
             ovmf_code=ovmf_code,
             ovmf_vars=ovmf_vars,
             cidata_iso=cidata_iso,
+            install_iso=install_iso,
         )
         log.info("qemu argv: %s", " ".join(argv))
         logf = arts.qemu_log.open("ab")
@@ -515,19 +803,36 @@ def build_live(
     machine: Machine | None = None
     golden = golden_qcow2(guest, cache)
 
+    iso_autoinstall = (
+        guest.source_kind == "iso-autoinstall" or uses_iso_autoinstall(guest.id)
+    )
+    omarchy_version = ""
+
     try:
         blob = run_bootstrap(guest, cache, run=run)
         _assert_free_space(cache, guest, blob)
-        convert_and_resize(blob, working, guest.disk_gb, run=run)
+        install_iso: Path | None = None
+        if iso_autoinstall:
+            create_blank_qcow2(working, guest.disk_gb, run=run)
+            install_iso = blob
+        else:
+            convert_and_resize(blob, working, guest.disk_gb, run=run)
 
         pubkey = _pubkey_for(host.ssh_key)
-        cidata = write_cidata_iso_from_recipe(
-            run_dir / "cidata.iso",
-            recipe_dir=guest.recipe_dir,
-            pubkey=pubkey,
-            instance_id=guest.id,
-            hostname=guest.id,
-        )
+        if iso_autoinstall:
+            cidata = write_omarchy_cidata_iso(
+                run_dir / "cidata.iso",
+                recipe_dir=guest.recipe_dir,
+                pubkey=pubkey,
+            )
+        else:
+            cidata = write_cidata_iso_from_recipe(
+                run_dir / "cidata.iso",
+                recipe_dir=guest.recipe_dir,
+                pubkey=pubkey,
+                instance_id=guest.id,
+                hostname=guest.id,
+            )
 
         ovmf_vars: Path | None = None
         ovmf_code: Path | None = None
@@ -551,18 +856,24 @@ def build_live(
             cidata_iso=cidata,
             identity=host.ssh_key,
             popen=popen,
+            install_iso=install_iso,
         )
-        wait_ssh(machine, timeout=guest.boot_timeout_s, run=run)
-        wait_cloud_init(machine, run=run)
+        if iso_autoinstall:
+            omarchy_version = wait_iso_autoinstall(
+                machine,
+                major=omarchy_major_for_guest(guest),
+                timeout=guest.build_timeout_s,
+                run=run,
+            )
+        else:
+            wait_ssh(machine, timeout=guest.boot_timeout_s, run=run)
+            wait_cloud_init(machine, run=run)
 
         for src in recipe_files_to_upload(guest):
             _scp_to_guest(machine, src, f"/tmp/{src.name}", run=run)
-        env_prefix = ""
-        if guest.packages.snapshot_url:
-            env_prefix = f"SNAPSHOT_URL={shlex.quote(guest.packages.snapshot_url)} "
         _ssh_run(
             machine,
-            f"{env_prefix}sudo -n bash /tmp/setup.sh",
+            setup_ssh_command(guest),
             timeout=guest.build_timeout_s,
             check=True,
             run=run,
@@ -580,6 +891,16 @@ def build_live(
         _scp_from_guest(
             machine, "/var/tmp/strata-gtk.txt", inv_dir / "gtk.txt", run=run
         )
+        if iso_autoinstall:
+            try:
+                _scp_from_guest(
+                    machine,
+                    "/var/tmp/strata-omarchy-version.txt",
+                    inv_dir / "omarchy-version.txt",
+                    run=run,
+                )
+            except ImageBuildError:
+                pass
 
         path_used = machine.shutdown()
         log.info("shutdown via %s", path_used)
@@ -600,6 +921,14 @@ def build_live(
         except OSError:
             pass
         _install_symlink(golden_symlink(guest, cache), golden)
+        if (
+            iso_autoinstall
+            and guest.firmware == "uefi"
+            and ovmf_vars is not None
+            and ovmf_vars.is_file()
+        ):
+            dest_vars = golden_vars_fd(guest, cache)
+            shutil.copyfile(ovmf_vars, dest_vars)
 
         inventory = (inv_dir / inv_name).read_text(
             encoding="utf-8", errors="replace"
@@ -621,6 +950,15 @@ def build_live(
             "glibc": glibc,
             "gtk": gtk,
         }
+        if iso_autoinstall:
+            recorded = omarchy_version
+            version_file = inv_dir / "omarchy-version.txt"
+            if version_file.is_file():
+                recorded = version_file.read_text(
+                    encoding="utf-8", errors="replace"
+                ).strip() or recorded
+            payload["omarchy_version"] = recorded
+            payload["vars"] = golden_vars_fd(guest, cache).name
         _write_provenance(provenance_path(guest, cache), payload)
         shutil.rmtree(run_dir, ignore_errors=True)
         return golden

@@ -1,7 +1,9 @@
-"""QEMU argv builder tests. No KVM, no qemu-system-x86_64 process."""
+"""QEMU argv builder tests. No KVM except the ISO-attach smoke spawn."""
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -158,7 +160,7 @@ class CloudInitSeedTests(unittest.TestCase):
 
 
 class IsoAutoinstallTests(unittest.TestCase):
-    def test_both_omarchy_majors_get_ide_cd_and_scsi_cidata(self) -> None:
+    def test_both_omarchy_majors_get_ide_cd_install_and_pinned_virtio_cidata(self) -> None:
         self.assertEqual(
             ISO_AUTOINSTALL_GUESTS,
             frozenset({"omarchy-4", "omarchy-3"}),
@@ -183,29 +185,94 @@ class IsoAutoinstallTests(unittest.TestCase):
                 self.assertEqual(len(ide), 1, guest)
                 self.assertIn("drive=cdrom0", ide[0])
                 self.assertIn("bootindex=2", ide[0])
+                self.assertFalse(
+                    any(d.startswith("usb-storage") for d in devices), guest
+                )
+                self.assertFalse(
+                    any(d.startswith("qemu-xhci") for d in devices), guest
+                )
+                blk = [d for d in devices if "virtio-blk" in d]
+                self.assertEqual(len(blk), 2, guest)
+                self.assertIn("drive=drive0", blk[0])
+                self.assertIn("bootindex=1", blk[0])
+                self.assertIn("addr=0x8", blk[0])
+                self.assertIn("drive=cidata0", blk[1])
+                self.assertIn("addr=0x9", blk[1])
+                self.assertIn("serial=cidata", blk[1])
+                self.assertNotIn("bootindex", blk[1])
                 cdrom = [d for d in drives if "id=cdrom0" in d]
                 self.assertEqual(len(cdrom), 1, guest)
                 self.assertIn("media=cdrom", cdrom[0])
                 self.assertIn(str(iso.resolve()), cdrom[0])
-                scsi = [d for d in devices if "virtio-scsi-pci" in d]
-                self.assertEqual(len(scsi), 1, guest)
-                self.assertEqual(scsi[0], "virtio-scsi-pci,id=scsi0")
-                self.assertEqual(
-                    sum(1 for t in argv if "id=scsi0" in t),
-                    1,
-                    argv,
-                )
                 cidata_drive = [d for d in drives if "id=cidata0" in d]
                 self.assertEqual(len(cidata_drive), 1, guest)
                 self.assertIn("readonly=on", cidata_drive[0])
-                self.assertNotIn("bootindex", cidata_drive[0])
-                scsi_cd = [d for d in devices if d.startswith("scsi-cd")]
-                self.assertEqual(len(scsi_cd), 1, guest)
-                self.assertIn("bus=scsi0.0", scsi_cd[0])
+                self.assertNotIn("media=cdrom", cidata_drive[0])
+                self.assertFalse(any("scsi-cd" in d for d in devices), guest)
+                self.assertEqual(sum(1 for d in devices if d.startswith("ide-cd")), 1)
                 drive0 = [d for d in drives if "id=drive0" in d][0]
                 self.assertNotIn("media=cdrom", drive0)
-                blk = [d for d in devices if "virtio-blk" in d][0]
-                self.assertNotIn("media=cdrom", blk)
+
+    def test_iso_autoinstall_argv_qemu_accepts_pinned_virtio_cidata(self) -> None:
+        """Catch QEMU device errors like 'bus supports only 1 units' at start."""
+        if not Path("/dev/kvm").exists():
+            self.skipTest("no /dev/kvm")
+        qemu = shutil.which("qemu-system-x86_64")
+        qemu_img = shutil.which("qemu-img")
+        if qemu is None or qemu_img is None:
+            self.skipTest("qemu-system-x86_64 / qemu-img not on PATH")
+        ovmf_code = Path("/usr/share/edk2/x64/OVMF_CODE.4m.fd")
+        ovmf_vars_src = Path("/usr/share/edk2/x64/OVMF_VARS.4m.fd")
+        if not ovmf_code.is_file() or not ovmf_vars_src.is_file():
+            self.skipTest("OVMF 4M not installed")
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            run = tmp / "run"
+            run.mkdir()
+            overlay = run / "overlay.qcow2"
+            subprocess.run(
+                [qemu_img, "create", "-f", "qcow2", str(overlay), "64M"],
+                check=True,
+                capture_output=True,
+            )
+            iso = tmp / "install.iso"
+            iso.write_bytes(b"iso" * 64)
+            cidata = tmp / "cidata.iso"
+            cidata.write_bytes(b"cidata" * 64)
+            vars_fd = run / "OVMF_VARS.fd"
+            vars_fd.write_bytes(ovmf_vars_src.read_bytes())
+            argv = build_qemu_argv(
+                overlay=overlay,
+                run_dir=run,
+                ssh_port=45454,
+                vnc_port=59111,
+                install_iso=iso,
+                cidata_iso=cidata,
+                ovmf_code=ovmf_code,
+                ovmf_vars=vars_fd,
+                disk_cache="writeback",
+            )
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                try:
+                    _out, err = proc.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    _out, err = proc.communicate()
+                    return
+                blob = err or ""
+                self.assertNotIn("Can't create IDE", blob, blob)
+                self.assertNotIn("bus supports only", blob, blob)
+                self.assertNotEqual(proc.returncode, 1, blob)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=5)
 
     def test_iso_without_cidata_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as td:

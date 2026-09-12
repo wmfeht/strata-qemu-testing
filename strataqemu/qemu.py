@@ -69,7 +69,7 @@ def build_qemu_argv(
         raise ValueError("vnc_port is required unless graphical=True")
     if install_iso is not None and cidata_iso is None:
         raise ValueError(
-            "ISO autoinstall requires cidata scsi-cd "
+            "ISO autoinstall requires cidata virtio-blk "
             "(omarchy-3 and omarchy-4)"
         )
     if (ovmf_code is None) ^ (ovmf_vars is None):
@@ -110,12 +110,16 @@ def build_qemu_argv(
                 f"127.0.0.1:{vnc_port}",
             ]
         )
+    drive0_dev = "virtio-blk-pci,drive=drive0,bootindex=1"
+    if install_iso is not None:
+        # Slot below cidata (0x9) so the 40G disk is always /dev/vda.
+        drive0_dev += ",addr=0x8"
     argv.extend(
         [
             "-drive",
             f"file={overlay_path},if=none,id=drive0,discard=unmap,cache={disk_cache}",
             "-device",
-            "virtio-blk-pci,drive=drive0,bootindex=1",
+            drive0_dev,
             "-netdev",
             f"user,id=net0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
             "-device",
@@ -144,8 +148,12 @@ def build_qemu_argv(
                 f"if=pflash,format=raw,file={_abs(ovmf_vars)}",
             ]
         )
-    # One virtio-scsi-pci id=scsi0. ISO autoinstall includes the seed pair;
-    # do not attach the cloud-guest snippet a second time.
+    # Cloud-init seed: virtio-scsi + scsi-cd. ISO autoinstall cidata is a
+    # second virtio-blk at PCI 0x9 (vdb), VFAT labeled CIDATA. drive0 is
+    # pinned at 0x8 so it stays /dev/vda. An unpinned second virtio-blk
+    # became vda and the installer died with "Partition is misaligned"
+    # on the 4MiB seed. USB (usb=off / UHCI / xhci) does not enumerate
+    # in time for omarchy-cidata-load.
     if install_iso is not None:
         argv.extend(
             [
@@ -153,12 +161,10 @@ def build_qemu_argv(
                 f"file={_abs(install_iso)},media=cdrom,if=none,format=raw,id=cdrom0",
                 "-device",
                 "ide-cd,drive=cdrom0,bootindex=2",
-                "-device",
-                "virtio-scsi-pci,id=scsi0",
                 "-drive",
                 f"file={_abs(cidata_iso)},if=none,format=raw,readonly=on,id=cidata0",
                 "-device",
-                "scsi-cd,drive=cidata0,bus=scsi0.0",
+                "virtio-blk-pci,drive=cidata0,serial=cidata,addr=0x9",
             ]
         )
     elif cidata_iso is not None:

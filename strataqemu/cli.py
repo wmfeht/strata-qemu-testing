@@ -22,6 +22,8 @@ REQUIRED_BINARIES = (
     "qemu-system-x86_64",
     "qemu-img",
     "xorriso",
+    "mkfs.vfat",
+    "mcopy",
     "ssh",
     "curl",
 )

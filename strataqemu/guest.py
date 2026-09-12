@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -19,6 +20,15 @@ DIGEST_OPTIONAL_BASENAMES = (
     "hyprland.lua",
     "hyprland.conf",
 )
+# ISO autoinstall cidata: both JSON files required or the wizard runs.
+ISO_CIDATA_REQUIRED = (
+    "user_configuration.json",
+    "user_credentials.json.tmpl",
+    "user_encrypt_installation.txt",
+    "authorized_keys.tmpl",
+)
+SDDM_WAYLAND_SESSION_CANDIDATES = ("omarchy.desktop", "hyprland-uwsm.desktop")
+ISO_AUTOINSTALL_DISK = "/dev/vda"
 
 
 class GuestError(ValueError):
@@ -85,7 +95,26 @@ def covered_recipe_files(recipe_dir: Path) -> tuple[Path, ...]:
             continue
         found.append(path)
         seen.add(resolved)
+    cidata_dir = root / "cidata"
+    if cidata_dir.is_dir():
+        for path in sorted(cidata_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            found.append(path)
+            seen.add(resolved)
     return tuple(found)
+
+
+def choose_sddm_session(session_files: Sequence[str]) -> str | None:
+    """Basename without ``.desktop`` from the frozen probe order."""
+    names = {Path(item).name for item in session_files}
+    for candidate in SDDM_WAYLAND_SESSION_CANDIDATES:
+        if candidate in names:
+            return candidate.removesuffix(".desktop")
+    return None
 
 
 def recipe_digest(recipe_dir: Path) -> str:
@@ -221,6 +250,13 @@ class Guest:
             tmpl = recipe_dir / "user-data.yaml.tmpl"
             if not tmpl.is_file():
                 raise GuestError(f"missing user-data.yaml.tmpl in {recipe_dir}")
+        elif source_kind == "iso-autoinstall":
+            if not isinstance(data.get("cidata"), dict):
+                raise GuestError("iso-autoinstall requires [cidata] table")
+            cidata_dir = recipe_dir / "cidata"
+            for name in ISO_CIDATA_REQUIRED:
+                if not (cidata_dir / name).is_file():
+                    raise GuestError(f"missing cidata/{name} in {recipe_dir}")
 
         session_raw = data.get("session")
         if not isinstance(session_raw, dict):
@@ -256,6 +292,15 @@ class Guest:
                 disk=_require_str(cidata_raw, "disk"),
                 encrypt=bool(cidata_raw.get("encrypt", False)),
             )
+            if source_kind == "iso-autoinstall":
+                if cidata.encrypt:
+                    raise GuestError(
+                        "iso-autoinstall [cidata] encrypt must be false"
+                    )
+                if cidata.disk != ISO_AUTOINSTALL_DISK:
+                    raise GuestError(
+                        "iso-autoinstall [cidata] disk must be /dev/vda"
+                    )
 
         ovmf_code = data.get("ovmf_code")
         ovmf_vars = data.get("ovmf_vars_template")

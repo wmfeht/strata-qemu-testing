@@ -58,10 +58,18 @@ python = "3.11"
 "apt:ovmf" = "latest"
 "dnf:edk2-ovmf" = "latest"
 
-# cidata ISO
+# cidata ISO (cloud-init NoCloud guests)
 "pacman:xorriso" = "latest"
 "apt:xorriso" = "latest"
 "dnf:xorriso" = "latest"
+
+# Omarchy cidata VFAT (usb-storage, label CIDATA)
+"pacman:dosfstools" = "latest"
+"apt:dosfstools" = "latest"
+"dnf:dosfstools" = "latest"
+"pacman:mtools" = "latest"
+"apt:mtools" = "latest"
+"dnf:mtools" = "latest"
 
 # SSH client (subprocess OpenSSH)
 "pacman:openssh" = "latest"

@@ -12,12 +12,15 @@ from strataqemu.guest import (
     SHA256_HEX,
     Guest,
     GuestError,
+    ISO_CIDATA_REQUIRED,
+    SDDM_WAYLAND_SESSION_CANDIDATES,
+    choose_sddm_session,
     covered_recipe_files,
     default_images_root,
     load_guest,
     recipe_digest,
 )
-from strataqemu.qemu import uses_cloud_init_seed
+from strataqemu.qemu import uses_cloud_init_seed, uses_iso_autoinstall
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RECIPE = REPO_ROOT / "images" / "ubuntu-2404"
@@ -416,6 +419,177 @@ class FedoraWorkstationRecipeTests(unittest.TestCase):
         lowered = text.lower()
         for needle in ("ghp_", "gh auth", "gh_token", "tskey-", "tailscale"):
             self.assertNotIn(needle, lowered)
+
+
+OMARCHY4 = REPO_ROOT / "images" / "omarchy-4"
+
+
+class Omarchy4RecipeTests(unittest.TestCase):
+    def test_load_real_recipe(self) -> None:
+        guest = load_guest("omarchy-4")
+        self.assertEqual(guest.id, "omarchy-4")
+        self.assertNotIn(".", guest.id)
+        self.assertEqual(guest.arch, "x86_64")
+        self.assertEqual(guest.firmware, "uefi")
+        self.assertEqual(guest.source_kind, "iso-autoinstall")
+        self.assertEqual(
+            guest.source_url, "https://iso.omarchy.org/omarchy-4.0.3.iso"
+        )
+        self.assertNotIn("/current/", guest.source_url)
+        self.assertNotIn("/latest/", guest.source_url)
+        self.assertEqual(
+            guest.source_sha256,
+            "03d60bc74306dca51f96e1a84b690871d8d606826b260edd0208962da8507d14",
+        )
+        self.assertIsNotNone(SHA256_HEX.fullmatch(guest.source_sha256))
+        self.assertEqual(guest.source_filename(), "omarchy-4.0.3.iso")
+        self.assertEqual(guest.user.name, "tester")
+        self.assertIn("wheel", guest.user.groups)
+        self.assertTrue(guest.session.autologin)
+        self.assertEqual(guest.session.kind, "hyprland")
+        self.assertEqual(guest.session.display_manager, "sddm")
+        self.assertEqual(guest.session.compositor, "hyprland")
+        self.assertTrue(guest.session.wayland)
+        self.assertEqual(guest.packages.manager, "pacman")
+        self.assertIsNotNone(guest.cidata)
+        assert guest.cidata is not None
+        self.assertEqual(guest.cidata.disk, "/dev/vda")
+        self.assertFalse(guest.cidata.encrypt)
+        self.assertTrue(uses_iso_autoinstall(guest.id))
+        self.assertFalse(uses_cloud_init_seed(guest.id))
+        self.assertTrue((guest.recipe_dir / "bootstrap.sh").is_file())
+        self.assertTrue((guest.recipe_dir / "setup.sh").is_file())
+        self.assertFalse((guest.recipe_dir / "user-data.yaml.tmpl").exists())
+        self.assertFalse((guest.recipe_dir / "install.sh").exists())
+        cidata = guest.recipe_dir / "cidata"
+        for name in ISO_CIDATA_REQUIRED:
+            self.assertTrue((cidata / name).is_file(), name)
+
+    def test_missing_cidata_table_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            copy = Path(td) / "omarchy-4"
+            shutil.copytree(OMARCHY4, copy)
+            toml = copy / "image.toml"
+            lines = [
+                line
+                for line in toml.read_text(encoding="utf-8").splitlines()
+                if not line.startswith("[cidata]")
+                and not line.startswith("disk =")
+                and not line.startswith("encrypt =")
+            ]
+            toml.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            with self.assertRaises(GuestError) as ctx:
+                Guest.load(copy)
+            self.assertIn("[cidata]", str(ctx.exception))
+
+    def test_missing_cidata_json_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            copy = Path(td) / "omarchy-4"
+            shutil.copytree(OMARCHY4, copy)
+            (copy / "cidata" / "user_configuration.json").unlink()
+            with self.assertRaises(GuestError) as ctx:
+                Guest.load(copy)
+            self.assertIn("user_configuration.json", str(ctx.exception))
+
+    def test_digest_covers_cidata_dump(self) -> None:
+        files = covered_recipe_files(OMARCHY4)
+        names = {p.name for p in files}
+        self.assertIn("image.toml", names)
+        self.assertIn("bootstrap.sh", names)
+        self.assertIn("setup.sh", names)
+        self.assertIn("user_configuration.json", names)
+        self.assertIn("user_credentials.json.tmpl", names)
+        self.assertIn("user_encrypt_installation.txt", names)
+        self.assertIn("authorized_keys.tmpl", names)
+        with tempfile.TemporaryDirectory() as td:
+            copy = Path(td) / "omarchy-4"
+            shutil.copytree(OMARCHY4, copy)
+            before = Guest.load(copy).recipe_digest()
+            dump = copy / "cidata" / "user_configuration.json"
+            dump.write_text(
+                dump.read_text(encoding="utf-8").replace(
+                    "strata-omarchy-4", "strata-omarchy-4-probe"
+                ),
+                encoding="utf-8",
+            )
+            after = Guest.load(copy).recipe_digest()
+            self.assertNotEqual(before, after)
+
+    def test_setup_sh_sddm_nopasswd_grim_no_greetd(self) -> None:
+        text = (OMARCHY4 / "setup.sh").read_text(encoding="utf-8")
+        self.assertIn("/etc/sddm.conf.d/99-autologin.conf", text)
+        self.assertIn("User=tester", text)
+        self.assertIn("Session=", text)
+        self.assertIn("Relogin=true", text)
+        self.assertIn("omarchy.desktop", text)
+        self.assertIn("hyprland-uwsm.desktop", text)
+        desktop_idx = text.index("omarchy.desktop")
+        uwsm_idx = text.index("hyprland-uwsm.desktop")
+        self.assertLess(desktop_idx, uwsm_idx)
+        self.assertEqual(
+            SDDM_WAYLAND_SESSION_CANDIDATES,
+            ("omarchy.desktop", "hyprland-uwsm.desktop"),
+        )
+        self.assertEqual(
+            choose_sddm_session(["hyprland-uwsm.desktop", "omarchy.desktop"]),
+            "omarchy",
+        )
+        self.assertEqual(
+            choose_sddm_session(["hyprland-uwsm.desktop"]),
+            "hyprland-uwsm",
+        )
+        self.assertIn("NOPASSWD: ALL", text)
+        self.assertIn("Defaults:tester !authenticate", text)
+        self.assertIn("grim", text)
+        self.assertIn("loginctl enable-linger tester", text)
+        self.assertIn("sddm", text)
+        self.assertIn("Hyprland", text)
+        self.assertNotIn("systemctl enable greetd", text)
+        commands = "\n".join(
+            line
+            for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        self.assertNotIn("omarchy update", commands)
+        self.assertNotIn("install.sh", commands)
+        self.assertNotIn("--with-omarchy-keybinds", text)
+        self.assertNotIn(".local/bin/strata", text)
+
+    def test_encrypt_off_and_no_tailscale_in_cidata(self) -> None:
+        encrypt = (
+            OMARCHY4 / "cidata" / "user_encrypt_installation.txt"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(encrypt.strip(), "false")
+        dump = (OMARCHY4 / "cidata" / "user_configuration.json").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("/dev/vda", dump)
+        self.assertNotIn("disk_encryption", dump)
+        lowered = dump.lower()
+        for needle in ("tskey-", "tailscale", "ghp_", "gh auth"):
+            self.assertNotIn(needle, lowered)
+        self.assertFalse((OMARCHY4 / "cidata" / "tailscale_authkey").exists())
+        creds = (
+            OMARCHY4 / "cidata" / "user_credentials.json.tmpl"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"username": "tester"', creds)
+        self.assertIn("$6$", creds)
+        self.assertIn("root_enc_password", creds)
+
+    def test_latest_source_url_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            copy = Path(td) / "omarchy-4"
+            shutil.copytree(OMARCHY4, copy)
+            toml = copy / "image.toml"
+            text = toml.read_text(encoding="utf-8")
+            text = text.replace(
+                load_guest("omarchy-4").source_url,
+                "https://iso.omarchy.org/latest/omarchy.iso",
+            )
+            toml.write_text(text, encoding="utf-8")
+            with self.assertRaises(GuestError) as ctx:
+                Guest.load(copy)
+            self.assertIn("dated", str(ctx.exception).lower())
 
 
 class MiseBootstrapBoundaryTests(unittest.TestCase):

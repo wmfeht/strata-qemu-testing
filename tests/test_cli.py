@@ -303,6 +303,19 @@ class MiseTomlTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertIn(key, packages)
 
+    def test_bootstrap_omarchy_vfat_package_keys(self) -> None:
+        packages = self.data["bootstrap"]["packages"]
+        for key in (
+            "pacman:dosfstools",
+            "apt:dosfstools",
+            "dnf:dosfstools",
+            "pacman:mtools",
+            "apt:mtools",
+            "dnf:mtools",
+        ):
+            with self.subTest(key=key):
+                self.assertIn(key, packages)
+
     def test_lockfile_records_cpython_311_with_checksums(self) -> None:
         lock_path = REPO_ROOT / "mise.lock"
         self.assertTrue(lock_path.is_file(), lock_path)
@@ -402,6 +415,11 @@ class ConfigTests(unittest.TestCase):
 
 
 class CheckHostTests(unittest.TestCase):
+    def test_required_binaries_include_vfat_tools(self) -> None:
+        self.assertIn("mkfs.vfat", REQUIRED_BINARIES)
+        self.assertIn("mcopy", REQUIRED_BINARIES)
+        self.assertIn("xorriso", REQUIRED_BINARIES)
+
     def test_missing_qemu_names_mise_bootstrap(self) -> None:
         import tempfile
 

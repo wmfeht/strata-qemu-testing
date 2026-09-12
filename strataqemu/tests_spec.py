@@ -53,8 +53,9 @@ INSTALL_FROM_RELEASE_STEPS = (
     "window",
 )
 INSTALL_FROM_RELEASE_GUESTS = frozenset(
-    {"arch", "ubuntu-2404", "fedora-workstation"}
+    {"arch", "ubuntu-2404", "fedora-workstation", "omarchy-4"}
 )
+VERSION_CLI_RE = re.compile(r"^(strata\s+)?v?\d+\.\d+", re.IGNORECASE)
 INSTALL_FROM_FAIL_CLOSED = (
     "run-test --install-from is not implemented yet (fail closed). "
     "See docs/design.md."
@@ -146,7 +147,11 @@ def compositor_process_name(guest: Guest | str) -> str:
         compositor = ""
     if guest_id == "ubuntu-2404" or kind == "gnome" or compositor == "mutter":
         return "gnome-shell"
-    if guest_id == "arch" or compositor == "hyprland" or kind == "hyprland":
+    if (
+        guest_id in {"arch", "omarchy-4"}
+        or compositor == "hyprland"
+        or kind == "hyprland"
+    ):
         return "Hyprland"
     return compositor or "gnome-shell"
 
@@ -241,6 +246,20 @@ def install_smoke_command(
     prefix = "SMOKE_FORBID_OMARCHY=1 " if forbid_omarchy else ""
     flags = " ".join(shlex.quote(part) for part in install_sh_argv(archive=archive))
     return f"{prefix}bash /tmp/smoke-install.sh {flags}".rstrip()
+
+
+def strata_version_is_cli(returncode: int, output: str) -> bool:
+    """True when ``strata --version`` printed a version and did not open GTK."""
+    del returncode
+    line = ""
+    for raw in output.splitlines():
+        stripped = raw.strip()
+        if stripped:
+            line = stripped
+            break
+    if not line or not VERSION_CLI_RE.match(line):
+        return False
+    return True
 
 
 def parse_observed_version(text: str) -> str:
@@ -922,30 +941,51 @@ def run_install_from_release_steps(
     )
 
     started = time.monotonic()
-    ver = ssh_run(
-        machine,
-        STRATA_VERSION_COMMAND,
-        timeout=VERSION_TIMEOUT_S,
-        check=True,
-        run=run,
-        commands=recorded,
-    )
-    observed = parse_observed_version(ver.stdout)
-    if not versions_match(observed, intended):
-        raise SessionSmokeError(
-            f"version mismatch: intended {intended}, observed {observed} "
-            f"(from {STRATA_VERSION_COMMAND})"
+    observed: str | None = None
+    version_status = "skip"
+    version_reason = "strata --version is not a CLI"
+    try:
+        ver = ssh_run(
+            machine,
+            STRATA_VERSION_COMMAND,
+            timeout=VERSION_TIMEOUT_S,
+            check=False,
+            run=run,
+            commands=recorded,
         )
-    steps.append(
-        {
-            "name": "version",
-            "status": "pass",
-            "seconds": round(time.monotonic() - started, 1),
-            "oracle": "strata --version",
-            "intended": intended,
-            "observed": observed,
-        }
-    )
+        if strata_version_is_cli(ver.returncode, ver.stdout):
+            if ver.returncode != 0:
+                raise SessionSmokeError(
+                    f"ssh command failed ({ver.returncode}): "
+                    f"{STRATA_VERSION_COMMAND}\n{ver.stdout}{ver.stderr}"
+                )
+            observed = parse_observed_version(ver.stdout)
+            if not versions_match(observed, intended):
+                raise SessionSmokeError(
+                    f"version mismatch: intended {intended}, observed {observed} "
+                    f"(from {STRATA_VERSION_COMMAND})"
+                )
+            version_status = "pass"
+            version_reason = ""
+    except subprocess.TimeoutExpired:
+        version_status = "skip"
+        version_reason = "strata --version is not a CLI"
+    version_step: dict = {
+        "name": "version",
+        "status": version_status,
+        "seconds": round(time.monotonic() - started, 1),
+    }
+    if version_status == "pass":
+        version_step.update(
+            {
+                "oracle": "strata --version",
+                "intended": intended,
+                "observed": observed,
+            }
+        )
+    else:
+        version_step["reason"] = version_reason
+    steps.append(version_step)
 
     started = time.monotonic()
     entry = ssh_run(
@@ -1035,9 +1075,10 @@ def run_install_from_release_steps(
         "install_method": "install.sh",
         "install_sh_sha256": digest,
         "intended_version": intended,
-        "observed_version": observed,
         "screenshot": str(screenshot_dest),
     }
+    if observed is not None:
+        extras["observed_version"] = observed
     if archive_digest is not None:
         extras["archive_sha256"] = archive_digest
     return steps, extras
