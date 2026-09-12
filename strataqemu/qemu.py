@@ -1,6 +1,6 @@
-"""QEMU argv builder, qemu-ga/QMP helpers, and shutdown cascade.
+"""QEMU argv builder, qemu-ga/QMP helpers, VNC grab, and shutdown cascade.
 
-Does not require ``Guest.load`` (PR 4). Callers pass the fields the argv needs.
+Independent of ``Guest``; callers pass the fields the argv needs.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ GUEST_AGENT_NAME = "org.qemu.guest_agent.0"
 
 
 def uses_iso_autoinstall(guest_id: str) -> bool:
-    """True for both Omarchy majors. Omitting omarchy-3 is a fail."""
+    """True for the Omarchy ISO guests."""
     return guest_id in ISO_AUTOINSTALL_GUESTS
 
 
@@ -664,7 +664,11 @@ def run_shutdown(hooks: ShutdownHooks) -> str:
 
 
 class Machine:
-    """VM handle. ``start()`` (spawn QEMU) is later PRs; shutdown/kill/ssh are here."""
+    """Handle for a running QEMU process: ssh argv, shutdown cascade, kill.
+
+    Spawning lives in ``image_build._spawn_qemu`` and
+    ``run_test._spawn_overlay_vm``; this class wraps the resulting process.
+    """
 
     def __init__(
         self,
@@ -720,7 +724,7 @@ class Machine:
         *,
         hooks: ShutdownHooks | None = None,
     ) -> str:
-        del timeout  # used by wait loops in later PRs; cascade itself is sequential
+        del timeout  # accepted for API stability; the cascade has no wait loop
         if hooks is None:
             hooks = ShutdownHooks(
                 guest_shutdown=lambda: qga_guest_shutdown(self.artifacts.qga_sock),

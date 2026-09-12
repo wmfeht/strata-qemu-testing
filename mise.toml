@@ -134,9 +134,9 @@ run = "python -m strataqemu image-prune"
 description = "Host-side unit tests. No KVM, no qemu, no check-host. -t . so import strataqemu works without pip install -e."
 run = "python -m unittest discover -s tests -t . -v"
 
-# Hidden: not a daily v1 command. Operator-gated live KVM path.
+# Hidden: ad-hoc Ubuntu Noble session spike that predates the recipe system.
 [tasks.spike-wayland-ubuntu]
-description = "Throwaway Noble overlay: Type=wayland + guest screenshot. Operator-gated."
+description = "Throwaway Noble overlay: Type=wayland + guest screenshot."
 depends = ["check-host"]
 hide = true
 interactive = true

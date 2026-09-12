@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Guest install smoke (design contract).
-# Save install.sh, then exec it. Never pipe curl into bash.
+# Guest install smoke.
+# Save install.sh, record its SHA-256, then run it. Never pipe curl into bash.
 # Flags: --non-interactive --with-desktop-entry --without-file-chooser
 # Optional: --archive PATH (or INSTALL_ARCHIVE). Extra matching flags from
 # the host command are accepted so they appear in recorded guest argv.

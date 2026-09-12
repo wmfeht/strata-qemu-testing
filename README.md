@@ -1,134 +1,223 @@
 # strata-qemu-testing
 
-Reproducible QEMU/KVM guests for Strata installer and desktop-session testing.
+QEMU/KVM guests for testing Strata's installer and desktop integration on
+real Linux desktop sessions.
 
-This repo is complementary to Strata’s container E2E (`tests/e2e`): that suite
-is widget-and-scenario evidence under Xvfb. This one boots a real desktop
-session (compositor, autologin, session D-Bus) in a throwaway overlay.
+Each guest is built once from a committed recipe into a read-only "golden"
+image. Every test run boots a throwaway overlay of that golden, waits for
+an autologin Wayland session, and runs smoke checks over SSH: session and
+compositor health, an in-guest screenshot, and optionally `install.sh`
+followed by launching the installed application.
 
-The design (five-guest matrix, frozen QEMU argv, installer gates) is
-[docs/design.md](docs/design.md). Adding a sixth guest is a design change.
+Guests in tree:
 
-## What works today
+| Guest | Distribution | Desktop |
+| --- | --- | --- |
+| `ubuntu-2404` | Ubuntu 24.04 (dated cloud image, snapshot APT) | GDM, GNOME Shell |
+| `fedora-workstation` | Fedora 44 Cloud Base + Workstation | GDM, GNOME Shell |
+| `arch` | Arch Linux (dated cloud image, dated archive) | greetd, Hyprland |
+| `omarchy-4` | Omarchy 4.x ISO autoinstall | SDDM, Hyprland |
+| `omarchy-3` | Omarchy 3.x ISO autoinstall | SDDM or seamless-login, Hyprland |
 
-One guest is implemented: **`ubuntu-2404`** (Ubuntu 24.04, GDM autologin,
-GNOME Shell / Wayland). You can:
+How the pieces fit together is described in
+[docs/architecture.md](docs/architecture.md).
 
-- fail-closed host check
-- build a content-addressed golden from the recipe
-- run session + compositor + in-guest screenshot smoke (`--session-only`)
-- boot an interactive throwaway overlay (`vm-run`)
-- prune overlays / goldens
-- run host unit tests (no KVM)
+## Requirements
 
-**Not implemented yet:** `arch`, `fedora-workstation`, `omarchy-4`,
-`omarchy-3`; `run-test --install-from`; `strata --version`; window-after-install
-(`gtk-launch` / bus-name wait). Ubuntu/Fedora installer smokes wait on Strata
-flags that do not exist (`--archive PATH`, non-Arch `--non-interactive` that
-trusts installed packages).
+- Linux x86_64 host with KVM (`/dev/kvm` readable and writable by your
+  user). Software emulation is not supported.
+- A working GPU/EGL stack: `libvirglrenderer` and a `/dev/dri/renderD*`
+  device. QEMU runs with `egl-headless,gl=on`.
+- About 9 GiB of free RAM per running guest (guests use 8 GiB) and
+  roughly 100 GiB of free disk in the cache directory for a build
+  (working copy + golden + source).
+- [mise](https://mise.jdx.dev) 2026.9.4 or newer. Install it from your
+  distribution's package manager; do not run it as root.
 
-Documented entry is `mise run <task>`. `python -m strataqemu …` is the
-implementation. `scripts/` are thin shims, not the operator path.
+macOS and Windows are not supported.
 
-## First run
-
-Linux x86_64 host with KVM. macOS and Windows are out of scope. Do not run
-as root.
-
-1. Install mise **outside this repo**. Prefer the distro package (Arch
-   `pacman -S mise`, Fedora COPR, Debian/Ubuntu extrepo/PPA). Review any
-   upstream installer before piping it to a shell. This repository does not
-   `curl | sh` mise from a task. Confirm `mise bootstrap --help` exists.
-
-2. Clone, review `mise.toml` (it is executable config), then:
+## Setup
 
 ```bash
+git clone <this repo> && cd strata-qemu-testing
 mise trust
-mise install             # Python 3.11 from [tools] / mise.lock
-mise bootstrap           # host packages + tools + check-host
-mise run check-host      # fail-closed; generates $CACHE/keys/
+mise install          # Python 3.11 into the mise toolchain
+mise bootstrap        # host packages via apt, dnf, or pacman, then check-host
+mise run check-host
 ```
 
-If the host package manager is not apt, dnf, or pacman, install qemu
-(including GL modules), OVMF, xorriso, ssh, and curl yourself, then run
-`mise run check-host`.
+`mise bootstrap` installs QEMU (with the GL display modules), `qemu-img`,
+OVMF, `xorriso`, `dosfstools`, `mtools`, OpenSSH, `curl`, and `openssl`.
+It does not load the KVM module, add you to the `kvm` group, or install
+GPU drivers. If `check-host` reports a problem it prints what to fix.
 
-`mise bootstrap` does **not** install KVM, `/dev/kvm` access, or a working
-GPU/EGL stack. Add your user to the `kvm` group and re-login if
-`check-host` says so. TCG fallback is not supported.
+On a distribution without apt, dnf, or pacman, install those packages
+yourself and run `mise run check-host`.
 
-**`mise bootstrap` is not `images/*/bootstrap.sh`.** The former installs host
-packages. The latter downloads the guest cloud image / ISO into the cache.
+`check-host` generates an SSH keypair at `$CACHE/keys/id_ed25519` on its
+first successful run. This key is only ever installed into throwaway
+guests.
 
-## Daily commands
+## Build a golden image
 
 ```bash
-mise run check-host
 mise run image-build -- ubuntu-2404
+```
+
+This downloads the pinned source image or ISO, boots it, installs the
+desktop and test dependencies, and saves the result under
+`$CACHE/images/`. The terminal is quiet while the guest works; SSH
+transcripts, the serial console, and the QEMU log are written to the run
+directory instead.
+
+Expect roughly 5-20 minutes for a cloud-image guest (`ubuntu-2404`,
+`fedora-workstation`, `arch`) and 10-30 minutes for the Omarchy ISO
+installs, depending on network speed and the host. The hard timeout is 60
+minutes.
+
+`image-build` is incremental. If a golden already exists for the current
+recipe and source pin, it prints the path and exits without building.
+Editing any recipe file (`image.toml`, `bootstrap.sh`, `setup.sh`,
+templates, `cidata/`) changes the digest and triggers a rebuild. Pass
+`--force` to rebuild regardless.
+
+On failure the run directory (`$CACHE/runs/<stamp>-<guest>-build/`) is
+kept with `qemu.log`, `serial.log`, `ssh.log`, and, for timeouts, a
+screenshot of the console.
+
+## Run tests
+
+### Session smoke
+
+```bash
 mise run run-test -- ubuntu-2404 --session-only
-MISE_TASK_OUTPUT=interleave mise run vm-run -- ubuntu-2404 --graphical
-mise run image-prune                 # overlays and run dirs; not goldens
-mise run image-prune -- --images     # also drop goldens; never $CACHE/keys/
-mise run test                        # unittest; no KVM
 ```
 
-Put mise flags *before* the task name (`mise run --quiet image-build -- ubuntu-2404`).
-With `raw_args = true`, `mise run run-test --help` reaches argparse. Flags
-after `--` belong to `strataqemu`.
+Boots an overlay, waits for the autologin Wayland session, verifies the
+compositor is running, and captures a screenshot from inside the guest.
+Nothing Strata-related is installed or launched. Typical runtime is one to
+three minutes.
 
-`image-build` is incremental: a golden matching the current recipe + source
-checksum is printed and the command exits 0. `--force` rebuilds.
+### Installer smoke
 
-`run-test` **never** builds a golden. `[tasks.run-test] depends` is
-`check-host` only. Missing golden exits non-zero with
-`run \`mise run image-build -- ubuntu-2404\` first`.
-
-Success keeps the run dir’s screenshot, `result.json`, and logs, and deletes
-the throwaway overlay. `--keep` retains the overlay too. Failures keep the
-whole run dir.
-
-Hidden, operator-gated spike (not a daily command):
-`mise run spike-wayland-ubuntu`.
-
-## Guest: ubuntu-2404
-
-| | |
-| --- | --- |
-| Source | Dated Noble cloudimg (not `…/noble/current/`) + SHA-256 in `images/ubuntu-2404/image.toml` |
-| APT | `snapshot.ubuntu.com` dated index; must not predate the cloud image |
-| Session | GDM autologin → GNOME Shell Wayland; initial-setup / tour masked |
-| Disk / RAM / CPUs | 40 GiB / 8192 MiB / 4 |
-| User | `tester` / `foobar` (test-only; user-net only, never bridge) |
-| SSH | ed25519 key generated into `$CACHE/keys/` on first `check-host` |
-
-`--session-only` asserts an active `Type=wayland` seat0 session, `gnome-shell`,
-a Wayland socket, and an in-guest `gnome-screenshot`. It does **not** run
-`install.sh` or launch Strata.
-
-## Cache
-
-Default `$XDG_CACHE_HOME/strata-qemu-testing` (else `~/.cache/strata-qemu-testing`).
-Override with `STRATA_QEMU_CACHE`. Put it on a large disk, not a small `/tmp`.
-
-```
-$CACHE/images/ubuntu-2404-<digest>.qcow2   # golden (read-only backing)
-$CACHE/images/ubuntu-2404.qcow2            # convenience symlink
-$CACHE/images/ubuntu-2404.json             # provenance
-$CACHE/downloads/                          # cloudimg blob
-$CACHE/runs/<stamp>-ubuntu-2404/           # overlay, logs, screenshot, result.json
-$CACHE/keys/id_ed25519                     # generated; not in git
+```bash
+mise run run-test -- arch --install-from release
+mise run run-test -- ubuntu-2404 --install-from local-archive ~/Downloads/strata-1.2.3-x86_64-unknown-linux-gnu.tar.gz
 ```
 
-Goldens are per-machine cache, rebuilt from the recipe. Only `keys/README.md`
-is committed.
+Runs the session smoke, then downloads Strata's `install.sh` inside the
+guest, records its SHA-256, and runs it with
+`--non-interactive --with-desktop-entry --without-file-chooser` (adding
+`--archive` for `local-archive`). It then checks `~/.local/bin/strata`
+exists, compares `strata --version` with the intended version (the
+GitHub latest release, or the version in the archive filename), verifies
+the desktop entry, launches the application, and waits for its window
+(Hyprland client class or GNOME session bus name) before taking a
+screenshot.
 
-## Host tests
+The version step is recorded as skipped if `strata --version` does not
+behave like a command-line flag.
+
+### Output
+
+On success `run-test` prints the guest, the screenshot path, and the run
+directory. `result.json` in the run directory lists each step with its
+duration and details such as the `install.sh` digest and observed version.
+
+```
+$CACHE/runs/<stamp>-<guest>/
+  result.json        step results
+  screenshot.png     in-guest screenshot
+  qmp-session.png    QEMU-side screendump (may be absent)
+  ssh.log            every guest command and its output
+  serial.log         guest console
+  qemu.log           QEMU stdout/stderr
+```
+
+The overlay disk is deleted after a successful run; pass `--keep` to
+retain it. Failed runs keep everything and exit 1.
+
+`run-test` never builds a golden. If one is missing it tells you to run
+`image-build` first.
+
+## Interactive use
+
+```bash
+mise run vm-run -- ubuntu-2404 --graphical
+```
+
+Boots a throwaway overlay in a QEMU window (GTK, or SDL if GTK is
+unavailable). Without `--graphical` the guest runs headless and is
+reachable over SSH only. `vm-run` prints the forwarded SSH port:
+
+```bash
+ssh -i "$CACHE/keys/id_ed25519" -p <port> tester@127.0.0.1
+```
+
+The `tester` account's password is `foobar` and it has passwordless sudo.
+Changes are discarded when QEMU exits unless `--keep` is given; the golden
+is never modified.
+
+## Cleaning up
+
+```bash
+mise run image-prune              # delete all run directories
+mise run image-prune -- --images  # also delete golden images
+```
+
+Downloads and the SSH key are never deleted by `image-prune`.
+
+## Cache location
+
+Default: `$XDG_CACHE_HOME/strata-qemu-testing`, else
+`~/.cache/strata-qemu-testing`. Override with `STRATA_QEMU_CACHE`. Put it
+on a filesystem with plenty of space; goldens are 40 GiB sparse qcow2
+files and builds need room for a working copy as well.
+
+```
+$CACHE/
+  keys/         generated SSH key
+  downloads/    pinned cloud images and ISOs
+  images/       goldens, symlinks, provenance JSON
+  runs/         per-run directories
+```
+
+## Host unit tests
 
 ```bash
 mise run test
 ```
 
-These are stdlib `unittest` on the shipped CLI, recipes, and smoke scripts.
-They inject fixtures and refuse `qemu-system-*`. Live `image-build` /
-`run-test` need KVM, virgl, and (for `run-test`) a matching golden.
-)
+Runs the `unittest` suite. It exercises the CLI, recipe loading, argv
+builders, protocol helpers, and the guest shell scripts with fixtures; it
+never starts QEMU and does not need KVM.
+
+## Command reference
+
+mise options go before the task name; everything after `--` is passed to
+the command.
+
+| Command | Description |
+| --- | --- |
+| `mise run check-host` | Verify KVM, QEMU, GL, OVMF, tools, and RAM. Generates the SSH key. |
+| `mise run image-build -- <guest> [--force]` | Build or reuse a golden image. |
+| `mise run run-test -- <guest> --session-only [--keep]` | Session and screenshot smoke. |
+| `mise run run-test -- <guest> --install-from release [--keep]` | Install from the latest GitHub release. |
+| `mise run run-test -- <guest> --install-from local-archive PATH [--keep]` | Install from a host tarball. |
+| `mise run vm-run -- <guest> [--graphical] [--keep]` | Interactive throwaway overlay. |
+| `mise run image-prune [-- --images]` | Delete run directories (and goldens). |
+| `mise run test` | Host unit tests. |
+
+For debug logging, invoke the module directly with `-v` before the
+command:
+
+```bash
+mise exec -- python -m strataqemu -v run-test ubuntu-2404 --session-only
+```
+
+## Contributing
+
+Recipes live in `images/<guest>/`; smoke scripts in `guest-tests/`; the
+host code in `strataqemu/`. Guides for adding a guest, a smoke step, or a
+CLI command are in `.agents/skills/`. Run `mise run test` before opening a
+merge request.

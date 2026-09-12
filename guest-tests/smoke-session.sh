@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Guest session smoke (design algorithm).
+# Guest session smoke.
 # Pick Type=wayland Class=user State=active Seat=seat0.
 # Never select SSH $XDG_SESSION_ID. Type=x11 is a hard fail.
 # WAYLAND_DISPLAY must be a socket, not a leftover lock.

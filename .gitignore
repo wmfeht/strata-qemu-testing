@@ -13,7 +13,7 @@ keys/*
 mise.local.toml
 mise.local.lock
 
-# Unsupported in v1; operators still create one by habit
+# Local virtualenvs (the project runs on mise's Python, not a venv)
 .venv/
 venv/
 

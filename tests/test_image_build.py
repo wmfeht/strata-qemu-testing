@@ -95,7 +95,7 @@ class IncrementalImageBuildTests(unittest.TestCase):
                     os.environ[config.CACHE_ENV] = old
         self.assertEqual(code, 0, err.getvalue())
         self.assertIn(str(golden.resolve()), buf.getvalue())
-        self.assertNotIn("typically takes", err.getvalue())
+        self.assertNotIn("image-build: building", err.getvalue())
         self.assertNotIn("not implemented", buf.getvalue() + err.getvalue())
         ch.assert_not_called()
 
@@ -129,7 +129,7 @@ class IncrementalImageBuildTests(unittest.TestCase):
                     os.environ[config.CACHE_ENV] = old
         self.assertEqual(code, 1)
         self.assertIn("injected-host-failure", err.getvalue())
-        self.assertNotIn("typically takes", err.getvalue())
+        self.assertNotIn("image-build: building", err.getvalue())
         self.assertNotEqual(buf.getvalue().strip(), str(golden.resolve()))
         self.assertNotIn("not implemented", buf.getvalue() + err.getvalue())
         ch.assert_called()
@@ -161,7 +161,7 @@ class IncrementalImageBuildTests(unittest.TestCase):
         ubuntu = load_guest("ubuntu-2404")
         cloud = build_duration_note(ubuntu)
         self.assertIn("ubuntu-2404", cloud)
-        self.assertIn("10-30 minutes", cloud)
+        self.assertIn("5-20 minutes", cloud)
         self.assertIn("timeout 60 minutes", cloud)
         self.assertIn("run dir", cloud)
         self.assertNotIn("ISO autoinstall", cloud)
@@ -169,13 +169,13 @@ class IncrementalImageBuildTests(unittest.TestCase):
         iso = build_duration_note(omarchy)
         self.assertIn("omarchy-4", iso)
         self.assertIn("ISO autoinstall", iso)
-        self.assertIn("20-60 minutes", iso)
+        self.assertIn("10-30 minutes", iso)
         self.assertIn("timeout 60 minutes", iso)
         omarchy3 = load_guest("omarchy-3")
         iso3 = build_duration_note(omarchy3)
         self.assertIn("omarchy-3", iso3)
         self.assertIn("ISO autoinstall", iso3)
-        self.assertIn("20-60 minutes", iso3)
+        self.assertIn("10-30 minutes", iso3)
         self.assertIn("timeout 60 minutes", iso3)
 
     def test_live_build_prints_duration_note_on_stderr(self) -> None:
@@ -205,7 +205,113 @@ class IncrementalImageBuildTests(unittest.TestCase):
         live.assert_called_once()
         self.assertIn(build_duration_note(guest), err.getvalue())
         self.assertIn(str(golden.resolve()), buf.getvalue())
-        self.assertNotIn("typically takes", buf.getvalue())
+        self.assertNotIn("image-build: building", buf.getvalue())
+
+    def test_live_build_shuts_down_qemu_on_keyboard_interrupt(self) -> None:
+        guest = load_guest("ubuntu-2404")
+
+        class _Proc:
+            def __init__(self) -> None:
+                self.returncode = None
+
+            def poll(self) -> None:
+                return None
+
+            def wait(self, timeout=None) -> int:
+                del timeout
+                return 0
+
+            def kill(self) -> None:
+                return None
+
+        proc = _Proc()
+
+        def fake_bootstrap(g, cache, run=None):
+            del run
+            dest = cache / "downloads" / g.source_filename()
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"blob")
+            return dest
+
+        def fake_convert(src, dest, disk_gb, run=None):
+            del src, disk_gb, run
+            Path(dest).write_bytes(b"qcow")
+            return Path(dest)
+
+        def fake_cidata(path, **kwargs):
+            del kwargs
+            Path(path).write_bytes(b"iso")
+            return Path(path)
+
+        def fake_spawn(**kwargs):
+            return Machine(
+                kwargs["overlay"],
+                kwargs["run_dir"],
+                ssh_port=22022,
+                vnc_port=5901,
+                identity=kwargs["identity"],
+                user=guest.user.name,
+                process=proc,
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cache = tmp / "cache"
+            cache.mkdir()
+            key = tmp / "id_ed25519"
+            key.write_text("k", encoding="utf-8")
+            key.with_name(key.name + ".pub").write_text("p", encoding="utf-8")
+            vars_template = tmp / "OVMF_VARS.4m.fd"
+            vars_template.write_bytes(b"vars")
+            host = CheckHostResult(
+                ok=True, errors=(), ssh_key=key, ovmf_code=tmp / "OVMF_CODE.4m.fd"
+            )
+            buf = io.StringIO()
+            err = io.StringIO()
+            with (
+                redirect_stdout(buf),
+                redirect_stderr(err),
+                patch(
+                    "strataqemu.image_build._assert_free_space", return_value=None
+                ),
+                patch(
+                    "strataqemu.image_build.run_bootstrap",
+                    side_effect=fake_bootstrap,
+                ),
+                patch(
+                    "strataqemu.image_build.convert_and_resize",
+                    side_effect=fake_convert,
+                ),
+                patch(
+                    "strataqemu.image_build.write_cidata_iso_from_recipe",
+                    side_effect=fake_cidata,
+                ),
+                patch(
+                    "strataqemu.image_build.find_ovmf_vars",
+                    return_value=vars_template,
+                ),
+                patch(
+                    "strataqemu.image_build._spawn_qemu", side_effect=fake_spawn
+                ),
+                patch(
+                    "strataqemu.image_build.wait_ssh",
+                    side_effect=KeyboardInterrupt,
+                ),
+                patch.object(Machine, "shutdown", return_value="kill") as sd,
+                patch("subprocess.Popen", side_effect=_refuse_qemu_system),
+                patch("subprocess.run", side_effect=_refuse_qemu_system),
+            ):
+                code = run_image_build(
+                    "ubuntu-2404",
+                    force=True,
+                    cache_dir=cache,
+                    check_host_fn=lambda: host,
+                )
+            self.assertEqual(code, 130, err.getvalue())
+            self.assertIn("image-build: interrupted", err.getvalue())
+            sd.assert_called()
+            runs = list((cache / "runs").glob("*-ubuntu-2404-build"))
+            self.assertEqual(len(runs), 1, runs)
 
     def test_arch_matching_golden_prints_path_and_skips_qemu(self) -> None:
         guest = load_guest("arch")

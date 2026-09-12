@@ -27,6 +27,7 @@ from strataqemu.run_test import (
     vm_run_qemu_argv,
 )
 from strataqemu.tests_spec import (
+    INSTALL_FROM_FAIL_CLOSED,
     LOCAL_ARCHIVE_MISSING_PATH,
     missing_golden_message,
     sha256_file,
@@ -884,7 +885,7 @@ class ArchInstallFromTests(unittest.TestCase):
         self.assertEqual(code, 2)
         text = buf.getvalue() + err.getvalue()
         self.assertIn(LOCAL_ARCHIVE_MISSING_PATH, text)
-        self.assertNotIn("not implemented yet (fail closed)", text)
+        self.assertNotIn(INSTALL_FROM_FAIL_CLOSED, text)
         popen.assert_not_called()
         run.assert_not_called()
 
@@ -912,7 +913,7 @@ class ArchInstallFromTests(unittest.TestCase):
         text = buf.getvalue() + err.getvalue()
         self.assertIn("archive not found", text)
         self.assertIn(missing, text)
-        self.assertNotIn("not implemented yet (fail closed)", text)
+        self.assertNotIn(INSTALL_FROM_FAIL_CLOSED, text)
         popen.assert_not_called()
         run.assert_not_called()
 

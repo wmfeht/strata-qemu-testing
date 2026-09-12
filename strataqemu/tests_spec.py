@@ -63,8 +63,8 @@ INSTALL_FROM_RELEASE_GUESTS = frozenset(
 )
 VERSION_CLI_RE = re.compile(r"^(strata\s+)?v?\d+\.\d+", re.IGNORECASE)
 INSTALL_FROM_FAIL_CLOSED = (
-    "run-test --install-from is not implemented yet (fail closed). "
-    "See docs/design.md."
+    "run-test: --install-from is not supported for this guest; "
+    "use --session-only"
 )
 INSTALL_SH_SHA256_PREFIX = "INSTALL_SH_SHA256="
 INSTALL_SH_URL = "https://raw.githubusercontent.com/lgse/strata/main/install.sh"

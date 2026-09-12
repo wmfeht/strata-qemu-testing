@@ -1,8 +1,8 @@
 """Throwaway Ubuntu Noble overlay proving Type=wayland + in-guest screenshot.
 
-Operator-gated live KVM path. Argv builders here are the unit-test surface;
-they never spawn ``qemu-system-x86_64``. Not ``images/ubuntu-2404/`` and not
-``Guest.load`` (PR 4).
+Ad-hoc spike that predates the recipe system; it does not use
+``images/ubuntu-2404/`` or ``Guest``. Argv builders here are the unit-test
+surface; they never spawn ``qemu-system-x86_64``.
 """
 
 from __future__ import annotations

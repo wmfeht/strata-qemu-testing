@@ -88,8 +88,8 @@ RECIPE_UPLOAD_NAMES = (
     "hyprland.lua",
     "hyprland.conf",
 )
-# Well-known test password (docs/design.md). ISO autoinstall sudoers is
-# password sudo until setup.sh writes NOPASSWD.
+# Test-only password for the `tester` account (see README). ISO autoinstall
+# only grants password sudo until setup.sh writes NOPASSWD.
 WELL_KNOWN_TEST_PASSWORD = "foobar"
 
 
@@ -618,8 +618,8 @@ def wait_iso_autoinstall(
                 ):
                     logged_progress = True
                     log.info(
-                        "working disk %s bytes "
-                        "(autoinstall writing, waiting for reboot)",
+                        "autoinstall is writing the disk (%s bytes so far); "
+                        "waiting for the installed system to boot",
                         disk,
                     )
                 elif ssh_auth_rejected(proc.returncode, last):
@@ -912,7 +912,8 @@ def _assert_free_space(cache: Path, guest: Guest, download: Path | None) -> None
         raise ImageBuildError(
             f"not enough free space on {cache}: "
             f"{free_gib:.1f} GiB free, need {need_gib:.1f} GiB "
-            f"(2 * disk_gb + cloudimg + 10)"
+            f"(two {guest.disk_gb} GiB disks, the source image, and 10 GiB slack). "
+            "Set STRATA_QEMU_CACHE to a larger filesystem."
         )
 
 
@@ -921,6 +922,18 @@ def _pubkey_for(ssh_key: Path) -> str:
     if not pub.is_file():
         raise ImageBuildError(f"missing SSH public key {pub}")
     return pub.read_text(encoding="utf-8")
+
+
+def _shutdown_machine(machine: Machine) -> None:
+    try:
+        machine.shutdown()
+    except Exception:
+        machine.kill()
+    if machine._proc is not None:
+        try:
+            machine._proc.wait(timeout=15)
+        except Exception:
+            machine.kill()
 
 
 def build_live(
@@ -1056,7 +1069,7 @@ def build_live(
                 pass
 
         path_used = machine.shutdown()
-        log.info("shutdown via %s", path_used)
+        log.info("guest shut down via %s; finalizing golden", path_used)
         if machine._proc is not None:
             try:
                 machine._proc.wait(timeout=60)
@@ -1116,18 +1129,11 @@ def build_live(
         shutil.rmtree(run_dir, ignore_errors=True)
         return golden
     except Exception:
-        if machine is not None:
-            try:
-                machine.shutdown()
-            except Exception:
-                machine.kill()
-            if machine._proc is not None:
-                try:
-                    machine._proc.wait(timeout=15)
-                except Exception:
-                    machine.kill()
-        log.exception("image-build live path failed; kept %s", run_dir)
+        log.exception("image-build failed; run dir kept at %s", run_dir)
         raise
+    finally:
+        if machine is not None:
+            _shutdown_machine(machine)
 
 
 def _format_minutes(seconds: int) -> str:
@@ -1141,15 +1147,15 @@ def build_duration_note(guest: Guest) -> str:
     """One-line expectation for a live golden build (stderr, not stdout)."""
     timeout = _format_minutes(guest.build_timeout_s)
     if guest.source_kind == "iso-autoinstall":
-        typical = "20-60 minutes"
+        typical = "10-30 minutes"
         what = "ISO autoinstall and setup"
     else:
-        typical = "10-30 minutes"
-        what = "first boot, package install, and setup"
+        typical = "5-20 minutes"
+        what = "download, first boot, package install, and setup"
     return (
-        f"image-build: {guest.id} {what} typically takes {typical} "
-        f"(timeout {timeout}). Quiet until done; SSH transcripts stay in "
-        f"the run dir, not the terminal."
+        f"image-build: building {guest.id} ({what}). Usually {typical}, "
+        f"timeout {timeout}. Progress is written to the run dir under "
+        f"$CACHE/runs/, not the terminal."
     )
 
 
@@ -1162,7 +1168,7 @@ def run_image_build(
     run: RunFn | None = None,
     popen: PopenFn | None = None,
 ) -> int:
-    """CLI body for ``image-build``. Never a generic ``not implemented`` stub."""
+    """CLI body for ``image-build``."""
     if not guest_id:
         print(
             "image-build: guest id is required (e.g. ubuntu-2404)",
@@ -1198,6 +1204,9 @@ def run_image_build(
         installed = build_live(
             guest, cache, host=host, run=run, popen=popen
         )
+    except KeyboardInterrupt:
+        print("image-build: interrupted", file=sys.stderr)
+        return 130
     except Exception as exc:
         print(f"image-build: {exc}", file=sys.stderr)
         return 1

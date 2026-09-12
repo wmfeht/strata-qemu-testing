@@ -228,7 +228,7 @@ def _spawn_overlay_vm(
                 ovmf_code=ovmf_code,
                 ovmf_vars=ovmf_vars,
             )
-        log.info("qemu argv: %s", " ".join(argv))
+        log.debug("qemu argv: %s", " ".join(argv))
         popen_kwargs: dict = {}
         logf = None
         if inherit_stdio:
@@ -366,7 +366,7 @@ def run_run_test(
     intended_version: str | None = None,
     intended_version_fn: Callable[[], str] | None = None,
 ) -> int:
-    """CLI body for ``run-test``. Not a stub. Never calls ``image-build``."""
+    """CLI body for ``run-test``. Never calls ``image-build``."""
     loaded = _load_or_usage(guest_id, "run-test")
     if isinstance(loaded, int):
         return loaded
@@ -548,7 +548,7 @@ def run_vm_run(
     graphical_ui: str | None = None,
     wait: bool = True,
 ) -> int:
-    """CLI body for ``vm-run``. Throwaway overlay; no ``--maintain``."""
+    """CLI body for ``vm-run``. Throwaway overlay; the golden is never written."""
     loaded = _load_or_usage(guest_id, "vm-run")
     if isinstance(loaded, int):
         return loaded

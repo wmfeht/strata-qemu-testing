@@ -98,7 +98,7 @@ def select_wayland_session(
     """Return the active ``Type=wayland`` ``Class=user`` ``Seat=seat0`` sid.
 
     Never returns ``ssh_session_id`` (the SSH ``$XDG_SESSION_ID``).
-    ``Type=x11`` is a hard fail in v1.
+    ``Type=x11`` is a hard fail.
     """
     chosen: str | None = None
     for row in parse_list_sessions(list_sessions_text):

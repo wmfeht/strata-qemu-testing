@@ -171,21 +171,18 @@ def check_host(env: CheckHostEnv | None = None) -> CheckHostResult:
     errors: list[str] = []
 
     if env.euid == 0:
-        errors.append(
-            "Refusing to run as root. Never run QEMU workflows as root."
-        )
+        errors.append("check-host: refusing to run as root.")
 
     kvm = env.kvm_path
     if not kvm.exists():
         errors.append(
-            f"{kvm} does not exist. KVM is required; TCG fallback is not supported. "
-            "Load the kvm module. Hint: add your user to the kvm group and re-login."
+            f"{kvm} does not exist. Load the kvm module and add your user to "
+            "the kvm group, then re-login. KVM is required (no TCG fallback)."
         )
     elif not env.kvm_accessible(kvm):
         errors.append(
-            f"{kvm} is not readable and writable. "
-            "Add your user to the kvm group and re-login. "
-            "TCG fallback is not supported."
+            f"{kvm} is not readable and writable. Add your user to the kvm "
+            "group and re-login. KVM is required (no TCG fallback)."
         )
 
     missing_bins: list[str] = []
@@ -200,16 +197,13 @@ def check_host(env: CheckHostEnv | None = None) -> CheckHostResult:
     for name in missing_bins:
         if name == "qemu-system-x86_64":
             continue
-        errors.append(
-            f"{name} is not on PATH. Install host packages with `mise bootstrap`."
-        )
+        errors.append(f"{name} is not on PATH. Install it with `mise bootstrap`.")
 
     if not env.virgl_ok:
         errors.append(
-            "virgl/egl is not usable (need libvirglrenderer and an EGL DRM device, "
-            "or qemu-system-x86_64 -display egl-headless,gl=on -device virtio-gpu-gl-pci). "
-            "Install virgl/EGL userspace with `mise bootstrap`; a working GPU/EGL stack "
-            "is still fail-closed if the device is missing."
+            "virgl/EGL is not usable: need libvirglrenderer and a "
+            "/dev/dri/renderD* device. Install the virgl/EGL packages with "
+            "`mise bootstrap` and make sure a GPU driver is loaded."
         )
 
     candidates = ovmf_code_candidates(env.firmware_share_roots)
@@ -217,19 +211,18 @@ def check_host(env: CheckHostEnv | None = None) -> CheckHostResult:
     if ovmf is None:
         searched = ", ".join(str(p) for p in candidates)
         errors.append(
-            "OVMF 4M non-secboot firmware not found "
-            f"(search order: {searched}). "
-            "Install edk2-ovmf / ovmf with `mise bootstrap`. "
-            "Secure Boot firmware (.secboot) is not accepted."
+            "OVMF 4M firmware not found (searched: "
+            f"{searched}). Install edk2-ovmf / ovmf with `mise bootstrap`. "
+            "Secure Boot (.secboot) firmware is not accepted."
         )
 
     mem = env.mem_available_mib
     if mem is None:
-        errors.append("Could not read MemAvailable; cannot verify host RAM floor.")
+        errors.append("Could not read MemAvailable from /proc/meminfo.")
     elif mem < GENERIC_MEM_FLOOR_MIB:
         errors.append(
             f"MemAvailable is {mem} MiB; need at least {GENERIC_MEM_FLOOR_MIB} MiB "
-            "(9 GiB floor when no guest is selected)."
+            "(8 GiB guest plus 1 GiB host headroom)."
         )
 
     if errors:
@@ -261,8 +254,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m strataqemu",
         description=(
-            "Host-side QEMU/KVM workflows for Strata distro-matrix testing. "
-            "Documented operator entry is mise run <task>."
+            "QEMU/KVM guests for Strata installer and desktop testing. "
+            "Normally invoked through `mise run <task>`."
         ),
     )
     parser.add_argument(
@@ -275,12 +268,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser(
         "check-host",
-        help="Fail-closed host check: /dev/kvm, qemu, virgl/egl, OVMF 4M, xorriso, ssh, curl",
+        help="Check KVM, QEMU, virgl/EGL, OVMF, tools, and RAM; generate the SSH key",
     )
 
     image_build = sub.add_parser(
         "image-build",
-        help="Build or refresh a golden from its recipe. Incremental; --force rebuilds.",
+        help="Build a golden image from its recipe, or print the existing one",
     )
     image_build.add_argument("guest", nargs="?", help="Guest id (e.g. ubuntu-2404)")
     image_build.add_argument(
@@ -291,66 +284,63 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_test = sub.add_parser(
         "run-test",
-        help="Boot a throwaway overlay and run smokes. Fails if no golden.",
+        help="Boot a throwaway overlay of a golden and run smoke checks",
     )
     run_test.add_argument("guest", nargs="?", help="Guest id")
     run_test.add_argument(
         "--session-only",
         action="store_true",
-        help="Session and compositor smoke without installer or app launch",
+        help="Check the desktop session and take a screenshot; do not install Strata",
     )
     run_test.add_argument(
         "--install-from",
         nargs="+",
         metavar=("SOURCE", "PATH"),
         help=(
-            "Install Strata from GitHub latest (release) "
-            "or a host tarball (local-archive PATH)"
+            "Install Strata from the latest GitHub release (release) "
+            "or a host tarball (local-archive PATH), then launch it"
         ),
     )
     run_test.add_argument(
         "--keep",
         action="store_true",
-        help="Keep the throwaway overlay after success",
+        help="Keep the overlay disk after a successful run",
     )
 
     vm_run = sub.add_parser(
         "vm-run",
-        help="Interactive throwaway overlay of an existing golden (no --maintain)",
+        help="Boot an interactive throwaway overlay of a golden",
     )
     vm_run.add_argument("guest", nargs="?", help="Guest id")
     vm_run.add_argument(
         "--graphical",
         action="store_true",
-        help="GTK/SDL GL display instead of egl-headless",
+        help="Open a GTK/SDL window instead of running headless",
     )
     vm_run.add_argument(
         "--keep",
         action="store_true",
-        help="Keep the throwaway overlay",
+        help="Keep the run directory after QEMU exits",
     )
 
     prune = sub.add_parser(
         "image-prune",
-        help="Drop overlays and old run dirs. Never deletes goldens unless --images.",
+        help="Delete run directories; with --images also delete golden images",
     )
     prune.add_argument(
         "--images",
         action="store_true",
-        help="Also delete golden images. Never deletes $CACHE/keys/.",
+        help="Also delete golden images (never the SSH key or downloads)",
     )
 
     spike = sub.add_parser(
         "spike-wayland-ubuntu",
-        help=(
-            "Throwaway Noble overlay: Type=wayland + guest screenshot. "
-            "Operator-gated."
-        ),
+        help="Ad-hoc Ubuntu Noble Wayland session spike (predates the recipe system)",
     )
     spike.add_argument(
         "--keep",
         action="store_true",
-        help="Keep the throwaway overlay and run dir after success",
+        help="Keep the run directory after success",
     )
     return parser
 
