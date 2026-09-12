@@ -40,17 +40,51 @@ def create_overlay_argv(
     ]
 
 
+def _without_backing_file_strict(argv: list[str]) -> list[str]:
+    """Drop ``backing_file_strict`` from ``-o`` for qemu-img that rejects it."""
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "-o" and i + 1 < len(argv):
+            kept = [
+                part
+                for part in argv[i + 1].split(",")
+                if part and "backing_file_strict" not in part
+            ]
+            if kept:
+                out.extend(["-o", ",".join(kept)])
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    return out
+
+
 def create_overlay(
     golden: Path | str,
     overlay: Path | str,
     *,
     qemu_img: str = "qemu-img",
 ) -> Path:
-    """Create a throwaway overlay. Does not open the golden for writing."""
+    """Create a throwaway overlay. Does not open the golden for writing.
+
+    Argv always includes ``backing_file_strict=on``. If this host's qemu-img
+    rejects that parameter, retry with the same absolute ``-b`` and ``-F``.
+    """
     dest = Path(overlay)
     dest.parent.mkdir(parents=True, exist_ok=True)
     argv = create_overlay_argv(golden, dest, qemu_img=qemu_img)
-    subprocess.run(argv, check=True, capture_output=True, text=True)
+    try:
+        subprocess.run(argv, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        err = f"{exc.stderr or ''}{exc.stdout or ''}"
+        if "backing_file_strict" not in err.lower():
+            raise
+        fallback = _without_backing_file_strict(argv)
+        log.warning(
+            "qemu-img rejected backing_file_strict; retrying with absolute backing"
+        )
+        subprocess.run(fallback, check=True, capture_output=True, text=True)
     return dest
 
 

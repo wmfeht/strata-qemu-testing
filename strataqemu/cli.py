@@ -1,4 +1,4 @@
-"""Argparse CLI: check-host, image-prune, and later-PR stubs."""
+"""Argparse CLI: check-host, image-prune, spike-wayland-ubuntu, later-PR stubs."""
 
 from __future__ import annotations
 
@@ -335,6 +335,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also delete golden images. Never deletes $CACHE/keys/.",
     )
+
+    spike = sub.add_parser(
+        "spike-wayland-ubuntu",
+        help=(
+            "Throwaway Noble overlay: Type=wayland + guest screenshot. "
+            "Operator-gated."
+        ),
+    )
+    spike.add_argument(
+        "--keep",
+        action="store_true",
+        help="Keep the throwaway overlay and run dir after success",
+    )
     return parser
 
 
@@ -383,6 +396,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "image-prune":
         return _run_image_prune(images=args.images)
+
+    if args.command == "spike-wayland-ubuntu":
+        from strataqemu.spike import run_spike_wayland_ubuntu
+
+        return run_spike_wayland_ubuntu(keep=args.keep)
 
     if args.command in STUB_COMMANDS:
         print(

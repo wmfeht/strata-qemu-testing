@@ -10,7 +10,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from strataqemu.overlay import copy_uefi_vars, create_overlay, create_overlay_argv
+from strataqemu.overlay import (
+    _without_backing_file_strict,
+    copy_uefi_vars,
+    create_overlay,
+    create_overlay_argv,
+)
 
 SCRATCH = Path("/tmp/grok-goal-3b8b13cb1e1a/implementer")
 MISSING_LOG = SCRATCH / "qemu-img-missing.log"
@@ -51,6 +56,27 @@ class OverlayArgvTests(unittest.TestCase):
         )
         self.assertTrue(Path(argv[argv.index("-b") + 1]).is_absolute())
         self.assertIn("backing_file_strict=on", argv)
+
+    def test_without_strict_keeps_absolute_backing(self) -> None:
+        argv = [
+            "qemu-img",
+            "create",
+            "-f",
+            "qcow2",
+            "-F",
+            "qcow2",
+            "-o",
+            "backing_file_strict=on",
+            "-b",
+            "/abs/golden.qcow2",
+            "overlay.qcow2",
+        ]
+        fallback = _without_backing_file_strict(argv)
+        self.assertNotIn("backing_file_strict=on", fallback)
+        self.assertIn("-b", fallback)
+        self.assertEqual(fallback[fallback.index("-b") + 1], "/abs/golden.qcow2")
+        self.assertTrue(Path(fallback[fallback.index("-b") + 1]).is_absolute())
+        self.assertEqual(fallback[-1], "overlay.qcow2")
 
     def test_create_does_not_invoke_qemu_system(self) -> None:
         with tempfile.TemporaryDirectory() as td:

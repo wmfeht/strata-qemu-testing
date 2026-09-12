@@ -126,8 +126,11 @@ run = "python -m strataqemu image-prune"
 description = "Host-side unit tests. No KVM, no qemu, no check-host. -t . so import strataqemu works without pip install -e."
 run = "python -m unittest discover -s tests -t . -v"
 
-# PR 3 fills a working run line. Stub fails closed until then.
+# Hidden: not a daily v1 command. Operator-gated live KVM path.
 [tasks.spike-wayland-ubuntu]
-description = "Throwaway Noble overlay: Type=wayland + guest screenshot. Operator-gated. Stub until PR 3."
+description = "Throwaway Noble overlay: Type=wayland + guest screenshot. Operator-gated."
+depends = ["check-host"]
 hide = true
-run = "python -c 'raise SystemExit(2)'"
+interactive = true
+raw_args = true
+run = "python -m strataqemu spike-wayland-ubuntu"

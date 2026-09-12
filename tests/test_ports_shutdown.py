@@ -33,7 +33,13 @@ from strataqemu.qemu import (
     qmp_system_powerdown,
     run_shutdown,
 )
-from strataqemu.ssh import POWEROFF_COMMAND, scp_command, ssh_command, ssh_poweroff_command
+from strataqemu.ssh import (
+    POWEROFF_COMMAND,
+    scp_command,
+    scp_download_command,
+    ssh_command,
+    ssh_poweroff_command,
+)
 
 
 class PortAllocatorTests(unittest.TestCase):
@@ -192,6 +198,19 @@ class OpenSshArgvTests(unittest.TestCase):
         self.assertEqual(argv[0], "scp")
         self.assertEqual(argv[argv.index("-P") + 1], "22022")
         self.assertIn("tester@127.0.0.1:/tmp/b", argv)
+        self.assertNotIn("paramiko", " ".join(argv).lower())
+
+    def test_scp_download_pulls_remote_to_local(self) -> None:
+        argv = scp_download_command(
+            port=22022,
+            identity="/tmp/k",
+            remote_path="/tmp/strata-window.png",
+            local_path="/tmp/screendump-session.png",
+        )
+        self.assertEqual(argv[0], "scp")
+        self.assertEqual(argv[argv.index("-P") + 1], "22022")
+        self.assertIn("tester@127.0.0.1:/tmp/strata-window.png", argv)
+        self.assertIn("/tmp/screendump-session.png", argv)
         self.assertNotIn("paramiko", " ".join(argv).lower())
 
     def test_poweroff_command_is_systemctl(self) -> None:

@@ -74,6 +74,26 @@ def scp_command(
     ]
 
 
+def scp_download_command(
+    *,
+    port: int,
+    identity: Path | str,
+    remote_path: str,
+    local_path: Path | str,
+    host: str = DEFAULT_HOST,
+    user: str = DEFAULT_USER,
+) -> list[str]:
+    """Build an ``scp`` argv that pulls ``remote_path`` to a local file."""
+    return [
+        "scp",
+        *openssh_opts(identity),
+        "-P",
+        str(port),
+        f"{user}@{host}:{remote_path}",
+        str(local_path),
+    ]
+
+
 def ssh_poweroff_command(
     *,
     port: int,

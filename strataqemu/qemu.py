@@ -210,8 +210,14 @@ def qga_guest_shutdown(socket_path: Path | str, *, timeout: float = 5.0) -> bool
     return True
 
 
-def qmp_system_powerdown(socket_path: Path | str, *, timeout: float = 5.0) -> bool:
-    """QMP ``system_powerdown`` (ACPI power-button). Handshake included."""
+def _qmp_execute(
+    socket_path: Path | str,
+    command: str,
+    arguments: dict | None = None,
+    *,
+    timeout: float = 5.0,
+) -> dict | None:
+    """QMP handshake + one command. None on transport / greeting failure."""
     path = str(Path(socket_path))
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -220,20 +226,60 @@ def qmp_system_powerdown(socket_path: Path | str, *, timeout: float = 5.0) -> bo
             greeting = _recv_json_line(sock)
             if "QMP" not in greeting:
                 log.debug("qmp greeting missing QMP key: %s", greeting)
-                return False
+                return None
             _send_json(sock, {"execute": "qmp_capabilities"})
             caps = _recv_json_line(sock)
             if "error" in caps:
-                return False
-            _send_json(sock, {"execute": "system_powerdown"})
-            reply = _recv_json_line(sock)
+                return None
+            payload: dict = {"execute": command}
+            if arguments:
+                payload["arguments"] = arguments
+            _send_json(sock, payload)
+            return _recv_json_line(sock)
     except (OSError, json.JSONDecodeError, TimeoutError) as exc:
-        log.debug("qmp system_powerdown failed: %s", exc)
+        log.debug("qmp %s failed: %s", command, exc)
+        return None
+
+
+def qmp_system_powerdown(socket_path: Path | str, *, timeout: float = 5.0) -> bool:
+    """QMP ``system_powerdown`` (ACPI power-button). Handshake included."""
+    reply = _qmp_execute(socket_path, "system_powerdown", timeout=timeout)
+    if reply is None:
         return False
     if "error" in reply:
         log.debug("qmp system_powerdown error: %s", reply["error"])
         return False
     return True
+
+
+def qmp_screendump(
+    socket_path: Path | str,
+    dest: Path | str,
+    *,
+    timeout: float = 5.0,
+) -> bool:
+    """Best-effort QMP ``screendump``. False on ``no surface`` or transport failure.
+
+    Must not be used as the primary screenshot oracle; a ``no surface`` error
+    must not fail the caller.
+    """
+    dest_path = Path(dest)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    reply = _qmp_execute(
+        socket_path,
+        "screendump",
+        {"filename": str(dest_path.resolve())},
+        timeout=timeout,
+    )
+    if reply is None:
+        return False
+    if "error" in reply:
+        log.debug("qmp screendump error: %s", reply["error"])
+        return False
+    try:
+        return dest_path.is_file() and dest_path.stat().st_size > 0
+    except OSError:
+        return False
 
 
 @dataclass

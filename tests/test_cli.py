@@ -32,9 +32,19 @@ ARGPARSE_PROXY_TASKS = (
     "run-test",
     "vm-run",
     "image-prune",
+    "spike-wayland-ubuntu",
 )
-QEMU_TASKS = ("image-build", "run-test", "vm-run")
+QEMU_TASKS = ("image-build", "run-test", "vm-run", "spike-wayland-ubuntu")
 SUBCOMMANDS = (
+    "check-host",
+    "image-build",
+    "run-test",
+    "vm-run",
+    "image-prune",
+    "spike-wayland-ubuntu",
+)
+# Hidden spike is a mise/python -m command, not a scripts/ shim.
+SHIM_COMMANDS = (
     "check-host",
     "image-build",
     "run-test",
@@ -126,6 +136,18 @@ class CliHelpTests(unittest.TestCase):
             self.assertIn(name, err.getvalue())
             self.assertIn("not implemented", err.getvalue())
 
+    def test_spike_wayland_ubuntu_help_is_not_exit2_stub(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            code = main(["spike-wayland-ubuntu", "--help"])
+        self.assertEqual(code, 0)
+        text = buf.getvalue() + err.getvalue()
+        self.assertIn("spike-wayland-ubuntu", text)
+        self.assertIn("wayland", text.lower())
+        self.assertNotIn("not implemented", text)
+        self.assertNotIn("SystemExit", text)
+
     def test_image_prune_is_not_a_stub(self) -> None:
         import tempfile
 
@@ -194,6 +216,20 @@ class MiseTomlTests(unittest.TestCase):
                     True,
                 )
 
+    def test_spike_wayland_ubuntu_is_hidden_argparse_proxy(self) -> None:
+        task = self.data["tasks"]["spike-wayland-ubuntu"]
+        self.assertIs(task["hide"], True)
+        self.assertIs(task["interactive"], True)
+        self.assertIs(task["raw_args"], True)
+        self.assertEqual(task["depends"], ["check-host"])
+        self.assertNotIn("image-build", task["depends"])
+        self.assertEqual(
+            task["run"],
+            "python -m strataqemu spike-wayland-ubuntu",
+        )
+        self.assertNotIn("SystemExit", task["run"])
+        self.assertNotEqual(task["run"], "python -c 'raise SystemExit(2)'")
+
     def test_bootstrap_gl_package_keys(self) -> None:
         packages = self.data["bootstrap"]["packages"]
         for key in (
@@ -254,7 +290,7 @@ class PyprojectTests(unittest.TestCase):
 
 class ScriptShimTests(unittest.TestCase):
     def test_shims_exec_module_and_do_not_invoke_mise(self) -> None:
-        for name in SUBCOMMANDS:
+        for name in SHIM_COMMANDS:
             path = REPO_ROOT / "scripts" / name
             with self.subTest(name=name):
                 self.assertTrue(path.is_file(), path)
