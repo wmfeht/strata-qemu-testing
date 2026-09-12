@@ -221,3 +221,7 @@ Recipes live in `images/<guest>/`; smoke scripts in `guest-tests/`; the
 host code in `strataqemu/`. Guides for adding a guest, a smoke step, or a
 CLI command are in `.agents/skills/`. Run `mise run test` before opening a
 merge request.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

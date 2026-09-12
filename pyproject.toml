@@ -7,6 +7,7 @@ name = "strataqemu"
 version = "0.1.0"
 description = "Host-side QEMU/KVM workflows for Strata distro-matrix testing"
 readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.11"
 # Host Python deps: stdlib only. SSH is subprocess + OpenSSH, not paramiko.
 
