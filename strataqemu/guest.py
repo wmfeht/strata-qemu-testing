@@ -19,6 +19,8 @@ DIGEST_OPTIONAL_BASENAMES = (
     "greetd-config.toml",
     "hyprland.lua",
     "hyprland.conf",
+    # 3.8.4 has no omarchy-cidata-load; image-build runs this via qemu-ga.
+    "skip-wizard.sh",
 )
 # ISO autoinstall cidata: both JSON files required or the wizard runs.
 ISO_CIDATA_REQUIRED = (

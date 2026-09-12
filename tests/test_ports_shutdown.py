@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import socket
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from strataqemu.ports import (
     BIND_HOST,
@@ -22,6 +24,9 @@ from strataqemu.ports import (
 from strataqemu.qemu import (
     Machine,
     ShutdownHooks,
+    qga_guest_exec,
+    qga_guest_file_write,
+    qga_guest_ping,
     qga_guest_shutdown,
     qmp_system_powerdown,
     run_shutdown,
@@ -354,6 +359,112 @@ class QgaAndQmpProtocolTests(unittest.TestCase):
 
     def test_qga_missing_socket_returns_false(self) -> None:
         self.assertFalse(qga_guest_shutdown("/tmp/no-such-qga.sock"))
+
+    def test_qga_ping_true_on_return(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sock_path = str(Path(td) / "qga.sock")
+            ready = threading.Event()
+
+            def server() -> None:
+                srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                srv.bind(sock_path)
+                srv.listen(1)
+                srv.settimeout(3)
+                ready.set()
+                conn, _ = srv.accept()
+                try:
+                    conn.recv(4096)
+                    conn.sendall(b'{"return": {}}\n')
+                finally:
+                    conn.close()
+                    srv.close()
+
+            thread = threading.Thread(target=server)
+            thread.start()
+            self.assertTrue(ready.wait(3))
+            ok = qga_guest_ping(sock_path)
+            thread.join(3)
+        self.assertTrue(ok)
+
+    def test_qga_exec_polls_status_and_decodes_output(self) -> None:
+        payload = base64.b64encode(b"ok\n").decode("ascii")
+        calls: list[tuple[str, dict | None]] = []
+
+        def fake_execute(
+            _path, command: str, arguments: dict | None = None, timeout: float = 5.0
+        ):
+            del timeout
+            calls.append((command, arguments))
+            if command == "guest-exec":
+                return {"return": {"pid": 42}}
+            if command == "guest-exec-status":
+                return {
+                    "return": {
+                        "exited": True,
+                        "exitcode": 0,
+                        "out-data": payload,
+                    }
+                }
+            return {"return": {}}
+
+        with patch("strataqemu.qemu.qga_execute", side_effect=fake_execute):
+            result = qga_guest_exec("/tmp/qga.sock", "echo ok", timeout=5, poll_s=0.01)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.exitcode, 0)
+        self.assertEqual(result.stdout, "ok\n")
+        self.assertEqual(calls[0][0], "guest-exec")
+        self.assertEqual(calls[0][1]["path"], "/usr/bin/bash")
+        self.assertEqual(calls[0][1]["arg"], ["-lc", "echo ok"])
+        self.assertEqual(calls[1][0], "guest-exec-status")
+        self.assertEqual(calls[1][1]["pid"], 42)
+
+    def test_qga_file_write_open_write_close(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sock_path = str(Path(td) / "qga.sock")
+            received: list[dict] = []
+            ready = threading.Event()
+
+            def _line(conn: socket.socket) -> dict:
+                buf = bytearray()
+                while b"\n" not in buf:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                return json.loads(bytes(buf).split(b"\n", 1)[0])
+
+            def server() -> None:
+                srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                srv.bind(sock_path)
+                srv.listen(1)
+                srv.settimeout(3)
+                ready.set()
+                conn, _ = srv.accept()
+                try:
+                    received.append(_line(conn))
+                    conn.sendall(b'{"return": 7}\n')
+                    received.append(_line(conn))
+                    conn.sendall(b'{"return": {"count": 4}}\n')
+                    received.append(_line(conn))
+                    conn.sendall(b'{"return": {}}\n')
+                finally:
+                    conn.close()
+                    srv.close()
+
+            thread = threading.Thread(target=server)
+            thread.start()
+            self.assertTrue(ready.wait(3))
+            ok = qga_guest_file_write(sock_path, "/root/skip-wizard.sh", b"data")
+            thread.join(3)
+        self.assertTrue(ok)
+        self.assertEqual(received[0]["execute"], "guest-file-open")
+        self.assertEqual(received[0]["arguments"]["path"], "/root/skip-wizard.sh")
+        self.assertEqual(received[1]["execute"], "guest-file-write")
+        self.assertEqual(received[1]["arguments"]["handle"], 7)
+        decoded = base64.b64decode(received[1]["arguments"]["buf-b64"])
+        self.assertEqual(decoded, b"data")
+        self.assertEqual(received[2]["execute"], "guest-file-close")
 
     def test_qga_hangup_after_execute_is_success(self) -> None:
         """Guest often drops the agent before a JSON return."""

@@ -5,11 +5,13 @@ Does not require ``Guest.load`` (PR 4). Callers pass the fields the argv needs.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import socket
 import struct
 import subprocess
+import time
 import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -153,7 +155,8 @@ def build_qemu_argv(
     # pinned at 0x8 so it stays /dev/vda. An unpinned second virtio-blk
     # became vda and the installer died with "Partition is misaligned"
     # on the 4MiB seed. USB (usb=off / UHCI / xhci) does not enumerate
-    # in time for omarchy-cidata-load.
+    # in time for omarchy-cidata-load. 3.8.4 has no cidata-load; image-build
+    # skips the gum wizard over qemu-ga (images/omarchy-3/skip-wizard.sh).
     if install_iso is not None:
         argv.extend(
             [
@@ -198,6 +201,181 @@ def _recv_json_line(sock: socket.socket) -> dict:
 
 def _send_json(sock: socket.socket, payload: dict) -> None:
     sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+
+
+QGA_FILE_WRITE_CHUNK = 48 * 1024
+
+
+def qga_execute(
+    socket_path: Path | str,
+    command: str,
+    arguments: dict | None = None,
+    *,
+    timeout: float = 5.0,
+) -> dict | None:
+    """One qemu-ga command. None on transport / parse failure.
+
+    Unlike QMP, qemu-ga has no capabilities handshake. A JSON ``error``
+    object is returned to the caller, not swallowed.
+    """
+    path = str(Path(socket_path))
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(path)
+            payload: dict = {"execute": command}
+            if arguments:
+                payload["arguments"] = arguments
+            _send_json(sock, payload)
+            return _recv_json_line(sock)
+    except (OSError, json.JSONDecodeError, TimeoutError) as exc:
+        log.debug("qga %s failed: %s", command, exc)
+        return None
+
+
+def qga_guest_ping(socket_path: Path | str, *, timeout: float = 2.0) -> bool:
+    """True when qemu-ga answers ``guest-ping``."""
+    reply = qga_execute(socket_path, "guest-ping", timeout=timeout)
+    if reply is None or "error" in reply:
+        return False
+    return "return" in reply
+
+
+@dataclass(frozen=True)
+class GuestExecResult:
+    """qemu-ga ``guest-exec`` / ``guest-exec-status`` outcome."""
+
+    exitcode: int
+    stdout: str
+    stderr: str
+
+
+def qga_guest_exec(
+    socket_path: Path | str,
+    command: str,
+    *,
+    timeout: float = 60.0,
+    poll_s: float = 0.2,
+) -> GuestExecResult | None:
+    """Run ``bash -lc command`` via qemu-ga. None if the agent never answers."""
+    started = qga_execute(
+        socket_path,
+        "guest-exec",
+        {
+            "path": "/usr/bin/bash",
+            "arg": ["-lc", command],
+            "capture-output": True,
+        },
+        timeout=min(timeout, 15.0),
+    )
+    if started is None or "error" in started:
+        log.debug("qga guest-exec start failed: %s", started)
+        return None
+    try:
+        pid = int(started["return"]["pid"])
+    except (KeyError, TypeError, ValueError):
+        log.debug("qga guest-exec missing pid: %s", started)
+        return None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = qga_execute(
+            socket_path,
+            "guest-exec-status",
+            {"pid": pid},
+            timeout=min(5.0, timeout),
+        )
+        if status is None:
+            time.sleep(poll_s)
+            continue
+        if "error" in status:
+            log.debug("qga guest-exec-status error: %s", status["error"])
+            return None
+        body = status.get("return") or {}
+        if not body.get("exited"):
+            time.sleep(poll_s)
+            continue
+        stdout = base64.b64decode(body.get("out-data") or b"").decode(
+            "utf-8", "replace"
+        )
+        stderr = base64.b64decode(body.get("err-data") or b"").decode(
+            "utf-8", "replace"
+        )
+        code = body.get("exitcode")
+        if not isinstance(code, int):
+            code = 1
+        return GuestExecResult(exitcode=code, stdout=stdout, stderr=stderr)
+    log.debug("qga guest-exec timed out pid=%s cmd=%s", pid, command[:80])
+    return None
+
+
+def qga_guest_file_write(
+    socket_path: Path | str,
+    dest: str,
+    data: bytes,
+    *,
+    timeout: float = 30.0,
+) -> bool:
+    """Write ``data`` to ``dest`` inside the guest. One qemu-ga connection."""
+    path = str(Path(socket_path))
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(path)
+            _send_json(
+                sock,
+                {
+                    "execute": "guest-file-open",
+                    "arguments": {"path": dest, "mode": "w+"},
+                },
+            )
+            opened = _recv_json_line(sock)
+            if "error" in opened:
+                log.debug("qga guest-file-open error: %s", opened["error"])
+                return False
+            handle = opened["return"]
+            try:
+                offset = 0
+                while offset < len(data):
+                    chunk = data[offset : offset + QGA_FILE_WRITE_CHUNK]
+                    _send_json(
+                        sock,
+                        {
+                            "execute": "guest-file-write",
+                            "arguments": {
+                                "handle": handle,
+                                "buf-b64": base64.b64encode(chunk).decode(
+                                    "ascii"
+                                ),
+                            },
+                        },
+                    )
+                    written = _recv_json_line(sock)
+                    if "error" in written:
+                        log.debug(
+                            "qga guest-file-write error: %s", written["error"]
+                        )
+                        return False
+                    count = (written.get("return") or {}).get("count")
+                    if isinstance(count, int) and count > 0:
+                        offset += count
+                    else:
+                        offset += len(chunk)
+            finally:
+                _send_json(
+                    sock,
+                    {
+                        "execute": "guest-file-close",
+                        "arguments": {"handle": handle},
+                    },
+                )
+                try:
+                    _recv_json_line(sock)
+                except (OSError, json.JSONDecodeError, TimeoutError):
+                    pass
+            return True
+    except (OSError, json.JSONDecodeError, TimeoutError, KeyError, TypeError) as exc:
+        log.debug("qga guest-file-write failed: %s", exc)
+        return False
 
 
 def qga_guest_shutdown(socket_path: Path | str, *, timeout: float = 5.0) -> bool:

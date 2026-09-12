@@ -57,11 +57,15 @@ chmod 440 /etc/sudoers.d/tester
 # omarchy sync DBs (omacom/omarchy#10263). install.sh then dies with
 # "target not found" for gst-libav, gst-plugins-good, and gtksourceview5,
 # which the ISO does not ship (it has gtksourceview4). Sync DBs and install
-# those three only. Do not -Syu or omarchy update; that would roll the pin.
+# those three. extra's gst-libav pulls a newer gstreamer than the ISO-pinned
+# gst-plugins-base (exact-version deps). Upgrade installed gstreamer/gst-*
+# in the same transaction. Do not -Syu or omarchy update.
 if [[ ! -f /var/lib/pacman/sync/core.db ]]; then
   pacman -Sy --noconfirm
 fi
-pacman -S --noconfirm --needed gst-libav gst-plugins-good gtksourceview5
+mapfile -t gst_installed < <(pacman -Qq | grep -E '^(gstreamer|gst-)' || true)
+pacman -S --noconfirm --needed \
+  gst-libav gst-plugins-good gtksourceview5 "${gst_installed[@]}"
 
 if ! command -v grim >/dev/null 2>&1; then
   pacman -S --noconfirm --needed grim

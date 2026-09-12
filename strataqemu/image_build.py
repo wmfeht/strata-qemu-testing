@@ -40,8 +40,12 @@ from strataqemu.ports import (
     retry_on_addr_in_use,
 )
 from strataqemu.qemu import (
+    GuestExecResult,
     Machine,
     build_qemu_argv,
+    qga_guest_exec,
+    qga_guest_file_write,
+    qga_guest_ping,
     qmp_screendump,
     uses_iso_autoinstall,
     vnc_framebuffer_png,
@@ -53,6 +57,11 @@ log = logging.getLogger("strataqemu")
 # Noble GDM / cloud-init first boot can exceed boot_timeout_s; wait cloud-init
 # with a separate budget, then setup.sh uses build_timeout_s.
 CLOUD_INIT_TIMEOUT_S = 600
+# 3.8.4 live ISO has qemu-ga but no omarchy-cidata-load. Wait for the agent
+# before skip-wizard.sh stubs the gum configurator.
+OMARCHY3_QGA_TIMEOUT_S = 300
+OMARCHY3_SKIP_WIZARD = "skip-wizard.sh"
+OMARCHY3_SKIP_WIZARD_GUEST_PATH = "/root/skip-wizard.sh"
 # Consecutive pubkey rejects (sshd is up but tester cannot log in). The live
 # ISO wizard answers SSH this way forever if cidata was not loaded. A healthy
 # autoinstall also rejects tester until reboot; qcow2 growth cancels the streak.
@@ -409,6 +418,146 @@ def capture_build_timeout_evidence(machine: Machine) -> None:
         pass
 
 
+def wait_qga(
+    machine: Machine,
+    *,
+    timeout: float,
+    sleep: Callable[[float], None] | None = None,
+    ping: Callable[[Path | str], bool] | None = None,
+    max_attempts: int | None = None,
+) -> None:
+    """Wait until qemu-ga answers ``guest-ping``."""
+    deadline = time.monotonic() + timeout
+    attempts = 0
+    limit = _default_max_attempts(timeout) if max_attempts is None else max_attempts
+    nap = sleep or time.sleep
+    check = ping or qga_guest_ping
+    last = "qemu-ga did not answer guest-ping"
+    while time.monotonic() < deadline:
+        attempts += 1
+        if attempts > limit:
+            capture_build_timeout_evidence(machine)
+            raise TimeoutError(
+                f"qemu-ga not ready after {limit} attempts: {last}"
+            )
+        if machine._proc is not None and machine._proc.poll() is not None:
+            raise ImageBuildError(
+                f"qemu exited {machine._proc.returncode} while waiting for qemu-ga"
+            )
+        try:
+            if check(machine.artifacts.qga_sock):
+                return
+        except (OSError, TypeError) as exc:
+            last = str(exc)
+        nap(SSH_WAIT_SLEEP_S)
+    capture_build_timeout_evidence(machine)
+    raise TimeoutError(f"qemu-ga not ready in {timeout}s: {last}")
+
+
+def _omarchy3_skip_wizard_prepared(blob: str) -> bool:
+    """True when skip-wizard.sh copied cidata / stubbed the configurator."""
+    lowered = blob.lower()
+    for needle in (
+        "patched authorized_keys",
+        "hook already present",
+        "tty1 killed",
+        "omarchy-cidata-load present",
+        "archinstall already running",
+        "already completed",
+        "skip reboot prompt",
+    ):
+        if needle in lowered:
+            return True
+    return False
+
+
+def kick_omarchy3_skip_wizard(
+    machine: Machine,
+    guest: Guest,
+    *,
+    timeout: float = OMARCHY3_QGA_TIMEOUT_S,
+    sleep: Callable[[float], None] | None = None,
+    ping: Callable[[Path | str], bool] | None = None,
+    write_file: Callable[[Path | str, str, bytes], bool] | None = None,
+    exec_cmd: Callable[..., GuestExecResult | None] | None = None,
+) -> None:
+    """3.8.4 never loads cidata. Stub the wizard over qemu-ga and respawn tty1.
+
+    No-op for any guest other than ``omarchy-3``. ``skip-wizard.sh`` itself
+    exits 0 if ``omarchy-cidata-load`` is present.
+    """
+    if guest.id != "omarchy-3":
+        return
+    script = guest.recipe_dir / OMARCHY3_SKIP_WIZARD
+    if not script.is_file():
+        raise ImageBuildError(f"missing {script}")
+    wait_qga(machine, timeout=timeout, sleep=sleep, ping=ping)
+    writer = write_file or qga_guest_file_write
+    if not writer(
+        machine.artifacts.qga_sock,
+        OMARCHY3_SKIP_WIZARD_GUEST_PATH,
+        script.read_bytes(),
+    ):
+        capture_build_timeout_evidence(machine)
+        raise ImageBuildError(
+            "qemu-ga failed to write omarchy-3 skip-wizard.sh"
+        )
+    runner = exec_cmd or qga_guest_exec
+    result = runner(
+        machine.artifacts.qga_sock,
+        f"chmod +x {OMARCHY3_SKIP_WIZARD_GUEST_PATH} "
+        f"&& {OMARCHY3_SKIP_WIZARD_GUEST_PATH}",
+        timeout=60.0,
+    )
+    if result is None:
+        capture_build_timeout_evidence(machine)
+        raise ImageBuildError(
+            "qemu-ga did not run omarchy-3 skip-wizard.sh"
+        )
+    blob = f"{result.stdout}{result.stderr}"
+    prepared = _omarchy3_skip_wizard_prepared(blob)
+    if result.exitcode != 0 and not prepared:
+        capture_build_timeout_evidence(machine)
+        raise ImageBuildError(
+            f"omarchy-3 skip-wizard.sh failed ({result.exitcode}): {blob[-2000:]}"
+        )
+    if result.exitcode != 0:
+        # Patch landed; tty1 kill is best-effort (kill(1) returns 1 when a
+        # pid is already gone, and qemu-ga may report a signal as exit 1).
+        log.info(
+            "omarchy-3 skip-wizard.sh exit %s after patch; killing tty1",
+            result.exitcode,
+        )
+        runner(
+            machine.artifacts.qga_sock,
+            "tty1_pids=$(ps -t tty1 -o pid= 2>/dev/null || true); "
+            "for pid in $tty1_pids; do "
+            '[ "$pid" = 1 ] && continue; '
+            "kill -9 \"$pid\" 2>/dev/null || true; "
+            "done",
+            timeout=15.0,
+        )
+    log.info("omarchy-3: skipped live configurator via qemu-ga")
+
+
+def omarchy_version_ssh_command() -> str:
+    """Remote ``omarchy version``. 4.x is on PATH; 3.x is under ``~/.local``.
+
+    Non-interactive SSH PATH is ``/usr/local/sbin:/usr/local/bin:/usr/bin``.
+    Omarchy 3.8.x installs the CLI at ``~/.local/share/omarchy/bin/omarchy``
+    and ``omarchy-version`` reads ``$OMARCHY_PATH/version`` (empty → ``/version``).
+    """
+    return (
+        "if command -v omarchy >/dev/null 2>&1; then "
+        "omarchy version; "
+        "else "
+        'export OMARCHY_PATH="${OMARCHY_PATH:-$HOME/.local/share/omarchy}"; '
+        'export PATH="$OMARCHY_PATH/bin:$PATH"; '
+        "omarchy version; "
+        "fi"
+    )
+
+
 def wait_iso_autoinstall(
     machine: Machine,
     *,
@@ -481,7 +630,9 @@ def wait_iso_autoinstall(
                 nap(SSH_WAIT_SLEEP_S)
                 continue
         try:
-            proc = _ssh_run(machine, "omarchy version", timeout=15, run=run)
+            proc = _ssh_run(
+                machine, omarchy_version_ssh_command(), timeout=15, run=run
+            )
         except (OSError, subprocess.TimeoutExpired) as exc:
             last = str(exc)
             nap(SSH_WAIT_SLEEP_S)
@@ -859,6 +1010,8 @@ def build_live(
             install_iso=install_iso,
         )
         if iso_autoinstall:
+            if guest.id == "omarchy-3":
+                kick_omarchy3_skip_wizard(machine, guest)
             omarchy_version = wait_iso_autoinstall(
                 machine,
                 major=omarchy_major_for_guest(guest),

@@ -101,12 +101,16 @@ chmod 440 /etc/sudoers.d/tester
 
 # The ISO install uses an offline repo and never fetches core/extra/multilib
 # sync DBs. install.sh then dies with "target not found" for gst-libav,
-# gst-plugins-good, and gtksourceview5. Sync DBs and install those three
-# only. Do not -Syu or omarchy update; that would roll the pin.
+# gst-plugins-good, and gtksourceview5. Sync DBs and install those three.
+# extra's gst-libav pulls a newer gstreamer than the ISO-pinned
+# gst-plugins-base (exact-version deps). Upgrade installed gstreamer/gst-*
+# in the same transaction. Do not -Syu or omarchy update.
 if [[ ! -f /var/lib/pacman/sync/core.db ]]; then
   pacman -Sy --noconfirm
 fi
-pacman -S --noconfirm --needed gst-libav gst-plugins-good gtksourceview5
+mapfile -t gst_installed < <(pacman -Qq | grep -E '^(gstreamer|gst-)' || true)
+pacman -S --noconfirm --needed \
+  gst-libav gst-plugins-good gtksourceview5 "${gst_installed[@]}"
 
 if ! command -v grim >/dev/null 2>&1; then
   pacman -S --noconfirm --needed grim
@@ -132,7 +136,15 @@ else
   systemctl restart sddm.service || systemctl start sddm.service || true
 fi
 
-omarchy version >/var/tmp/strata-omarchy-version.txt 2>&1 || true
+if command -v omarchy >/dev/null 2>&1; then
+  omarchy version >/var/tmp/strata-omarchy-version.txt 2>&1 || true
+elif [[ -x /home/tester/.local/share/omarchy/bin/omarchy ]]; then
+  OMARCHY_PATH=/home/tester/.local/share/omarchy \
+    PATH="/home/tester/.local/share/omarchy/bin:$PATH" \
+    omarchy version >/var/tmp/strata-omarchy-version.txt 2>&1 || true
+else
+  tee /var/tmp/strata-omarchy-version.txt >/dev/null <<<"omarchy not found"
+fi
 pacman -Q >/var/tmp/strata-inventory.txt
 getconf GNU_LIBC_VERSION >/var/tmp/strata-glibc.txt
 pacman -Q gtk4 >/var/tmp/strata-gtk.txt 2>/dev/null \

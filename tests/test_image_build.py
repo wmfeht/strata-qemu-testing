@@ -26,6 +26,7 @@ from strataqemu.image_build import (
     golden_vars_fd,
     inventory_basename,
     inventory_provenance_key,
+    kick_omarchy3_skip_wizard,
     omarchy_major_for_guest,
     omarchy_version_matches_major,
     recipe_files_to_upload,
@@ -34,10 +35,13 @@ from strataqemu.image_build import (
     setup_ssh_command,
     ssh_auth_rejected,
     ssh_not_listening,
+    omarchy_version_ssh_command,
     wait_iso_autoinstall,
+    wait_qga,
     wait_ssh,
     working_qemu_argv,
 )
+from strataqemu.qemu import GuestExecResult
 from strataqemu.qemu import Machine
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -542,11 +546,201 @@ class IsoAutoinstallBuildTests(unittest.TestCase):
         self.assertIn("create_blank_qcow2", src)
         self.assertIn("write_omarchy_cidata_iso", src)
         self.assertIn("wait_iso_autoinstall", src)
+        self.assertIn("kick_omarchy3_skip_wizard", src)
         self.assertIn("golden_vars_fd", src)
         self.assertIn("install_iso", src)
         self.assertIn("omarchy_version", src)
         self.assertIn("setup_ssh_command", src)
         self.assertNotIn("sudo -n bash /tmp/setup.sh", src)
+
+    def test_wait_qga_returns_when_ping_succeeds(self) -> None:
+        pings = {"n": 0}
+
+        def ping(_sock) -> bool:
+            pings["n"] += 1
+            return pings["n"] >= 2
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            machine = Machine(
+                tmp / "working.qcow2",
+                tmp,
+                ssh_port=22022,
+                vnc_port=5901,
+            )
+            wait_qga(
+                machine,
+                timeout=30,
+                sleep=lambda _s: None,
+                ping=ping,
+                max_attempts=5,
+            )
+        self.assertEqual(pings["n"], 2)
+
+    def test_wait_qga_times_out(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            machine = Machine(
+                tmp / "working.qcow2",
+                tmp,
+                ssh_port=22022,
+                vnc_port=5901,
+            )
+            with (
+                patch(
+                    "strataqemu.image_build.vnc_framebuffer_png",
+                    return_value=True,
+                ),
+                patch(
+                    "strataqemu.image_build.qmp_screendump",
+                    return_value=False,
+                ),
+                self.assertRaises(TimeoutError) as ctx,
+            ):
+                wait_qga(
+                    machine,
+                    timeout=30,
+                    sleep=lambda _s: None,
+                    ping=lambda _sock: False,
+                    max_attempts=3,
+                )
+        self.assertIn("qemu-ga", str(ctx.exception).lower())
+
+    def test_kick_omarchy3_writes_and_runs_skip_wizard(self) -> None:
+        written: list[tuple[str, bytes]] = []
+        ran: list[str] = []
+
+        def ping(_sock) -> bool:
+            return True
+
+        def write_file(_sock, dest: str, data: bytes) -> bool:
+            written.append((dest, data))
+            return True
+
+        def exec_cmd(_sock, command: str, timeout: float = 60.0):
+            del timeout
+            ran.append(command)
+            return GuestExecResult(0, "skip-wizard: tty1 killed\n", "")
+
+        guest = load_guest("omarchy-3")
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            machine = Machine(
+                tmp / "working.qcow2",
+                tmp,
+                ssh_port=22022,
+                vnc_port=5901,
+            )
+            kick_omarchy3_skip_wizard(
+                machine,
+                guest,
+                timeout=10,
+                sleep=lambda _s: None,
+                ping=ping,
+                write_file=write_file,
+                exec_cmd=exec_cmd,
+            )
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0][0], "/root/skip-wizard.sh")
+        self.assertIn(b"omarchy-cidata-load", written[0][1])
+        self.assertEqual(len(ran), 1)
+        self.assertIn("/root/skip-wizard.sh", ran[0])
+
+    def test_kick_skip_wizard_is_noop_for_omarchy4(self) -> None:
+        def boom(*_a, **_k):
+            raise AssertionError("omarchy-4 must not skip-wizard")
+
+        guest = load_guest("omarchy-4")
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            machine = Machine(
+                tmp / "working.qcow2",
+                tmp,
+                ssh_port=22022,
+                vnc_port=5901,
+            )
+            kick_omarchy3_skip_wizard(
+                machine,
+                guest,
+                ping=boom,
+                write_file=boom,
+                exec_cmd=boom,
+            )
+
+    def test_kick_omarchy3_fails_when_skip_wizard_exits_nonzero(self) -> None:
+        guest = load_guest("omarchy-3")
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            machine = Machine(
+                tmp / "working.qcow2",
+                tmp,
+                ssh_port=22022,
+                vnc_port=5901,
+            )
+            with (
+                patch(
+                    "strataqemu.image_build.vnc_framebuffer_png",
+                    return_value=True,
+                ),
+                patch(
+                    "strataqemu.image_build.qmp_screendump",
+                    return_value=False,
+                ),
+                self.assertRaises(ImageBuildError) as ctx,
+            ):
+                kick_omarchy3_skip_wizard(
+                    machine,
+                    guest,
+                    timeout=10,
+                    sleep=lambda _s: None,
+                    ping=lambda _sock: True,
+                    write_file=lambda *_a: True,
+                    exec_cmd=lambda *_a, **_k: GuestExecResult(
+                        1, "", "skip-wizard: no cidata label\n"
+                    ),
+                )
+        self.assertIn("skip-wizard", str(ctx.exception).lower())
+        self.assertIn("no cidata label", str(ctx.exception))
+
+    def test_kick_omarchy3_nonzero_after_patch_still_succeeds(self) -> None:
+        ran: list[str] = []
+
+        def exec_cmd(_sock, command: str, timeout: float = 60.0):
+            del timeout
+            ran.append(command)
+            if "chmod" in command:
+                return GuestExecResult(
+                    1, "skip-wizard: patched authorized_keys + sshd\n", ""
+                )
+            return GuestExecResult(0, "", "")
+
+        guest = load_guest("omarchy-3")
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            machine = Machine(
+                tmp / "working.qcow2",
+                tmp,
+                ssh_port=22022,
+                vnc_port=5901,
+            )
+            kick_omarchy3_skip_wizard(
+                machine,
+                guest,
+                timeout=10,
+                sleep=lambda _s: None,
+                ping=lambda _sock: True,
+                write_file=lambda *_a: True,
+                exec_cmd=exec_cmd,
+            )
+        self.assertEqual(len(ran), 2)
+        self.assertIn("skip-wizard.sh", ran[0])
+        self.assertIn("kill -9", ran[1])
+
+    def test_omarchy3_uploads_are_setup_sh_not_skip_wizard(self) -> None:
+        guest = load_guest("omarchy-3")
+        names = {p.name for p in recipe_files_to_upload(guest)}
+        self.assertEqual(names, {"setup.sh"})
+        self.assertTrue((guest.recipe_dir / "skip-wizard.sh").is_file())
 
     def test_omarchy4_setup_ssh_uses_password_sudo_not_n(self) -> None:
         guest = load_guest("omarchy-4")
@@ -940,6 +1134,50 @@ class IsoAutoinstallBuildTests(unittest.TestCase):
         )
         self.assertFalse(omarchy_version_matches_major("wizard hang", 4))
         self.assertTrue(omarchy_version_matches_major("3.8.2", 3))
+
+    def test_omarchy_version_ssh_command_sets_home_bin_and_omarchy_path(self) -> None:
+        cmd = omarchy_version_ssh_command()
+        self.assertIn("command -v omarchy", cmd)
+        self.assertIn("omarchy version", cmd)
+        self.assertIn("$HOME/.local/share/omarchy", cmd)
+        self.assertIn("OMARCHY_PATH", cmd)
+        self.assertIn("$OMARCHY_PATH/bin", cmd)
+
+    def test_wait_iso_autoinstall_accepts_3x_from_home_bin(self) -> None:
+        seen: list[str] = []
+
+        def fake_run(argv, **kwargs):
+            remote = argv[-1]
+            seen.append(remote)
+            if remote == "true":
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return subprocess.CompletedProcess(argv, 0, "3.8.3\n", "")
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "working.qcow2",
+                tmp,
+                ssh_port=22022,
+                vnc_port=5901,
+                identity=identity,
+            )
+            out = wait_iso_autoinstall(
+                machine,
+                major=3,
+                timeout=30,
+                run=fake_run,
+                sleep=lambda _s: None,
+                max_attempts=5,
+            )
+        self.assertIn("3.8.3", out)
+        self.assertIn("true", seen)
+        version_cmds = [c for c in seen if c != "true"]
+        self.assertTrue(version_cmds)
+        self.assertIn("OMARCHY_PATH", version_cmds[0])
+        self.assertIn(".local/share/omarchy", version_cmds[0])
 
     def test_wait_predicate_accepts_3x_rejects_4x_and_wizard(self) -> None:
         self.assertEqual(omarchy_major_for_guest("omarchy-3"), 3)

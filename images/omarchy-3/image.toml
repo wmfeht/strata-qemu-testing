@@ -2,7 +2,8 @@ id = "omarchy-3"
 arch = "x86_64"
 firmware = "uefi"
 source_kind = "iso-autoinstall"
-# Official 3.x pin. Do not follow /latest/.
+# Official 3.x pin. Do not follow /latest/. 3.8.4 has no omarchy-cidata-load;
+# image-build skips the gum wizard via qemu-ga (skip-wizard.sh).
 source_url = "https://iso.omarchy.org/omarchy-3.8.4.iso"
 source_sha256 = "7bc1dc7d98f3d088e57dc06581a494ea441fb15f3edd191360fd1696931bd895"
 disk_gb = 40

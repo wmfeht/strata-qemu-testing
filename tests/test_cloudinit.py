@@ -304,6 +304,10 @@ class Omarchy3CidataTests(unittest.TestCase):
         self.assertNotIn("bootloader_config", data)
         self.assertNotIn("omarchy_install", data)
         self.assertEqual(
+            data["packages"],
+            ["base-devel", "git", "omarchy-keyring", "snapper"],
+        )
+        self.assertEqual(
             data["disk_config"]["device_modifications"][0]["device"],
             "/dev/vda",
         )

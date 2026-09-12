@@ -94,7 +94,9 @@
     },
     "packages": [
         "base-devel",
-        "git"
+        "git",
+        "omarchy-keyring",
+        "snapper"
     ],
     "profile_config": {
         "gfx_driver": null,

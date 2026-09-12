@@ -532,6 +532,8 @@ class Omarchy4RecipeTests(unittest.TestCase):
         self.assertIn("gst-libav", text)
         self.assertIn("gst-plugins-good", text)
         self.assertIn("gtksourceview5", text)
+        self.assertIn("gst_installed", text)
+        self.assertIn("gstreamer|gst-", text)
         self.assertIn("loginctl enable-linger tester", text)
         self.assertIn("sddm", text)
         self.assertIn("Hyprland", text)
@@ -620,6 +622,7 @@ class Omarchy3RecipeTests(unittest.TestCase):
         self.assertFalse(uses_cloud_init_seed(guest.id))
         self.assertTrue((guest.recipe_dir / "bootstrap.sh").is_file())
         self.assertTrue((guest.recipe_dir / "setup.sh").is_file())
+        self.assertTrue((guest.recipe_dir / "skip-wizard.sh").is_file())
         self.assertFalse((guest.recipe_dir / "user-data.yaml.tmpl").exists())
         self.assertFalse((guest.recipe_dir / "install.sh").exists())
         cidata = guest.recipe_dir / "cidata"
@@ -658,6 +661,7 @@ class Omarchy3RecipeTests(unittest.TestCase):
         self.assertIn("image.toml", names)
         self.assertIn("bootstrap.sh", names)
         self.assertIn("setup.sh", names)
+        self.assertIn("skip-wizard.sh", names)
         self.assertIn("user_configuration.json", names)
         self.assertIn("user_credentials.json.tmpl", names)
         self.assertIn("user_encrypt_installation.txt", names)
@@ -691,8 +695,15 @@ class Omarchy3RecipeTests(unittest.TestCase):
         self.assertIn("NOPASSWD: ALL", text)
         self.assertIn("Defaults:tester !authenticate", text)
         self.assertIn("grim", text)
+        self.assertIn("gst-libav", text)
+        self.assertIn("gst-plugins-good", text)
+        self.assertIn("gtksourceview5", text)
         self.assertIn("loginctl enable-linger tester", text)
         self.assertIn("omarchy version", text)
+        self.assertIn("gst_installed", text)
+        self.assertIn("gstreamer|gst-", text)
+        self.assertIn("/home/tester/.local/share/omarchy/bin/omarchy", text)
+        self.assertIn("OMARCHY_PATH", text)
         self.assertIn("Hyprland", text)
         self.assertIn(
             "both SDDM and omarchy-seamless-login.service enabled", text
@@ -723,6 +734,8 @@ class Omarchy3RecipeTests(unittest.TestCase):
         self.assertNotIn("bootloader_config", dump)
         self.assertNotIn("omarchy_install", dump)
         self.assertIn('"bootloader": "Limine"', dump)
+        self.assertIn("omarchy-keyring", dump)
+        self.assertIn("snapper", dump)
         lowered = dump.lower()
         for needle in ("tskey-", "tailscale", "ghp_", "gh auth"):
             self.assertNotIn(needle, lowered)
@@ -748,6 +761,25 @@ class Omarchy3RecipeTests(unittest.TestCase):
             with self.assertRaises(GuestError) as ctx:
                 Guest.load(copy)
             self.assertIn("dated", str(ctx.exception).lower())
+
+    def test_skip_wizard_stubs_configurator_and_respawns_tty1(self) -> None:
+        text = (OMARCHY3 / "skip-wizard.sh").read_text(encoding="utf-8")
+        self.assertIn("omarchy-cidata-load", text)
+        self.assertIn("/dev/disk/by-label/CIDATA", text)
+        self.assertIn("user_configuration.json", text)
+        self.assertIn("authorized_keys", text)
+        self.assertIn("exit 0", text)
+        self.assertIn("/root/configurator", text)
+        self.assertIn("configure_login_for_unencrypted_install", text)
+        self.assertIn("systemctl enable sshd.service", text)
+        self.assertIn("post-install/finished.sh", text)
+        self.assertIn("Reboot Now", text)
+        self.assertIn("OMARCHY_CHROOT_INSTALL", text)
+        self.assertIn("ps -t tty1", text)
+        self.assertIn("kill -9", text)
+        self.assertIn("|| true", text)
+        self.assertNotIn("tailscale", text.lower())
+        self.assertNotIn("omarchy update", text)
 
 
 class MiseBootstrapBoundaryTests(unittest.TestCase):
