@@ -1,0 +1,40 @@
+id = "omarchy-4"
+arch = "x86_64"
+firmware = "uefi"
+source_kind = "iso-autoinstall"
+# Official 4.x pin. Do not follow /latest/.
+source_url = "https://iso.omarchy.org/omarchy-4.0.3.iso"
+source_sha256 = "03d60bc74306dca51f96e1a84b690871d8d606826b260edd0208962da8507d14"
+disk_gb = 40
+memory_mib = 8192
+cpus = 4
+build_timeout_s = 3600
+boot_timeout_s = 180
+ovmf_code = "OVMF_CODE.4m.fd"
+ovmf_vars_template = "OVMF_VARS.4m.fd"
+
+[session]
+kind = "hyprland"
+display_manager = "sddm"
+compositor = "hyprland"
+autologin = true
+wayland = true
+
+[packages]
+manager = "pacman"
+runtime = [
+  "hyprland",
+  "sddm",
+  "xdg-desktop-portal-hyprland",
+  "xdg-desktop-portal",
+  "jq",
+  "grim",
+]
+
+[user]
+name = "tester"
+groups = ["wheel"]
+
+[cidata]
+disk = "/dev/vda"
+encrypt = false
