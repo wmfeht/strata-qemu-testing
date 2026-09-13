@@ -28,7 +28,7 @@ from pathlib import Path
 
 from strataqemu import config
 from strataqemu.guest import Guest
-from strataqemu.qemu import Machine, qmp_screendump, vnc_framebuffer_png
+from strataqemu.qemu import Machine, qmp_screendump, qmp_send_key, vnc_framebuffer_png
 from strataqemu.ssh import scp_command, scp_download_command
 
 log = logging.getLogger("strataqemu")
@@ -42,6 +42,19 @@ DESKTOP_ENTRY_TIMEOUT_S = 10
 VERSION_TIMEOUT_S = 10
 GUEST_SCREENSHOT_REMOTE = "/tmp/strata-window.png"
 GUEST_ARCHIVE_REMOTE = "/tmp/strata-archive.tar.gz"
+ABOUT_VERSION_PNG_NAME = "about-version.png"
+ABOUT_OPEN_SETTLE_S = 0.6
+ABOUT_NAV_SETTLE_S = 0.08
+ABOUT_PAGE_SETTLE_S = 0.5
+ABOUT_INPUT_MISSING_EXIT = 2
+# Sidebar after Ctrl+,: first Tab focuses General (see live Omarchy/GNOME
+# shots); About is the fifth item (General, Keybindings, Theme, Updates,
+# About). Space activates the focused nav button.
+ABOUT_SIDEBAR_TABS = 5
+ABOUT_CLI_ALREADY_RECORDED = "CLI version already recorded"
+ABOUT_INPUT_FAILED = "could not open Settings About (no wtype, hyprctl, or QMP)"
+ABOUT_BEFORE_PNG_NAME = "about-version-before.png"
+ABOUT_AFTER_PNG_NAME = "about-version-after.png"
 SCREENSHOT_TOOL_MISSING = "screenshot tool missing; rebuild the golden"
 GNOME_SCREENSHOT_TIMEOUT_S = 15
 STRATA_BUS_NAME = "io.github.lgse.Strata"
@@ -57,15 +70,18 @@ INSTALL_FROM_RELEASE_STEPS = (
     "version",
     "desktop-entry",
     "window",
+    "about-version",
 )
 UPDATE_FROM_STEPS = (
     "session",
     "install-previous",
     "version-previous",
+    "about-version-before",
     "update",
     "version",
     "desktop-entry",
     "window",
+    "about-version-after",
 )
 OMARCHY_BINDINGS_STEPS = (
     "session",
@@ -206,6 +222,10 @@ def smoke_install_script() -> Path:
 
 def smoke_update_script() -> Path:
     return guest_tests_dir() / "smoke-update.sh"
+
+
+def smoke_about_script() -> Path:
+    return guest_tests_dir() / "smoke-about.sh"
 
 
 def smoke_omarchy_detect_script() -> Path:
@@ -372,6 +392,28 @@ def update_smoke_command(
         parts.append("SMOKE_FORBID_OMARCHY=1")
     parts.append("bash /tmp/smoke-update.sh")
     return " ".join(parts)
+
+
+def about_smoke_command(*, compositor: str) -> str:
+    return (
+        f"SMOKE_COMPOSITOR={shlex.quote(compositor)} "
+        f"SMOKE_ABOUT_TABS={ABOUT_SIDEBAR_TABS} "
+        "bash /tmp/smoke-about.sh"
+    )
+
+
+def qmp_open_about_chords() -> list[list[str]]:
+    """Ctrl+, then Tab × ``ABOUT_SIDEBAR_TABS`` (About), then Space."""
+    return (
+        [["ctrl", "comma"]]
+        + [["tab"] for _ in range(ABOUT_SIDEBAR_TABS)]
+        + [["spc"]]
+    )
+
+
+def qmp_about_nav_chords() -> list[list[str]]:
+    """Tabs and Space after Settings is already open."""
+    return [["tab"] for _ in range(ABOUT_SIDEBAR_TABS)] + [["spc"]]
 
 
 def omarchy_detect_command(
@@ -1305,6 +1347,209 @@ def _desktop_entry_probe_command() -> str:
     return f"test -f {path} && grep -E '^Exec=' {path}"
 
 
+def _ensure_screenshot_tool(
+    machine: Machine,
+    tool: str,
+    *,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+) -> None:
+    which = ssh_run(
+        machine,
+        f"command -v {shlex.quote(tool)}",
+        timeout=15,
+        run=run,
+        commands=commands,
+    )
+    if screenshot_tool_missing(which.returncode):
+        raise SessionSmokeError(SCREENSHOT_TOOL_MISSING)
+
+
+def launch_strata(
+    machine: Machine,
+    env: Mapping[str, str],
+    *,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+) -> None:
+    ssh_run(
+        machine,
+        launch_desktop_entry_command(env),
+        timeout=30,
+        check=True,
+        run=run,
+        commands=commands,
+    )
+
+
+def wait_strata_window(
+    machine: Machine,
+    env: Mapping[str, str],
+    compositor: str,
+    *,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> str:
+    """Wait until Strata's window is up. Returns the oracle name."""
+    if compositor == "Hyprland":
+        wait_hyprland_class(
+            machine,
+            env,
+            timeout=WINDOW_TIMEOUT_S,
+            run=run,
+            commands=commands,
+            sleep=sleep,
+        )
+        return "hyprctl-class"
+    wait_gnome_bus_name(
+        machine,
+        env=env,
+        timeout=WINDOW_TIMEOUT_S,
+        run=run,
+        commands=commands,
+        sleep=sleep,
+    )
+    return "bus-name"
+
+
+def quit_strata(
+    machine: Machine,
+    env: Mapping[str, str],
+    *,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+) -> None:
+    """Stop the running Strata process so a later update can relaunch it."""
+    remote = f"{env_prefix(env)} sh -c 'pkill -x strata || true'"
+    ssh_run(machine, remote, timeout=15, run=run, commands=commands)
+
+
+def _send_qmp_chords(
+    machine: Machine,
+    chords: Sequence[Sequence[str]],
+    *,
+    send_key: Callable[..., bool] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    pause_s: float = 0.05,
+) -> bool:
+    sender = send_key or qmp_send_key
+    nap = sleep or time.sleep
+    sock = machine.artifacts.qmp_sock
+    for chord in chords:
+        if not sender(sock, list(chord)):
+            return False
+        nap(pause_s)
+    return True
+
+
+def run_about_version_step(
+    machine: Machine,
+    *,
+    env: Mapping[str, str],
+    compositor: str,
+    screenshot_dest: Path,
+    cli_version_passed: bool,
+    intended: str,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    send_key: Callable[..., bool] | None = None,
+    name: str = "about-version",
+) -> dict:
+    """Open Settings → About and screenshot. Skip when CLI version already passed."""
+    started = time.monotonic()
+    if cli_version_passed:
+        return {
+            "name": name,
+            "status": "skip",
+            "seconds": round(time.monotonic() - started, 1),
+            "reason": ABOUT_CLI_ALREADY_RECORDED,
+        }
+    recorded = commands if commands is not None else []
+    nap = sleep or time.sleep
+    tool = screenshot_tool_for_compositor(compositor)
+    helper = smoke_about_script()
+    if not helper.is_file():
+        raise SessionSmokeError(f"missing about smoke script {helper}")
+    scp_to_guest(
+        machine, helper, "/tmp/smoke-about.sh", run=run, commands=recorded
+    )
+    about_cmd = about_smoke_command(compositor=compositor)
+    if env:
+        about_cmd = f"{env_prefix(env)} {about_cmd}"
+    proc = ssh_run(
+        machine,
+        about_cmd,
+        timeout=30,
+        check=False,
+        run=run,
+        commands=recorded,
+    )
+    blob = f"{proc.stdout}{proc.stderr}"
+    try:
+        injected = parse_smoke_kv(blob, "INPUT")
+    except SessionSmokeError:
+        injected = ""
+    used = ""
+    if proc.returncode == 0 and injected == "wtype":
+        used = "wtype"
+        nap(ABOUT_PAGE_SETTLE_S)
+    elif proc.returncode == 0 and injected == "hyprctl-open":
+        nap(ABOUT_OPEN_SETTLE_S)
+        if _send_qmp_chords(
+            machine,
+            qmp_about_nav_chords(),
+            send_key=send_key,
+            sleep=sleep,
+            pause_s=ABOUT_NAV_SETTLE_S,
+        ):
+            used = "hyprctl+qmp"
+            nap(ABOUT_PAGE_SETTLE_S)
+    if not used:
+        if _send_qmp_chords(
+            machine, [["ctrl", "comma"]], send_key=send_key, sleep=sleep
+        ):
+            nap(ABOUT_OPEN_SETTLE_S)
+            if _send_qmp_chords(
+                machine,
+                qmp_about_nav_chords(),
+                send_key=send_key,
+                sleep=sleep,
+                pause_s=ABOUT_NAV_SETTLE_S,
+            ):
+                used = "qmp"
+                nap(ABOUT_PAGE_SETTLE_S)
+
+    if not used:
+        return {
+            "name": name,
+            "status": "skip",
+            "seconds": round(time.monotonic() - started, 1),
+            "reason": ABOUT_INPUT_FAILED,
+            "intended": intended,
+        }
+
+    capture_guest_screenshot(
+        machine,
+        env,
+        screenshot_dest,
+        tool=tool,
+        run=run,
+        commands=recorded,
+    )
+    return {
+        "name": name,
+        "status": "pass",
+        "seconds": round(time.monotonic() - started, 1),
+        "oracle": "settings-about",
+        "input": used,
+        "path": str(screenshot_dest),
+        "intended": intended,
+        "nav": f"tab×{ABOUT_SIDEBAR_TABS}+space",
+    }
+
+
 def run_version_oracle(
     machine: Machine,
     *,
@@ -1376,8 +1621,9 @@ def run_install_from_release_steps(
     archive_path: Path | str | None = None,
     intended_version: str | None = None,
     intended_version_fn: Callable[[], str] | None = None,
+    send_key: Callable[..., bool] | None = None,
 ) -> tuple[list[dict], dict]:
-    """session → install → version → desktop-entry → window."""
+    """session → install → version → desktop-entry → window → about-version."""
     if not supports_install_from_release(guest):
         raise SessionSmokeError(
             f"--install-from {install_from} is not implemented for {guest.id}"
@@ -1560,6 +1806,20 @@ def run_install_from_release_steps(
             "oracle": window_oracle,
         }
     )
+    about_dest = screenshot_dest.with_name(ABOUT_VERSION_PNG_NAME)
+    about_step = run_about_version_step(
+        machine,
+        env=env,
+        compositor=compositor,
+        screenshot_dest=about_dest,
+        cli_version_passed=version_step.get("status") == "pass",
+        intended=intended,
+        run=run,
+        commands=recorded,
+        sleep=sleep,
+        send_key=send_key,
+    )
+    steps.append(about_step)
     extras: dict = {
         "install_method": "install.sh",
         "install_sh_sha256": digest,
@@ -1570,6 +1830,8 @@ def run_install_from_release_steps(
         extras["observed_version"] = observed
     if archive_digest is not None:
         extras["archive_sha256"] = archive_digest
+    if about_step.get("status") == "pass":
+        extras["about_version"] = about_step.get("path")
     return steps, extras
 
 
@@ -1587,8 +1849,9 @@ def run_update_from_steps(
     intended_version: str | None = None,
     intended_version_fn: Callable[[], str] | None = None,
     previous_archive: Path | str | None = None,
+    send_key: Callable[..., bool] | None = None,
 ) -> tuple[list[dict], dict]:
-    """session → previous install → version-previous → update → version → desktop → window."""
+    """session → previous → version-previous → update → version → desktop → window → about-version."""
     if not supports_update_from(guest):
         raise SessionSmokeError(UPDATE_FROM_FAIL_CLOSED)
     from_ver = parse_update_from_version(from_version)
@@ -1689,6 +1952,35 @@ def run_update_from_steps(
         name="version-previous",
     )
     steps.append(prev_version_step)
+
+    started = time.monotonic()
+    _ensure_screenshot_tool(machine, tool, run=run, commands=recorded)
+    launch_strata(machine, env, run=run, commands=recorded)
+    wait_strata_window(
+        machine,
+        env,
+        compositor,
+        run=run,
+        commands=recorded,
+        sleep=sleep,
+    )
+    before_dest = screenshot_dest.with_name(ABOUT_BEFORE_PNG_NAME)
+    before_step = run_about_version_step(
+        machine,
+        env=env,
+        compositor=compositor,
+        screenshot_dest=before_dest,
+        cli_version_passed=False,
+        intended=from_ver,
+        run=run,
+        commands=recorded,
+        sleep=sleep,
+        send_key=send_key,
+        name="about-version-before",
+    )
+    steps.append(before_step)
+    quit_strata(machine, env, run=run, commands=recorded)
+    before_step["seconds"] = round(time.monotonic() - started, 1)
 
     started = time.monotonic()
     latest = ssh_run(
@@ -1813,6 +2105,21 @@ def run_update_from_steps(
             "oracle": window_oracle,
         }
     )
+    after_dest = screenshot_dest.with_name(ABOUT_AFTER_PNG_NAME)
+    after_step = run_about_version_step(
+        machine,
+        env=env,
+        compositor=compositor,
+        screenshot_dest=after_dest,
+        cli_version_passed=False,
+        intended=intended,
+        run=run,
+        commands=recorded,
+        sleep=sleep,
+        send_key=send_key,
+        name="about-version-after",
+    )
+    steps.append(after_step)
     extras: dict = {
         "install_method": "install.sh",
         "install_sh_sha256": digest,
@@ -1827,4 +2134,8 @@ def run_update_from_steps(
         extras["observed_version"] = observed
     if archive_digest is not None:
         extras["archive_sha256"] = archive_digest
+    if before_step.get("status") == "pass":
+        extras["about_version_before"] = before_step.get("path")
+    if after_step.get("status") == "pass":
+        extras["about_version_after"] = after_step.get("path")
     return steps, extras

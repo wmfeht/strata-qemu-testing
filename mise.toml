@@ -125,6 +125,14 @@ raw_args = true
 output = "interleave"
 run = "python -m strataqemu vm-run"
 
+[tasks.vm-live]
+description = "Live overlay with tagged or local Strata plus ~/fixtures sample files."
+depends = ["check-host"]
+interactive = true
+raw_args = true
+output = "interleave"
+run = "python -m strataqemu vm-live"
+
 [tasks.image-prune]
 description = "Drop overlays and old run dirs. Never deletes goldens unless --images."
 raw_args = true

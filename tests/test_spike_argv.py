@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from strataqemu.cli import CheckHostResult, main
 from strataqemu.overlay import create_overlay_argv
-from strataqemu.qemu import qmp_screendump
+from strataqemu.qemu import qmp_screendump, qmp_send_key
 from strataqemu.spike import (
     _cloudinit_user_data,
     cidata_xorriso_argv,
@@ -178,6 +178,69 @@ class QmpScreendumpExtraTests(unittest.TestCase):
         self.assertEqual(received[0]["execute"], "qmp_capabilities")
         self.assertEqual(received[1]["execute"], "screendump")
         self.assertFalse(dest.exists() and dest.stat().st_size > 0)
+
+
+class QmpSendKeyTests(unittest.TestCase):
+    def test_send_key_chords_ctrl_comma(self) -> None:
+        import json
+        import socket
+        import threading
+
+        with tempfile.TemporaryDirectory() as td:
+            sock_path = str(Path(td) / "qmp.sock")
+            ready = threading.Event()
+            received: list[dict] = []
+
+            def _line(conn: socket.socket) -> dict:
+                buf = bytearray()
+                while b"\n" not in buf:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                return json.loads(bytes(buf).split(b"\n", 1)[0])
+
+            def server() -> None:
+                srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                srv.bind(sock_path)
+                srv.listen(1)
+                srv.settimeout(3)
+                ready.set()
+                conn, _ = srv.accept()
+                try:
+                    conn.sendall(
+                        b'{"QMP": {"version": {"qemu": {"major": 9}},'
+                        b' "capabilities": []}}\n'
+                    )
+                    received.append(_line(conn))
+                    conn.sendall(b'{"return": {}}\n')
+                    received.append(_line(conn))
+                    conn.sendall(b'{"return": {}}\n')
+                finally:
+                    conn.close()
+                    srv.close()
+
+            thread = threading.Thread(target=server)
+            thread.start()
+            self.assertTrue(ready.wait(3))
+            ok = qmp_send_key(sock_path, ["ctrl", "comma"])
+            thread.join(3)
+        self.assertTrue(ok)
+        self.assertEqual(received[0]["execute"], "qmp_capabilities")
+        self.assertEqual(received[1]["execute"], "send-key")
+        keys = received[1]["arguments"]["keys"]
+        self.assertEqual(
+            keys,
+            [
+                {"type": "qcode", "data": "ctrl"},
+                {"type": "qcode", "data": "comma"},
+            ],
+        )
+
+    def test_missing_socket_returns_false(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            ok = qmp_send_key(Path(td) / "missing.sock", ["ctrl", "comma"])
+        self.assertFalse(ok)
 
 
 if __name__ == "__main__":

@@ -116,7 +116,13 @@ the desktop entry, launches the application, and waits for its window
 screenshot.
 
 The version step is recorded as skipped if `strata --version` does not
-behave like a command-line flag.
+behave like a command-line flag. In that case the run opens
+**Settings → About** (Ctrl+, then Tab × 5 to the About sidebar item,
+then Space) and saves `about-version.png`. `--update-from` captures
+both `about-version-before.png` (seeded previous install) and
+`about-version-after.png` (after `install.sh` to latest). In-guest
+`wtype` is preferred; Hyprland can send Ctrl+, via `hyprctl`; otherwise
+the host sends keys through QEMU `send-key`.
 
 `--install-from` does not probe Omarchy version detection or rewrite
 Hyprland bindings. Use `--omarchy-bindings` for that.
@@ -208,6 +214,28 @@ The `tester` account's password is `foobar` and it has passwordless sudo.
 Changes are discarded when QEMU exits unless `--keep` is given; the golden
 is never modified.
 
+### Live session with Strata installed
+
+```bash
+mise run vm-live -- ubuntu-2404 --from-tag 0.15.0
+mise run vm-live -- ubuntu-2404 --from-local ~/dev/strata/target/release/strata
+mise run vm-live -- arch --from-local ~/Downloads/strata-0.16.0-x86_64-unknown-linux-gnu.tar.gz
+```
+
+Like `vm-run`, but waits for the autologin Wayland session, installs
+Strata, seeds `~/fixtures` with sample files (documents, a PNG, a zip,
+nested dirs, a symlink, a hidden file), and launches Strata on that
+directory. A GTK/SDL window is the default; pass `--headless` for SSH
+only.
+
+`--from-tag VERSION` downloads that GitHub release inside the guest
+(`0.15.0` or `v0.15.0`). `--from-local PATH` copies a host binary, a
+release tarball, or a checkout that contains `target/release/strata`.
+Exactly one of `--from-tag` or `--from-local` is required.
+
+`vm-live` never builds a golden. If one is missing it tells you to run
+`image-build` first.
+
 ## Cleaning up
 
 ```bash
@@ -257,6 +285,7 @@ the command.
 | `mise run run-test -- <guest> --update-from VERSION [--keep]` | Seed a previous release, then run current `install.sh` to latest. |
 | `mise run run-test -- omarchy-3\|omarchy-4 --omarchy-bindings [--keep]` | Probe Omarchy detection and Hyprland bindings (optional `STRATA_QEMU_INSTALL_SH`). |
 | `mise run vm-run -- <guest> [--graphical] [--keep]` | Interactive throwaway overlay. |
+| `mise run vm-live -- <guest> (--from-tag VERSION \| --from-local PATH) [--headless] [--keep]` | Live overlay with Strata installed and `~/fixtures` sample files. |
 | `mise run image-prune [-- --images]` | Delete run directories (and goldens). |
 | `mise run test` | Host unit tests. |
 

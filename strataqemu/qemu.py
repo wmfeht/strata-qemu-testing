@@ -13,7 +13,7 @@ import struct
 import subprocess
 import time
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -432,6 +432,35 @@ def _qmp_execute(
     except (OSError, json.JSONDecodeError, TimeoutError) as exc:
         log.debug("qmp %s failed: %s", command, exc)
         return None
+
+
+def qmp_send_key(
+    socket_path: Path | str,
+    keys: Sequence[str],
+    *,
+    hold_ms: int = 100,
+    timeout: float = 5.0,
+) -> bool:
+    """QMP ``send-key``. ``keys`` are qcodes (``ctrl``, ``comma``, ``a``).
+
+    QEMU presses them in order and releases in reverse, so ``ctrl``+``comma``
+    is a chord. False on transport or QMP error; does not raise.
+    """
+    if not keys:
+        return False
+    arguments = {
+        "keys": [{"type": "qcode", "data": str(key)} for key in keys],
+        "hold-time": int(hold_ms),
+    }
+    reply = _qmp_execute(
+        socket_path, "send-key", arguments, timeout=timeout
+    )
+    if reply is None:
+        return False
+    if "error" in reply:
+        log.debug("qmp send-key error: %s", reply["error"])
+        return False
+    return True
 
 
 def qmp_system_powerdown(socket_path: Path | str, *, timeout: float = 5.0) -> bool:

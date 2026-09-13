@@ -29,6 +29,7 @@ SMOKE_SESSION = REPO_ROOT / "guest-tests" / "smoke-session.sh"
 SMOKE_DESKTOP = REPO_ROOT / "guest-tests" / "smoke-desktop.sh"
 SMOKE_INSTALL = REPO_ROOT / "guest-tests" / "smoke-install.sh"
 SMOKE_UPDATE = REPO_ROOT / "guest-tests" / "smoke-update.sh"
+SMOKE_ABOUT = REPO_ROOT / "guest-tests" / "smoke-about.sh"
 SMOKE_OMARCHY_DETECT = REPO_ROOT / "guest-tests" / "smoke-omarchy-detect.sh"
 SMOKE_OMARCHY_BINDINGS = REPO_ROOT / "guest-tests" / "smoke-omarchy-bindings.sh"
 FIXTURE_PR743 = REPO_ROOT / "tests" / "fixtures" / "omarchy-detect" / "install-pr743.sh"
@@ -927,6 +928,106 @@ class SmokeUpdateScriptTests(unittest.TestCase):
         self.assertNotIn("| bash", body)
         self.assertNotIn("curl |", body)
         self.assertIn("sha256sum --check", body)
+
+
+class SmokeAboutScriptTests(unittest.TestCase):
+    def test_script_is_executable(self) -> None:
+        self.assertTrue(SMOKE_ABOUT.is_file())
+        self.assertTrue(os.access(SMOKE_ABOUT, os.X_OK))
+
+    def test_wtype_opens_settings_and_types_version(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        bindir = tmp / "bin"
+        bindir.mkdir()
+        record = tmp / "wtype-argv"
+        wtype = bindir / "wtype"
+        wtype.write_text(
+            "#!/bin/bash\n"
+            "printf '%s\\n' \"$*\" >> \"${WTYPE_RECORD:?}\"\n",
+            encoding="utf-8",
+        )
+        wtype.chmod(wtype.stat().st_mode | stat.S_IXUSR)
+        sleep = shutil.which("sleep")
+        self.assertIsNotNone(sleep)
+        assert sleep is not None
+        os.symlink(sleep, bindir / "sleep")
+        env = os.environ.copy()
+        env["PATH"] = str(bindir)
+        env["WTYPE_RECORD"] = str(record)
+        env["SMOKE_COMPOSITOR"] = "gnome-shell"
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        assert bash is not None
+        proc = subprocess.run(
+            [bash, str(SMOKE_ABOUT)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertEqual(parse_smoke_kv(proc.stdout, "INPUT"), "wtype")
+        lines = record.read_text(encoding="utf-8").splitlines()
+        self.assertTrue(any("comma" in line for line in lines))
+        self.assertGreaterEqual(sum(1 for line in lines if "Tab" in line), 5)
+        self.assertTrue(any("space" in line.lower() for line in lines))
+        self.assertFalse(any(line.strip() == "version" for line in lines))
+
+    def test_hyprland_without_wtype_reports_hyprctl_open(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        bindir = tmp / "bin"
+        bindir.mkdir()
+        record = tmp / "hyprctl-argv"
+        hyprctl = bindir / "hyprctl"
+        hyprctl.write_text(
+            "#!/bin/bash\n"
+            "printf '%s\\n' \"$*\" >> \"${HYPRCTL_RECORD:?}\"\n",
+            encoding="utf-8",
+        )
+        hyprctl.chmod(hyprctl.stat().st_mode | stat.S_IXUSR)
+        env = os.environ.copy()
+        env["PATH"] = str(bindir)
+        env["HYPRCTL_RECORD"] = str(record)
+        env["SMOKE_COMPOSITOR"] = "Hyprland"
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        assert bash is not None
+        proc = subprocess.run(
+            [bash, str(SMOKE_ABOUT)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertEqual(parse_smoke_kv(proc.stdout, "INPUT"), "hyprctl-open")
+        blob = record.read_text(encoding="utf-8")
+        self.assertIn("sendshortcut", blob)
+        self.assertIn("CTRL, comma", blob)
+        self.assertIn("io.github.lgse.Strata", blob)
+
+    def test_missing_input_tool_exits_two(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        bindir = tmp / "bin"
+        bindir.mkdir()
+        env = os.environ.copy()
+        env["PATH"] = str(bindir)
+        env["SMOKE_COMPOSITOR"] = "gnome-shell"
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        assert bash is not None
+        proc = subprocess.run(
+            [bash, str(SMOKE_ABOUT)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(parse_smoke_kv(proc.stdout, "INPUT"), "missing")
 
 
 if __name__ == "__main__":

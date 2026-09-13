@@ -334,26 +334,30 @@ def _prepare_overlay(
     return overlay, ovmf_vars
 
 
+_USAGE_LINES = {
+    "vm-run": "usage: python -m strataqemu vm-run [--graphical] [--keep] <guest>",
+    "vm-live": (
+        "usage: python -m strataqemu vm-live "
+        "(--from-tag VERSION | --from-local PATH) "
+        "[--graphical] [--headless] [--keep] <guest>"
+    ),
+    "run-test": (
+        "usage: python -m strataqemu run-test "
+        "[--session-only | --install-from release | "
+        "--install-from local-archive PATH | --omarchy-bindings | "
+        "--update-from VERSION] "
+        "[--keep] <guest>"
+    ),
+}
+
+
 def _load_or_usage(guest_id: str | None, command: str) -> Guest | int:
     if not guest_id:
         print(
             f"{command}: guest id is required (e.g. ubuntu-2404)",
             file=sys.stderr,
         )
-        if command == "vm-run":
-            print(
-                "usage: python -m strataqemu vm-run [--graphical] [--keep] <guest>",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                "usage: python -m strataqemu run-test "
-                "[--session-only | --install-from release | "
-                "--install-from local-archive PATH | --omarchy-bindings | "
-                "--update-from VERSION] "
-                "[--keep] <guest>",
-                file=sys.stderr,
-            )
+        print(_USAGE_LINES.get(command, _USAGE_LINES["run-test"]), file=sys.stderr)
         return 2
     try:
         return load_guest(guest_id)

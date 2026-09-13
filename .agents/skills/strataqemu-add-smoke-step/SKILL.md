@@ -22,8 +22,8 @@ first.
 | Flow | Function | Steps today |
 | --- | --- | --- |
 | `--session-only` | `run_session_only_steps` | `session`, `screenshot` |
-| `--install-from` | `run_install_from_release_steps` | `session`, `install`, `version`, `desktop-entry`, `window` |
-| `--update-from` | `run_update_from_steps` | `session`, `install-previous`, `version-previous`, `update`, `version`, `desktop-entry`, `window` |
+| `--install-from` | `run_install_from_release_steps` | `session`, `install`, `version`, `desktop-entry`, `window`, `about-version` |
+| `--update-from` | `run_update_from_steps` | `session`, `install-previous`, `version-previous`, `about-version-before`, `update`, `version`, `desktop-entry`, `window`, `about-version-after` |
 | `--omarchy-bindings` | `run_omarchy_bindings_steps` | `session`, `omarchy-detect`, `omarchy-bindings`, `screenshot` |
 
 `--omarchy-bindings` is Omarchy-only and exclusive with the other flows.

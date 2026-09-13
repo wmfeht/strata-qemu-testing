@@ -141,6 +141,8 @@ class _FakeRun:
                 f"BINDINGS_KIND={kind}\nBINDINGS_PATH=/home/tester/.config/hypr/bindings.{kind}\n",
                 "",
             )
+        if "smoke-about.sh" in remote:
+            return subprocess.CompletedProcess(argv, 0, "INPUT=wtype\n", "")
         if "smoke-update.sh" in remote:
             digest = "ab" * 32
             if "SMOKE_UPDATE_PHASE=previous" in remote:
@@ -672,6 +674,19 @@ class HelpAndMiseTests(unittest.TestCase):
         self.assertIn("--keep", text)
         self.assertNotIn("not implemented", text)
         self.assertNotIn("--maintain", text)
+
+    def test_vm_live_help_has_from_tag_and_from_local(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            code = main(["vm-live", "--help"])
+        self.assertEqual(code, 0)
+        text = buf.getvalue() + err.getvalue()
+        self.assertIn("--from-tag", text)
+        self.assertIn("--from-local", text)
+        self.assertIn("--headless", text)
+        self.assertIn("--keep", text)
+        self.assertNotIn("not implemented", text)
 
 
 class ArchInstallFromTests(unittest.TestCase):

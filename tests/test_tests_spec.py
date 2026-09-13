@@ -34,6 +34,11 @@ from strataqemu.tests_spec import (
     UPDATE_FROM_MISSING_VERSION,
     UPDATE_FROM_SAME_AS_LATEST,
     UPDATE_FROM_STEPS,
+    ABOUT_AFTER_PNG_NAME,
+    ABOUT_BEFORE_PNG_NAME,
+    ABOUT_CLI_ALREADY_RECORDED,
+    ABOUT_SIDEBAR_TABS,
+    ABOUT_VERSION_PNG_NAME,
     assert_session_only_commands,
     capture_guest_screenshot,
     command_is_forbidden_for_session_only,
@@ -70,7 +75,12 @@ from strataqemu.tests_spec import (
     smoke_omarchy_bindings_script,
     smoke_omarchy_detect_script,
     smoke_session_script,
+    smoke_about_script,
     smoke_update_script,
+    about_smoke_command,
+    qmp_about_nav_chords,
+    qmp_open_about_chords,
+    run_about_version_step,
     strata_version_is_cli,
     supports_install_from_release,
     supports_update_from,
@@ -113,6 +123,8 @@ class _FakeRun:
         self._version_i = 0
         self.from_version = "0.15.0"
         self.detected_major = "4"
+        self.about_code = 0
+        self.about_stdout = "INPUT=wtype\n"
 
     def _version_reply(self) -> str:
         value = self.version_stdout
@@ -173,6 +185,8 @@ class _FakeRun:
             return _completed(0)
         if " grim " in f" {remote} " or remote.strip().startswith("grim "):
             return _completed(0)
+        if "smoke-about.sh" in remote:
+            return _completed(self.about_code, stdout=self.about_stdout)
         if "smoke-update.sh" in remote:
             if "SMOKE_UPDATE_PHASE=previous" in remote:
                 return _completed(
@@ -426,6 +440,8 @@ class SessionOnlyDriveTests(unittest.TestCase):
         self.assertTrue(os.access(smoke_install_script(), os.X_OK))
         self.assertTrue(smoke_update_script().is_file())
         self.assertTrue(os.access(smoke_update_script(), os.X_OK))
+        self.assertTrue(smoke_about_script().is_file())
+        self.assertTrue(os.access(smoke_about_script(), os.X_OK))
         desktop = smoke_desktop_script().read_text(encoding="utf-8")
         self.assertIn("NameHasOwner", desktop)
         self.assertIn("grim", desktop)
@@ -1326,6 +1342,10 @@ class UpdateFromStepsTests(unittest.TestCase):
                 self.assertEqual(extras["observed_previous_version"], from_version)
                 self.assertEqual(extras["observed_version"], latest)
                 self.assertEqual(extras["install_method"], "install.sh")
+                self.assertIn("about_version_before", extras)
+                self.assertIn("about_version_after", extras)
+                self.assertTrue(extras["about_version_before"].endswith(ABOUT_BEFORE_PNG_NAME))
+                self.assertTrue(extras["about_version_after"].endswith(ABOUT_AFTER_PNG_NAME))
                 prev = [s for s in steps if s["name"] == "version-previous"][0]
                 self.assertEqual(prev["status"], "pass")
                 self.assertEqual(prev["observed"], from_version)
@@ -1433,6 +1453,171 @@ class UpdateFromStepsTests(unittest.TestCase):
         self.assertIn("version mismatch", str(ctx.exception))
         self.assertIn("0.16.0", str(ctx.exception))
         self.assertIn("0.15.0", str(ctx.exception))
+
+
+class AboutVersionTests(unittest.TestCase):
+    def test_sidebar_nav_is_five_tabs_then_space(self) -> None:
+        self.assertEqual(ABOUT_SIDEBAR_TABS, 5)
+        chords = qmp_open_about_chords()
+        self.assertEqual(chords[0], ["ctrl", "comma"])
+        self.assertEqual(chords[1:-1], [["tab"]] * ABOUT_SIDEBAR_TABS)
+        self.assertEqual(chords[-1], ["spc"])
+        self.assertEqual(
+            qmp_about_nav_chords(),
+            [["tab"]] * ABOUT_SIDEBAR_TABS + [["spc"]],
+        )
+        remote = about_smoke_command(compositor="Hyprland")
+        self.assertIn("SMOKE_COMPOSITOR=Hyprland", remote)
+        self.assertIn("SMOKE_ABOUT_TABS=5", remote)
+
+    def test_skips_when_cli_version_already_recorded(self) -> None:
+        fake = _FakeRun()
+        sent: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2", tmp, ssh_port=22022, identity=identity
+            )
+            step = run_about_version_step(
+                machine,
+                env={"WAYLAND_DISPLAY": "wayland-0"},
+                compositor="gnome-shell",
+                screenshot_dest=tmp / ABOUT_VERSION_PNG_NAME,
+                cli_version_passed=True,
+                intended="0.16.0",
+                run=fake,
+                send_key=lambda *_a, **_k: sent.append(["x"]) or True,
+            )
+        self.assertEqual(step["status"], "skip")
+        self.assertEqual(step["reason"], ABOUT_CLI_ALREADY_RECORDED)
+        self.assertEqual(sent, [])
+        self.assertFalse(any("smoke-about.sh" in c for c in fake.remote))
+
+    def test_wtype_path_screenshots_about_page(self) -> None:
+        fake = _FakeRun()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2", tmp, ssh_port=22022, identity=identity
+            )
+            dest = tmp / ABOUT_VERSION_PNG_NAME
+            step = run_about_version_step(
+                machine,
+                env={"WAYLAND_DISPLAY": "wayland-0"},
+                compositor="gnome-shell",
+                screenshot_dest=dest,
+                cli_version_passed=False,
+                intended="0.16.0",
+                run=fake,
+                sleep=lambda _s: None,
+                send_key=lambda *_a, **_k: False,
+            )
+            self.assertEqual(step["status"], "pass")
+            self.assertEqual(step["oracle"], "settings-about")
+            self.assertEqual(step["input"], "wtype")
+            self.assertEqual(step["intended"], "0.16.0")
+            self.assertTrue(dest.is_file())
+            blob = "\n".join(fake.remote)
+            self.assertIn("smoke-about.sh", blob)
+            self.assertIn("gnome-screenshot", blob)
+
+    def test_qmp_fallback_tabs_to_about_when_guest_has_no_wtype(self) -> None:
+        fake = _FakeRun()
+        fake.about_code = 2
+        fake.about_stdout = "INPUT=missing\n"
+        sent: list[list[str]] = []
+
+        def send_key(_sock, keys, **_kwargs):
+            sent.append(list(keys))
+            return True
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2", tmp, ssh_port=22022, identity=identity
+            )
+            dest = tmp / ABOUT_VERSION_PNG_NAME
+            step = run_about_version_step(
+                machine,
+                env={"WAYLAND_DISPLAY": "wayland-0", "HYPRLAND_INSTANCE_SIGNATURE": "s"},
+                compositor="Hyprland",
+                screenshot_dest=dest,
+                cli_version_passed=False,
+                intended="0.15.0",
+                run=fake,
+                sleep=lambda _s: None,
+                send_key=send_key,
+            )
+        self.assertEqual(step["status"], "pass")
+        self.assertEqual(step["input"], "qmp")
+        self.assertEqual(sent[0], ["ctrl", "comma"])
+        self.assertEqual(sent.count(["tab"]), ABOUT_SIDEBAR_TABS)
+        self.assertEqual(sent[-1], ["spc"])
+        self.assertNotIn(["v"], sent)
+        blob = "\n".join(fake.remote)
+        self.assertIn("grim", blob)
+
+    def test_install_from_skips_about_when_cli_version_passes(self) -> None:
+        fake = _FakeRun()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2", tmp, ssh_port=22022, identity=identity
+            )
+            steps, extras = run_install_from_release_steps(
+                machine,
+                guest=load_guest("ubuntu-2404"),
+                screenshot_dest=tmp / "screenshot.png",
+                session_timeout=5,
+                run=fake,
+                sleep=lambda _s: None,
+                intended_version="0.9.0",
+            )
+        names = [s["name"] for s in steps]
+        self.assertEqual(names, list(INSTALL_FROM_RELEASE_STEPS))
+        about = [s for s in steps if s["name"] == "about-version"][0]
+        self.assertEqual(about["status"], "skip")
+        self.assertEqual(about["reason"], ABOUT_CLI_ALREADY_RECORDED)
+        self.assertNotIn("about_version", extras)
+        self.assertFalse(any("smoke-about.sh" in c for c in fake.remote))
+
+    def test_install_from_uses_about_when_cli_version_skips(self) -> None:
+        fake = _FakeRun()
+        fake.version_stdout = "Gtk-Message: Failed to open display\n"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            identity = tmp / "id"
+            identity.write_text("k", encoding="utf-8")
+            machine = Machine(
+                tmp / "overlay.qcow2",
+                tmp,
+                ssh_port=22022,
+                identity=identity,
+            )
+            steps, extras = run_install_from_release_steps(
+                machine,
+                guest=load_guest("omarchy-4"),
+                screenshot_dest=tmp / "screenshot.png",
+                session_timeout=5,
+                run=fake,
+                sleep=lambda _s: None,
+                intended_version="0.9.0",
+            )
+        version = [s for s in steps if s["name"] == "version"][0]
+        about = [s for s in steps if s["name"] == "about-version"][0]
+        self.assertEqual(version["status"], "skip")
+        self.assertEqual(about["status"], "pass")
+        self.assertEqual(about["oracle"], "settings-about")
+        self.assertIn("about_version", extras)
+        self.assertTrue(any("smoke-about.sh" in c for c in fake.remote))
 
 
 if __name__ == "__main__":
