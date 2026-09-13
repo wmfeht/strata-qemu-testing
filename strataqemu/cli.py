@@ -1,4 +1,4 @@
-"""Argparse CLI: check-host, image-build, run-test, vm-run, image-prune, spike."""
+"""Argparse CLI: check-host, image-build, run-test, vm-run, vm-live, image-prune, spike."""
 
 from __future__ import annotations
 
@@ -316,6 +316,15 @@ def build_parser() -> argparse.ArgumentParser:
             "uploads a host install.sh instead of curling main."
         ),
     )
+    run_test.add_argument(
+        "--update-from",
+        metavar="VERSION",
+        help=(
+            "Install a previous Strata release (e.g. 0.15.0), then run current "
+            "install.sh to update to latest. Override the default previous-version "
+            "list with STRATA_QEMU_UPDATE_FROM (comma-separated)."
+        ),
+    )
 
     vm_run = sub.add_parser(
         "vm-run",
@@ -328,6 +337,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Open a GTK/SDL window instead of running headless",
     )
     vm_run.add_argument(
+        "--keep",
+        action="store_true",
+        help="Keep the run directory after QEMU exits",
+    )
+
+    vm_live = sub.add_parser(
+        "vm-live",
+        help=(
+            "Boot a live overlay, install a tagged or local Strata, "
+            "and seed ~/fixtures with sample files"
+        ),
+        description=(
+            "Boot a throwaway overlay, install Strata from a GitHub release "
+            "tag or a host binary/archive, seed ~/fixtures with sample files, "
+            "and leave a live QEMU session running."
+        ),
+    )
+    vm_live.add_argument("guest", nargs="?", help="Guest id")
+    vm_live_source = vm_live.add_mutually_exclusive_group()
+    vm_live_source.add_argument(
+        "--from-tag",
+        metavar="VERSION",
+        help="Install a GitHub release tag (e.g. 0.15.0)",
+    )
+    vm_live_source.add_argument(
+        "--from-local",
+        metavar="PATH",
+        help=(
+            "Install a host binary, a release tarball, or a checkout "
+            "containing target/release/strata"
+        ),
+    )
+    vm_live.add_argument(
+        "--graphical",
+        action="store_true",
+        help="Open a GTK/SDL window (default)",
+    )
+    vm_live.add_argument(
+        "--headless",
+        action="store_true",
+        help="No GTK/SDL window; SSH only",
+    )
+    vm_live.add_argument(
         "--keep",
         action="store_true",
         help="Keep the run directory after QEMU exits",
@@ -467,6 +519,7 @@ def main(argv: list[str] | None = None) -> int:
             archive_path=archive_path,
             keep=args.keep,
             omarchy_bindings=args.omarchy_bindings,
+            update_from=args.update_from,
         )
 
     if args.command == "vm-run":
@@ -475,6 +528,30 @@ def main(argv: list[str] | None = None) -> int:
         return run_vm_run(
             args.guest,
             graphical=args.graphical,
+            keep=args.keep,
+        )
+
+    if args.command == "vm-live":
+        from strataqemu.vm_live import run_vm_live
+
+        if args.graphical and args.headless:
+            print(
+                "vm-live: --graphical and --headless cannot be combined",
+                file=sys.stderr,
+            )
+            print(
+                "usage: python -m strataqemu vm-live "
+                "(--from-tag VERSION | --from-local PATH) "
+                "[--graphical] [--headless] [--keep] <guest>",
+                file=sys.stderr,
+            )
+            return 2
+
+        return run_vm_live(
+            args.guest,
+            from_tag=args.from_tag,
+            from_local=args.from_local,
+            graphical=not args.headless,
             keep=args.keep,
         )
 

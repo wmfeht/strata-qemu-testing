@@ -27,12 +27,15 @@ from strataqemu.run_test import (
     vm_run_qemu_argv,
 )
 from strataqemu.tests_spec import (
+    DEFAULT_UPDATE_FROM_VERSIONS,
     INSTALL_FROM_FAIL_CLOSED,
     INSTALL_SH_MISSING_PATH,
     LOCAL_ARCHIVE_MISSING_PATH,
     OMARCHY_BINDINGS_EXCLUSIVE,
     OMARCHY_BINDINGS_FAIL_CLOSED,
     OMARCHY_BINDINGS_STEPS,
+    UPDATE_FROM_EXCLUSIVE,
+    UPDATE_FROM_STEPS,
     missing_golden_message,
     sha256_file,
 )
@@ -72,6 +75,19 @@ class _DummyProc:
 class _FakeRun:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
+        self.version_stdout: str | list[str] = "0.9.0\n"
+        self._version_i = 0
+        self.from_version = "0.15.0"
+
+    def _version_reply(self) -> str:
+        value = self.version_stdout
+        if isinstance(value, list):
+            if not value:
+                return "0.9.0\n"
+            idx = min(self._version_i, len(value) - 1)
+            self._version_i += 1
+            return value[idx]
+        return value
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
@@ -125,6 +141,20 @@ class _FakeRun:
                 f"BINDINGS_KIND={kind}\nBINDINGS_PATH=/home/tester/.config/hypr/bindings.{kind}\n",
                 "",
             )
+        if "smoke-about.sh" in remote:
+            return subprocess.CompletedProcess(argv, 0, "INPUT=wtype\n", "")
+        if "smoke-update.sh" in remote:
+            digest = "ab" * 32
+            if "SMOKE_UPDATE_PHASE=previous" in remote:
+                return subprocess.CompletedProcess(
+                    argv, 0, f"FROM_VERSION={self.from_version}\n", ""
+                )
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                f"INSTALL_SH_SHA256={digest}\nInstalled Strata v9.9.9\n",
+                "",
+            )
         if "smoke-install.sh" in remote or "install-arch.sh" in remote:
             digest = "ab" * 32
             return subprocess.CompletedProcess(
@@ -138,7 +168,7 @@ class _FakeRun:
                 argv, 0, "Exec=/home/tester/.local/bin/strata %U\n", ""
             )
         if "--version" in remote and "strata" in remote:
-            return subprocess.CompletedProcess(argv, 0, "0.9.0\n", "")
+            return subprocess.CompletedProcess(argv, 0, self._version_reply(), "")
         if "gtk-launch" in remote or "gio launch" in remote:
             return subprocess.CompletedProcess(argv, 0, "", "")
         if "hyprctl clients" in remote:
@@ -630,6 +660,7 @@ class HelpAndMiseTests(unittest.TestCase):
         self.assertIn("release", text)
         self.assertIn("local-archive", text)
         self.assertIn("--omarchy-bindings", text)
+        self.assertIn("--update-from", text)
         self.assertNotIn("not implemented", text)
 
     def test_vm_run_help_has_graphical(self) -> None:
@@ -643,6 +674,19 @@ class HelpAndMiseTests(unittest.TestCase):
         self.assertIn("--keep", text)
         self.assertNotIn("not implemented", text)
         self.assertNotIn("--maintain", text)
+
+    def test_vm_live_help_has_from_tag_and_from_local(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            code = main(["vm-live", "--help"])
+        self.assertEqual(code, 0)
+        text = buf.getvalue() + err.getvalue()
+        self.assertIn("--from-tag", text)
+        self.assertIn("--from-local", text)
+        self.assertIn("--headless", text)
+        self.assertIn("--keep", text)
+        self.assertNotIn("not implemented", text)
 
 
 class ArchInstallFromTests(unittest.TestCase):
@@ -1149,6 +1193,191 @@ class ArchInstallFromTests(unittest.TestCase):
         self.assertIn(OMARCHY_BINDINGS_EXCLUSIVE, err.getvalue())
         popen.assert_not_called()
         run.assert_not_called()
+
+    def test_update_from_exclusive_with_install_from(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with (
+            redirect_stdout(buf),
+            redirect_stderr(err),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+            patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+        ):
+            code = main(
+                [
+                    "run-test",
+                    "--",
+                    "ubuntu-2404",
+                    "--update-from",
+                    "0.15.0",
+                    "--install-from",
+                    "release",
+                ]
+            )
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertIn(UPDATE_FROM_EXCLUSIVE, err.getvalue())
+        popen.assert_not_called()
+        run.assert_not_called()
+
+    def test_update_from_exclusive_with_session_only(self) -> None:
+        err = io.StringIO()
+        with (
+            redirect_stderr(err),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+            patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+        ):
+            code = main(
+                [
+                    "run-test",
+                    "--",
+                    "arch",
+                    "--session-only",
+                    "--update-from",
+                    "0.15.0",
+                ]
+            )
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertIn(UPDATE_FROM_EXCLUSIVE, err.getvalue())
+        popen.assert_not_called()
+        run.assert_not_called()
+
+    def test_update_from_missing_version_fail_closed_no_qemu(self) -> None:
+        err = io.StringIO()
+        with (
+            redirect_stderr(err),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+            patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+        ):
+            code = main(["run-test", "--", "ubuntu-2404", "--update-from"])
+        self.assertNotEqual(code, 0)
+        text = err.getvalue()
+        self.assertTrue(
+            "update-from" in text.lower() or "VERSION" in text or "required" in text.lower()
+        )
+        popen.assert_not_called()
+        run.assert_not_called()
+
+    def test_update_from_junk_version_fail_closed_no_qemu(self) -> None:
+        err = io.StringIO()
+        with (
+            redirect_stderr(err),
+            patch("subprocess.Popen", side_effect=_refuse_qemu_system) as popen,
+            patch("subprocess.run", side_effect=_refuse_qemu_system) as run,
+        ):
+            code = main(
+                ["run-test", "--", "ubuntu-2404", "--update-from", "latest"]
+            )
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertIn("not a Strata release tag", err.getvalue())
+        popen.assert_not_called()
+        run.assert_not_called()
+
+    def test_update_from_missing_golden_twice(self) -> None:
+        msg = missing_golden_message("ubuntu-2404")
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "empty-cache"
+            cache.mkdir()
+            old = os.environ.get(config.CACHE_ENV)
+            os.environ[config.CACHE_ENV] = str(cache)
+            texts = []
+            try:
+                for _ in range(2):
+                    err = io.StringIO()
+                    with (
+                        redirect_stderr(err),
+                        patch(
+                            "subprocess.Popen", side_effect=_refuse_qemu_system
+                        ) as popen,
+                        patch(
+                            "subprocess.run", side_effect=_refuse_qemu_system
+                        ) as run,
+                        patch("strataqemu.image_build.run_image_build") as build,
+                    ):
+                        code = main(
+                            [
+                                "run-test",
+                                "--",
+                                "ubuntu-2404",
+                                "--update-from",
+                                DEFAULT_UPDATE_FROM_VERSIONS[0],
+                            ]
+                        )
+                    self.assertEqual(code, 1)
+                    texts.append(err.getvalue())
+                    self.assertIn(msg, err.getvalue())
+                    popen.assert_not_called()
+                    run.assert_not_called()
+                    build.assert_not_called()
+            finally:
+                if old is None:
+                    os.environ.pop(config.CACHE_ENV, None)
+                else:
+                    os.environ[config.CACHE_ENV] = old
+        self.assertEqual(texts[0], texts[1])
+
+    def test_update_from_records_previous_and_latest_versions(self) -> None:
+        fake = _FakeRun()
+        from_version = DEFAULT_UPDATE_FROM_VERSIONS[0]
+        fake.from_version = from_version
+        fake.version_stdout = [f"{from_version}\n", "0.16.0\n"]
+        recorded_argv: list[list[str]] = []
+
+        def popen(argv, **kwargs):
+            name = Path(str(argv[0])).name if argv else ""
+            if name.startswith("qemu-system"):
+                recorded_argv.append(list(argv))
+                return _DummyProc()
+            raise AssertionError(f"unexpected Popen: {argv}")
+
+        def fake_overlay(golden, overlay, **kwargs):
+            dest = Path(overlay)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"overlay")
+            return dest
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cache, golden = _cache_with_golden(tmp, "ubuntu-2404")
+            host = _host_ok(tmp)
+            buf = io.StringIO()
+            err = io.StringIO()
+            with (
+                redirect_stdout(buf),
+                redirect_stderr(err),
+                patch.object(Machine, "shutdown", return_value="kill"),
+                patch(
+                    "strataqemu.tests_spec.qmp_screendump", return_value=False
+                ),
+            ):
+                code = run_run_test(
+                    "ubuntu-2404",
+                    update_from=from_version,
+                    keep=True,
+                    cache_dir=cache,
+                    check_host_fn=lambda: host,
+                    run=fake,
+                    popen=popen,
+                    create_overlay_fn=fake_overlay,
+                    settle_s=0,
+                    intended_version="0.16.0",
+                )
+            self.assertEqual(code, 0, err.getvalue())
+            self.assertIn(f"update-from {from_version} ok", buf.getvalue())
+            blob = " ".join(str(c) for c in fake.calls)
+            self.assertIn("smoke-update.sh", blob)
+            self.assertIn("SMOKE_UPDATE_PHASE=previous", blob)
+            self.assertIn("SMOKE_UPDATE_PHASE=latest", blob)
+            self.assertNotIn("smoke-install.sh", blob)
+            result_files = list((cache / "runs").glob("*/result.json"))
+            self.assertTrue(result_files)
+            text = result_files[0].read_text(encoding="utf-8")
+            for name in UPDATE_FROM_STEPS:
+                self.assertIn(f'"name": "{name}"', text)
+            self.assertIn(from_version, text)
+            self.assertIn("0.16.0", text)
+            self.assertIn("from_version", text)
+            self.assertIn("observed_previous_version", text)
+            del golden
 
     def test_ubuntu_install_from_release_records_gnome_bus_and_version(self) -> None:
         fake = _FakeRun()

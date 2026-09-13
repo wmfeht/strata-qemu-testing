@@ -32,15 +32,23 @@ ARGPARSE_PROXY_TASKS = (
     "image-build",
     "run-test",
     "vm-run",
+    "vm-live",
     "image-prune",
     "spike-wayland-ubuntu",
 )
-QEMU_TASKS = ("image-build", "run-test", "vm-run", "spike-wayland-ubuntu")
+QEMU_TASKS = (
+    "image-build",
+    "run-test",
+    "vm-run",
+    "vm-live",
+    "spike-wayland-ubuntu",
+)
 SUBCOMMANDS = (
     "check-host",
     "image-build",
     "run-test",
     "vm-run",
+    "vm-live",
     "image-prune",
     "spike-wayland-ubuntu",
 )
@@ -50,6 +58,7 @@ SHIM_COMMANDS = (
     "image-build",
     "run-test",
     "vm-run",
+    "vm-live",
     "image-prune",
 )
 
@@ -141,6 +150,82 @@ class CliHelpTests(unittest.TestCase):
             self.assertNotIn("not implemented", text)
             self.assertNotIn("SystemExit", text)
 
+    def test_vm_live_help_names_sources(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            code = main(["vm-live", "--help"])
+        self.assertEqual(code, 0)
+        text = buf.getvalue() + err.getvalue()
+        self.assertIn("--from-tag", text)
+        self.assertIn("--from-local", text)
+        self.assertIn("--headless", text)
+        self.assertIn("--keep", text)
+        self.assertIn("fixtures", text.lower())
+        self.assertNotIn("not implemented", text)
+
+    def test_vm_live_from_tag_binds_version(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            ["vm-live", "ubuntu-2404", "--from-tag", "0.15.0"]
+        )
+        self.assertEqual(args.command, "vm-live")
+        self.assertEqual(args.from_tag, "0.15.0")
+        self.assertIsNone(args.from_local)
+        self.assertFalse(args.headless)
+
+    def test_vm_live_from_local_binds_path(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            ["vm-live", "arch", "--from-local", "/tmp/strata"]
+        )
+        self.assertEqual(args.from_local, "/tmp/strata")
+        self.assertIsNone(args.from_tag)
+
+    def test_vm_live_from_tag_and_from_local_rejected(self) -> None:
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = main(
+                [
+                    "vm-live",
+                    "ubuntu-2404",
+                    "--from-tag",
+                    "0.15.0",
+                    "--from-local",
+                    "/tmp/strata",
+                ]
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("not allowed", err.getvalue().lower())
+
+    def test_vm_live_graphical_and_headless_rejected(self) -> None:
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = main(
+                [
+                    "vm-live",
+                    "ubuntu-2404",
+                    "--from-tag",
+                    "0.15.0",
+                    "--graphical",
+                    "--headless",
+                ]
+            )
+        self.assertEqual(code, 2)
+        text = err.getvalue()
+        self.assertIn("--graphical", text)
+        self.assertIn("--headless", text)
+
+    def test_vm_live_without_guest_is_not_stub(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            code = main(["vm-live", "--from-tag", "0.15.0"])
+        self.assertEqual(code, 2)
+        text = buf.getvalue() + err.getvalue()
+        self.assertNotIn("not implemented", text)
+        self.assertIn("guest", text.lower())
+
     def test_run_test_help_includes_omarchy_bindings(self) -> None:
         buf = io.StringIO()
         err = io.StringIO()
@@ -149,6 +234,25 @@ class CliHelpTests(unittest.TestCase):
         self.assertEqual(code, 0)
         text = buf.getvalue() + err.getvalue()
         self.assertIn("--omarchy-bindings", text)
+
+    def test_run_test_help_includes_update_from(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            code = main(["run-test", "--help"])
+        self.assertEqual(code, 0)
+        text = buf.getvalue() + err.getvalue()
+        self.assertIn("--update-from", text)
+        self.assertIn("STRATA_QEMU_UPDATE_FROM", text)
+
+    def test_update_from_binds_version(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            ["run-test", "ubuntu-2404", "--update-from", "0.15.0"]
+        )
+        self.assertEqual(args.update_from, "0.15.0")
+        self.assertFalse(args.session_only)
+        self.assertIsNone(args.install_from)
 
     def test_install_from_local_archive_binds_path(self) -> None:
         parser = build_parser()

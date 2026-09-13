@@ -35,7 +35,9 @@ strataqemu/               host-side Python package
   overlay.py              qcow2 overlay creation, OVMF vars copy, cache prune
   image_build.py          golden build pipeline
   run_test.py             run-test and vm-run
-  tests_spec.py           smoke steps (session, screenshot, install, version, window)
+  vm_live.py              vm-live (tagged/local install + sample fixtures)
+  sample_tree.py          host-generated ~/fixtures tree for vm-live
+  tests_spec.py           smoke steps (session, screenshot, install, update-from, version, window)
   session.py              pure loginctl/runtime-dir parsing (used by the spike)
   spike.py                hidden spike-wayland-ubuntu command
 images/<guest>/           one recipe directory per guest
@@ -50,15 +52,16 @@ keys/README.md            explains the generated SSH key; nothing else is commit
 
 `mise.toml` defines the tasks; each forwards raw argv to
 `python -m strataqemu <command>`. Tasks that spawn QEMU are
-`interactive = true`. `run-test` and `vm-run` depend only on `check-host`;
+`interactive = true`. `run-test`, `vm-run`, and `vm-live` depend only on `check-host`;
 nothing builds a golden implicitly.
 
 | Task | Command | What it does |
 | --- | --- | --- |
 | `check-host` | `check-host` | Host capability check. Generates the SSH key on first success. |
 | `image-build` | `image-build [--force] <guest>` | Build or reuse a golden. Prints the golden path. |
-| `run-test` | `run-test <guest> (--session-only \| --install-from release \| --install-from local-archive PATH \| --omarchy-bindings) [--keep]` | Boot an overlay and run smokes. |
+| `run-test` | `run-test <guest> (--session-only \| --install-from release \| --install-from local-archive PATH \| --omarchy-bindings \| --update-from VERSION) [--keep]` | Boot an overlay and run smokes. |
 | `vm-run` | `vm-run [--graphical] [--keep] <guest>` | Interactive throwaway overlay. |
+| `vm-live` | `vm-live (--from-tag VERSION \| --from-local PATH) [--graphical] [--headless] [--keep] <guest>` | Interactive overlay with Strata installed and `~/fixtures` sample files. |
 | `image-prune` | `image-prune [--images]` | Delete run dirs; with `--images` also goldens. Never `keys/`. |
 | `test` | `python -m unittest discover -s tests -t .` | Host unit tests. |
 | `spike-wayland-ubuntu` (hidden) | `spike-wayland-ubuntu [--keep]` | Ad-hoc Noble session spike; predates the recipe system. |
@@ -81,6 +84,7 @@ $CACHE/images/<id>.json               provenance
 $CACHE/runs/<UTC stamp>-<id>-build/   image-build working dir (deleted on success)
 $CACHE/runs/<UTC stamp>-<id>/         run-test run dir
 $CACHE/runs/<UTC stamp>-<id>-vm/      vm-run run dir (deleted on success unless --keep)
+$CACHE/runs/<UTC stamp>-<id>-live/    vm-live run dir (deleted on success unless --keep)
 ```
 
 Per-run files (`artifacts.RunArtifacts`): `overlay.qcow2`, `OVMF_VARS.fd`,
@@ -107,7 +111,7 @@ command. Checks, in order:
 
 On success it generates `$CACHE/keys/id_ed25519` with `ssh-keygen -t
 ed25519 -N ""` if missing, and returns the OVMF path and key path for the
-callers (`image-build`, `run-test`, `vm-run`, spike).
+callers (`image-build`, `run-test`, `vm-run`, `vm-live`, spike).
 
 The check is injectable (`CheckHostEnv`) so unit tests never probe the
 real machine.
@@ -186,9 +190,9 @@ One builder produces every argv. Fixed parts:
 
 Variants:
 
-- Headless (image-build, run-test, vm-run default):
+- Headless (image-build, run-test, vm-run default, `vm-live --headless`):
   `-device virtio-gpu-gl-pci -display egl-headless,gl=on -vnc 127.0.0.1:<display>`.
-- Graphical (`vm-run --graphical`): `-device virtio-vga-gl -display gtk,gl=on`
+- Graphical (`vm-run --graphical`, `vm-live` default): `-device virtio-vga-gl -display gtk,gl=on`
   (or `sdl` when QEMU's `-display help` lacks gtk). No VNC.
 - UEFI: two `if=pflash` drives, code read-only, vars a per-run copy.
 - Cloud-init seed: `virtio-scsi-pci` + `scsi-cd` with the NoCloud ISO.
@@ -302,10 +306,13 @@ machine down and exits 130. Timeouts inside the wait loops capture
 
 Argument validation happens before anything touches the cache:
 
-- Exactly one of `--session-only`, `--install-from`, or
-  `--omarchy-bindings` is required.
+- Exactly one of `--session-only`, `--install-from`, `--omarchy-bindings`,
+  or `--update-from VERSION` is required.
 - `--omarchy-bindings` is Omarchy-only (`omarchy-3`, `omarchy-4`) and
-  cannot be combined with the other two flows.
+  cannot be combined with the other flows.
+- `--update-from` is exclusive with the other three. VERSION is a previous
+  release tag (`0.15.0` or `v0.15.0`). The default previous-version list is
+  `0.15.0,0.14.0`; override with `STRATA_QEMU_UPDATE_FROM`.
 - `--install-from local-archive` requires an existing host path;
   `--install-from release` refuses a path.
 - `--omarchy-bindings` optionally uploads `STRATA_QEMU_INSTALL_SH`
@@ -326,7 +333,8 @@ Then:
 4. Run steps (see below). Each step records `name`, `status`, `seconds`,
    and step-specific fields into `result.json`.
 5. On success print `run-test: session ok (<id>)`, `run-test: ok (<id>)`,
-   or `run-test: omarchy-bindings ok (<id>)` and the screenshot path, shut
+   `run-test: update-from VERSION ok (<id>)`, or
+   `run-test: omarchy-bindings ok (<id>)` and the screenshot path, shut
    down, delete the overlay, vars copy, and sockets (unless `--keep`), and
    print `run dir: <path>`. Logs, `result.json`, and screenshots stay.
 6. On failure record `error` and the recorded guest commands in
@@ -370,7 +378,8 @@ present. Budget 180 s.
 **version**: run `~/.local/bin/strata --version` with a 10 s timeout. If
 the first line looks like a version, it must equal the intended version.
 If the command times out or does not print a version, the step is recorded
-as `skip` with reason "strata --version is not a CLI".
+as `skip` with reason "strata --version is not a CLI". The About page
+screenshot (`about-version`) is the visual fallback in that case.
 
 **desktop-entry**: `~/.local/share/applications/io.github.lgse.Strata.desktop`
 exists and its `Exec=` points at `~/.local/bin/strata`.
@@ -382,13 +391,45 @@ Hyprland, or `gdbus ... NameHasOwner io.github.lgse.Strata` on GNOME. A
 screenshot is taken whether or not the window appeared; the step then
 fails if the oracle timed out.
 
+**about-version**: when `version` skipped, drive Settings → About and
+screenshot `about-version.png`. Ctrl+, opens Settings (General is
+focused after the first Tab). Four more Tabs reach About; Space
+activates it. Input: in-guest `wtype` (full sequence), else Hyprland
+`hyprctl` for Ctrl+, plus QMP Tab×5+Space, else the whole sequence via
+QMP. Skipped with "CLI version already recorded" when `--version`
+worked, or when no input path succeeded.
+
+On `--update-from`, About is captured twice: `about-version-before.png`
+on the seeded previous install (then Strata is quit so the binary can
+be replaced) and `about-version-after.png` after the latest install.
+
 `result.json` for install runs also records `install_method`,
 `install_sh_sha256`, `intended_version`, `observed_version` (when the
-version step passed), and `archive_sha256` (for `local-archive`).
+version step passed), `about_version` (path, when the About screenshot
+passed), and `archive_sha256` (for `local-archive`).
 
-`--install-from` on Omarchy guests is the same five-step sequence as on
+`--install-from` on Omarchy guests is the same sequence as on
 GNOME/Arch. It does not run Omarchy detection or rewrite Hyprland
 bindings.
+
+**update-from** (`--update-from VERSION`): same guests as `--install-from`.
+Resolve latest from GitHub `/releases/latest` (or an injected intended
+version). Fail closed if VERSION equals latest. Upload
+`guest-tests/smoke-update.sh`. Steps: session → install-previous (download
+the GitHub archive for VERSION, or a host-uploaded tarball, extract, install
+the binary and desktop entry) → version-previous (`strata --version` must
+match VERSION) → update (move the previous binary aside because
+`install.sh --non-interactive` refuses an existing `~/.local/bin/strata`,
+then run current `install.sh` with the same flags as `--install-from`) →
+about-version-before → update → version (must match latest) →
+desktop-entry → window → about-version-after.
+
+`result.json` for this flow records `from_version`, `intended_version`,
+`observed_previous_version` (when the previous version step passed),
+`observed_version` (when the latest version step passed), and
+`install_sh_sha256`. The default VERSION list is
+`DEFAULT_UPDATE_FROM_VERSIONS` (`0.15.0`, `0.14.0`); override with
+`STRATA_QEMU_UPDATE_FROM`.
 
 **omarchy-detect** (`--omarchy-bindings`): upload
 `guest-tests/smoke-omarchy-detect.sh` and a staged `install.sh`. The
@@ -415,6 +456,37 @@ terminal's stdio so GTK/SDL and Ctrl-C work. Prints
 the run dir is deleted unless `--keep`; on error it is kept. There is no
 "maintain" mode: the golden is never opened for writing.
 
+## vm-live (`vm_live.run_vm_live`)
+
+Same golden/overlay/host checks as `vm-run`. Exactly one of `--from-tag
+VERSION` or `--from-local PATH` is required. Graphical GTK/SDL is the
+default (`--headless` for SSH only). After SSH is up:
+
+1. Wait for the autologin Wayland session (`smoke-session.sh`).
+2. Install Strata:
+   - `--from-tag`: `smoke-update.sh` previous phase downloads the GitHub
+     archive for that tag and installs the binary plus desktop entry.
+   - `--from-local` tarball: upload the archive and run the same previous
+     phase with `UPDATE_FROM_ARCHIVE`.
+   - `--from-local` binary (or a checkout containing `strata` /
+     `target/release/strata`): `scp` the binary and a generated desktop
+     file into `~/.local`.
+3. Generate a sample tree on the host (`sample_tree.py`: documents, a
+   1×1 PNG, a zip, nested dirs, a symlink, a hidden file, a name with
+   spaces), upload it, and extract to `$HOME/fixtures`.
+4. If `pacman` is present and `gtk4` is not, install Strata's Arch
+   runtime packages (`install.sh` `REQUIRED_PACKAGES`). Tagged/local
+   installs copy a binary and skip `install.sh`; the arch golden has no
+   GTK, while Omarchy and GNOME guests already do.
+5. Launch Strata on `$HOME/fixtures`. Hyprland 0.55+ (arch) uses
+   `hyprctl dispatch 'hl.dsp.exec_cmd("…")'` — legacy
+   `hyprctl dispatch exec PATH` is parsed as Lua and dies on `.local`.
+   Falls back to `hl.exec_cmd` then `nohup`. GNOME uses `nohup`.
+
+Prints `vm-live: <id> ssh_port=<port>`, the install source, and the
+fixtures path, then waits for QEMU to exit. Run-dir lifetime matches
+`vm-run`. Never builds a golden.
+
 ## image-prune (`overlay.prune`)
 
 `shutil.rmtree($CACHE/runs)`; with `--images`, also `$CACHE/images`.
@@ -425,6 +497,10 @@ the run dir is deleted unless `--keep`; on error it is kept. There is no
 - `guest-tests/smoke-session.sh`: session selection and env export, as
   described above.
 - `guest-tests/smoke-install.sh`: `install.sh` download, digest, and run.
+- `guest-tests/smoke-update.sh`: seed a previous GitHub release, then run
+  current `install.sh` to latest. Phases `previous` / `latest` / `all`.
+- `guest-tests/smoke-about.sh`: Ctrl+, then Tab × 5 and Space to open
+  About (`wtype`, or Hyprland `hyprctl sendshortcut` for the chord).
 - `guest-tests/smoke-omarchy-detect.sh`: source a staged `install.sh` and
   print `DETECTED_MAJOR=` for live / token / fake-command cases
   (lgse/strata#743). Used only by `--omarchy-bindings`.
@@ -451,7 +527,7 @@ raise if a QEMU binary is invoked. Coverage includes the CLI and
 `check-host` (injected env), argv builders, overlay argv, port allocation,
 the shutdown cascade, QMP/qemu-ga/VNC protocol helpers over local
 sockets, recipe loading and digests for every guest, seed rendering and
-validation, `run-test`/`vm-run` wiring with fake SSH responders, and the
+validation, `run-test`/`vm-run`/`vm-live` wiring with fake SSH responders, and the
 guest shell smokes driven by fake `loginctl`, `busctl`, `pgrep`, `gdbus`,
 `hyprctl`, `grim`, and `gnome-screenshot` on `PATH`.
 

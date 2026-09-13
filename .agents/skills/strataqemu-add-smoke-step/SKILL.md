@@ -22,11 +22,16 @@ first.
 | Flow | Function | Steps today |
 | --- | --- | --- |
 | `--session-only` | `run_session_only_steps` | `session`, `screenshot` |
-| `--install-from` | `run_install_from_release_steps` | `session`, `install`, `version`, `desktop-entry`, `window` |
+| `--install-from` | `run_install_from_release_steps` | `session`, `install`, `version`, `desktop-entry`, `window`, `about-version` |
+| `--update-from` | `run_update_from_steps` | `session`, `install-previous`, `version-previous`, `about-version-before`, `update`, `version`, `desktop-entry`, `window`, `about-version-after` |
 | `--omarchy-bindings` | `run_omarchy_bindings_steps` | `session`, `omarchy-detect`, `omarchy-bindings`, `screenshot` |
 
-`--omarchy-bindings` is Omarchy-only and exclusive with the other two.
-Do not add detect/bindings oracles to `--install-from`.
+`--omarchy-bindings` is Omarchy-only and exclusive with the other flows.
+`--update-from` is exclusive with the other three. Do not add
+detect/bindings oracles to `--install-from` or `--update-from`.
+Previous versions for `--update-from` live in `DEFAULT_UPDATE_FROM_VERSIONS`
+and `STRATA_QEMU_UPDATE_FROM`; do not hardcode a single from-version in
+tests that are meant to cover the matrix.
 
 Each flow receives a `Machine`, an injectable `run` callable (the fake
 `subprocess.run` in tests), and a `commands` list that records every
@@ -90,7 +95,8 @@ If the step belongs to `--omarchy-bindings`, add it to
 flow must not install or launch Strata.
 
 Update `SESSION_ONLY_STEPS` / `INSTALL_FROM_RELEASE_STEPS` /
-`OMARCHY_BINDINGS_STEPS` when adding a step name; tests assert on them.
+`UPDATE_FROM_STEPS` / `OMARCHY_BINDINGS_STEPS` when adding a step name;
+tests assert on them.
 
 ## Guest-side scripts
 
@@ -125,10 +131,10 @@ Branch on `compositor_process_name(guest)` returning `"gnome-shell"` or
 ## Wiring into run_test.py
 
 `run_run_test` calls the matching step function
-(`run_session_only_steps`, `run_install_from_release_steps`, or
-`run_omarchy_bindings_steps`) and merges the returned `steps` list and
-`extras` dict into `result.json`. Add new top-level result keys through
-`extras`, not by editing `run_run_test`.
+(`run_session_only_steps`, `run_install_from_release_steps`,
+`run_update_from_steps`, or `run_omarchy_bindings_steps`) and merges the
+returned `steps` list and `extras` dict into `result.json`. Add new
+top-level result keys through `extras`, not by editing `run_run_test`.
 
 ## Tests
 
