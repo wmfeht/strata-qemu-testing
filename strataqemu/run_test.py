@@ -44,6 +44,9 @@ from strataqemu.tests_spec import (
     OMARCHY_BINDINGS_FAIL_CLOSED,
     SESSION_TIMEOUT_S,
     SessionSmokeError,
+    LUKS_HOTPLUG_EXCLUSIVE,
+    LUKS_HOTPLUG_FAIL_CLOSED,
+    LUKS_HOTPLUG_MISSING_PATH,
     UDISKIE_UNLOCK_EXCLUSIVE,
     UDISKIE_UNLOCK_FAIL_CLOSED,
     UDISKIE_UNLOCK_FIXTURE_MISSING,
@@ -53,11 +56,13 @@ from strataqemu.tests_spec import (
     missing_golden_message,
     parse_update_from_version,
     run_install_from_release_steps,
+    run_luks_hotplug_steps,
     run_omarchy_bindings_steps,
     run_session_only_steps,
     run_udiskie_unlock_steps,
     run_update_from_steps,
     supports_install_from_release,
+    supports_luks_hotplug,
     supports_omarchy_bindings,
     supports_udiskie_unlock,
     supports_update_from,
@@ -132,6 +137,7 @@ def run_test_qemu_argv(
     memory_mib: int,
     ovmf_code: Path | str | None = None,
     ovmf_vars: Path | str | None = None,
+    hotplug_port: bool = False,
 ) -> list[str]:
     """Frozen test display stack on a throwaway overlay (``cache=unsafe``)."""
     return build_qemu_argv(
@@ -145,6 +151,7 @@ def run_test_qemu_argv(
         disk_cache="unsafe",
         ovmf_code=ovmf_code,
         ovmf_vars=ovmf_vars,
+        hotplug_port=hotplug_port,
     )
 
 
@@ -211,6 +218,7 @@ def _spawn_overlay_vm(
     popen: PopenFn | None = None,
     settle_s: float = SETTLE_S,
     inherit_stdio: bool = False,
+    hotplug_port: bool = False,
 ) -> Machine:
     arts = artifacts.RunArtifacts(run_dir)
     launcher = popen or subprocess.Popen
@@ -243,6 +251,7 @@ def _spawn_overlay_vm(
                 memory_mib=guest.memory_mib,
                 ovmf_code=ovmf_code,
                 ovmf_vars=ovmf_vars,
+                hotplug_port=hotplug_port,
             )
         log.debug("qemu argv: %s", " ".join(argv))
         popen_kwargs: dict = {}
@@ -351,7 +360,7 @@ _USAGE_LINES = {
         "usage: python -m strataqemu run-test "
         "[--session-only | --install-from release | "
         "--install-from local-archive PATH | --omarchy-bindings | "
-        "--update-from VERSION | --udiskie-unlock] "
+        "--update-from VERSION | --udiskie-unlock | --luks-hotplug PATH] "
         "[--keep] <guest>"
     ),
 }
@@ -391,6 +400,9 @@ def run_run_test(
     omarchy_bindings: bool = False,
     update_from: str | None = None,
     udiskie_unlock: bool = False,
+    luks_hotplug: Path | str | None = None,
+    create_luks_fn: Callable[[Path], Path] | None = None,
+    hotplug_fn: Callable[[Path], bool] | None = None,
 ) -> int:
     """CLI body for ``run-test``. Never calls ``image-build``."""
     loaded = _load_or_usage(guest_id, "run-test")
@@ -398,8 +410,13 @@ def run_run_test(
         return loaded
     guest = loaded
 
+    luks_requested = luks_hotplug is not None
     if udiskie_unlock and (
-        session_only or install_from or omarchy_bindings or update_from
+        session_only
+        or install_from
+        or omarchy_bindings
+        or update_from
+        or luks_requested
     ):
         print(UDISKIE_UNLOCK_EXCLUSIVE, file=sys.stderr)
         return 2
@@ -407,7 +424,11 @@ def run_run_test(
         print(UDISKIE_UNLOCK_FAIL_CLOSED, file=sys.stderr)
         return 2
     if omarchy_bindings and (
-        session_only or install_from or update_from or udiskie_unlock
+        session_only
+        or install_from
+        or update_from
+        or udiskie_unlock
+        or luks_requested
     ):
         print(OMARCHY_BINDINGS_EXCLUSIVE, file=sys.stderr)
         return 2
@@ -415,10 +436,32 @@ def run_run_test(
         print(OMARCHY_BINDINGS_FAIL_CLOSED, file=sys.stderr)
         return 2
     if update_from and (
-        session_only or install_from or omarchy_bindings or udiskie_unlock
+        session_only
+        or install_from
+        or omarchy_bindings
+        or udiskie_unlock
+        or luks_requested
     ):
         print(UPDATE_FROM_EXCLUSIVE, file=sys.stderr)
         return 2
+    if luks_requested and (
+        session_only or install_from or omarchy_bindings or update_from or udiskie_unlock
+    ):
+        print(LUKS_HOTPLUG_EXCLUSIVE, file=sys.stderr)
+        return 2
+    if luks_requested and not supports_luks_hotplug(guest):
+        print(LUKS_HOTPLUG_FAIL_CLOSED, file=sys.stderr)
+        return 2
+    luks_local: Path | None = None
+    if luks_requested:
+        text = str(luks_hotplug).strip()
+        if not text:
+            print(LUKS_HOTPLUG_MISSING_PATH, file=sys.stderr)
+            return 2
+        luks_local = Path(text).expanduser()
+        if not luks_local.exists():
+            print(f"{LUKS_HOTPLUG_MISSING_PATH}: {luks_local}", file=sys.stderr)
+            return 2
 
     resolved_from: str | None = None
     if update_from is not None:
@@ -438,6 +481,7 @@ def run_run_test(
         and not omarchy_bindings
         and not update_from
         and not udiskie_unlock
+        and not luks_requested
     )
     if install_from and not session_only and not install_ok:
         print(INSTALL_FROM_FAIL_CLOSED, file=sys.stderr)
@@ -481,11 +525,12 @@ def run_run_test(
         and not omarchy_bindings
         and not resolved_from
         and not udiskie_unlock
+        and not luks_requested
     ):
         print(
             "run-test: pass --session-only, --omarchy-bindings, "
             "--install-from release|local-archive, --update-from VERSION, "
-            "or --udiskie-unlock",
+            "--udiskie-unlock, or --luks-hotplug PATH",
             file=sys.stderr,
         )
         return 2
@@ -542,6 +587,7 @@ def run_run_test(
             popen=popen,
             settle_s=settle_s,
             inherit_stdio=False,
+            hotplug_port=luks_requested,
         )
         wait_ssh(machine, timeout=guest.boot_timeout_s, run=run)
         shot = run_dir / "screenshot.png"
@@ -596,6 +642,19 @@ def run_run_test(
                 commands=recorded,
                 install_sh_path=resolved_install_sh,
             )
+        elif luks_local is not None:
+            steps, extras = run_luks_hotplug_steps(
+                machine,
+                guest=guest,
+                local_path=luks_local,
+                screenshot_dest=shot,
+                qmp_dest=qmp_path,
+                session_timeout=SESSION_TIMEOUT_S,
+                run=run,
+                commands=recorded,
+                create_luks_fn=create_luks_fn,
+                hotplug_fn=hotplug_fn,
+            )
         else:
             steps = run_session_only_steps(
                 machine,
@@ -624,6 +683,8 @@ def run_run_test(
             print(f"run-test: omarchy-bindings ok ({guest.id})")
         elif udiskie_unlock:
             print(f"run-test: udiskie-unlock ok ({guest.id})")
+        elif luks_local is not None:
+            print(f"run-test: luks-hotplug ok ({guest.id})")
         else:
             print(f"run-test: session ok ({guest.id})")
         print(f"screenshot: {shot}")

@@ -335,6 +335,17 @@ def build_parser() -> argparse.ArgumentParser:
             "uploads a host install.sh; otherwise the committed fixture is used."
         ),
     )
+    run_test.add_argument(
+        "--luks-hotplug",
+        nargs="?",
+        const="",
+        metavar="PATH",
+        help=(
+            "Omarchy/Arch: install a host Strata binary/archive/checkout, "
+            "register the udiskie unlock handler, hotplug a LUKS disk, and "
+            "assert Strata is called (lgse/strata#537)."
+        ),
+    )
 
     vm_run = sub.add_parser(
         "vm-run",
@@ -531,6 +542,7 @@ def main(argv: list[str] | None = None) -> int:
             omarchy_bindings=args.omarchy_bindings,
             update_from=args.update_from,
             udiskie_unlock=args.udiskie_unlock,
+            luks_hotplug=args.luks_hotplug,
         )
 
     if args.command == "vm-run":

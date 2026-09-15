@@ -144,6 +144,29 @@ class _FakeRun:
                 f"BINDINGS_KIND={kind}\nBINDINGS_PATH=/home/tester/.config/hypr/bindings.{kind}\n",
                 "",
             )
+        if "smoke-luks-hotplug.sh" in remote:
+            if "SMOKE_LUKS_CASE=wrap" in remote:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    "WRAPPED=1\nHOOK_LOG=/tmp/strata-luks-hook.log\n",
+                    "",
+                )
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "STRATA_CALLED=1\n"
+                "LUKS_DEV=vdc\n"
+                "LUKS_SERIAL=strata-luks\n"
+                "HOOK_LINE=--udiskie-hook device_added crypto /dev/vdc uuid\n",
+                "",
+            )
+        if "udiskie/config.yml" in remote:
+            return subprocess.CompletedProcess(argv, 0, "HOOK_CONFIG=1\n", "")
+        if "pacman -S --needed --noconfirm udiskie" in remote and "gtk4" not in remote:
+            return subprocess.CompletedProcess(argv, 0, "UDISKIE=ok\n", "")
+        if "printf 'UDISKIE=" in remote:
+            return subprocess.CompletedProcess(argv, 0, "UDISKIE=ok\n", "")
         if "smoke-udiskie-unlock.sh" in remote:
             if "SMOKE_UDISKIE_CASE=parse-args" in remote:
                 with_flag = (
@@ -696,6 +719,7 @@ class HelpAndMiseTests(unittest.TestCase):
         self.assertIn("--omarchy-bindings", text)
         self.assertIn("--update-from", text)
         self.assertIn("--udiskie-unlock", text)
+        self.assertIn("--luks-hotplug", text)
         self.assertNotIn("not implemented", text)
 
     def test_vm_run_help_has_graphical(self) -> None:

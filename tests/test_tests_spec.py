@@ -188,6 +188,27 @@ class _FakeRun:
                 0,
                 stdout=f"BINDINGS_KIND={kind}\nBINDINGS_PATH={path}\n",
             )
+        if "smoke-luks-hotplug.sh" in remote:
+            if "SMOKE_LUKS_CASE=wrap" in remote:
+                return _completed(
+                    0,
+                    stdout="WRAPPED=1\nHOOK_LOG=/tmp/strata-luks-hook.log\n",
+                )
+            return _completed(
+                0,
+                stdout=(
+                    "STRATA_CALLED=1\n"
+                    "LUKS_DEV=vdc\n"
+                    "LUKS_SERIAL=strata-luks\n"
+                    "HOOK_LINE=--udiskie-hook device_added crypto /dev/vdc uuid\n"
+                ),
+            )
+        if "udiskie/config.yml" in remote:
+            return _completed(0, stdout="HOOK_CONFIG=1\n")
+        if "pacman -S --needed --noconfirm udiskie" in remote and "gtk4" not in remote:
+            return _completed(0, stdout="UDISKIE=ok\n")
+        if "printf 'UDISKIE=" in remote:
+            return _completed(0, stdout="UDISKIE=ok\n")
         if "smoke-udiskie-unlock.sh" in remote:
             if "SMOKE_UDISKIE_CASE=parse-args" in remote:
                 with_flag = (

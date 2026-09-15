@@ -200,6 +200,25 @@ cover the full eligibility → marker → prompt → exec matrix, including
 `--with-udiskie-unlock`, so unattended guest installs do not rewrite
 udiskie config.
 
+### LUKS hotplug
+
+```bash
+mise run run-test -- omarchy-4 --luks-hotplug ~/dev/strata/target/release/strata
+mise run run-test -- arch --luks-hotplug ~/dev/strata
+mise run run-test -- omarchy-3 --luks-hotplug ~/dev/strata/target/release/strata
+```
+
+Omarchy and Arch guests only (`omarchy-3`, `omarchy-4`, `arch`). Exclusive
+with `--session-only`, `--install-from`, `--omarchy-bindings`,
+`--update-from`, and `--udiskie-unlock`. PATH is a host binary, a release
+tarball, or a checkout containing `target/release/strata`.
+
+The guest installs that Strata, runs `strata --install-udiskie-unlock`
+(installing `udiskie` on Arch if needed), wraps the binary to record hook
+argv, then the host hotplugs a LUKS disk over QMP. The smoke waits until
+udiskie invokes Strata (`--udiskie-hook` / `--unlock-volume`). Host
+`cryptsetup` and `qemu-img` are required to format the throwaway image.
+
 ### Output
 
 On success `run-test` prints the guest, the screenshot path, and the run
@@ -311,6 +330,7 @@ the command.
 | `mise run run-test -- <guest> --update-from VERSION [--keep]` | Seed a previous release, then run current `install.sh` to latest. |
 | `mise run run-test -- omarchy-3\|omarchy-4 --omarchy-bindings [--keep]` | Probe Omarchy detection and Hyprland bindings (optional `STRATA_QEMU_INSTALL_SH`). |
 | `mise run run-test -- omarchy-3\|omarchy-4\|arch --udiskie-unlock [--keep]` | PATH-isolated `configure_udiskie_unlock` helper smoke (optional `STRATA_QEMU_INSTALL_SH`). |
+| `mise run run-test -- omarchy-3\|omarchy-4\|arch --luks-hotplug PATH [--keep]` | Install host Strata, register the udiskie handler, hotplug LUKS, assert Strata is called. |
 | `mise run vm-run -- <guest> [--graphical] [--keep]` | Interactive throwaway overlay. |
 | `mise run vm-live -- <guest> (--from-tag VERSION \| --from-local PATH) [--headless] [--keep]` | Live overlay with Strata installed and `~/fixtures` sample files. |
 | `mise run image-prune [-- --images]` | Delete run directories (and goldens). |

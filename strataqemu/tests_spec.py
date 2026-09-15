@@ -11,6 +11,8 @@ that previous release, then runs current ``install.sh`` to latest.
 session → detect → write/check Hyprland bindings.
 ``--udiskie-unlock`` is a separate Omarchy/Arch flow that sources
 ``configure_udiskie_unlock`` with PATH and ``BIN_PATH`` isolated.
+``--luks-hotplug PATH`` installs a host Strata binary, registers the
+udiskie handler, hotplugs a LUKS disk, and asserts Strata is called.
 """
 
 from __future__ import annotations
@@ -30,7 +32,17 @@ from pathlib import Path
 
 from strataqemu import config
 from strataqemu.guest import Guest
-from strataqemu.qemu import Machine, qmp_screendump, qmp_send_key, vnc_framebuffer_png
+from strataqemu.qemu import (
+    LUKS_HOTPLUG_QMP_FAILED,
+    LUKS_HOTPLUG_SERIAL,
+    LUKS_IMAGE_TOOLS_MISSING,
+    Machine,
+    create_luks_image,
+    qmp_hotplug_raw_disk,
+    qmp_screendump,
+    qmp_send_key,
+    vnc_framebuffer_png,
+)
 from strataqemu.ssh import scp_command, scp_download_command
 
 log = logging.getLogger("strataqemu")
@@ -96,8 +108,18 @@ UDISKIE_UNLOCK_STEPS = (
     "udiskie-unlock",
     "screenshot",
 )
+LUKS_HOTPLUG_STEPS = (
+    "session",
+    "install",
+    "udiskie-handler",
+    "luks-hotplug",
+    "screenshot",
+)
 OMARCHY_BINDINGS_GUESTS = frozenset({"omarchy-4", "omarchy-3"})
 UDISKIE_UNLOCK_GUESTS = frozenset({"omarchy-4", "omarchy-3", "arch"})
+LUKS_HOTPLUG_GUESTS = UDISKIE_UNLOCK_GUESTS
+LUKS_HOTPLUG_TIMEOUT_S = 30
+GUEST_HOOK_LOG = "/tmp/strata-luks-hook.log"
 # Whole N.M token cases for omarchy_major_from (lgse/strata#743 / #652).
 OMARCHY_TOKEN_CASES: tuple[tuple[str, str], ...] = (
     ("4.0.0-1", "4"),
@@ -130,17 +152,33 @@ OMARCHY_BINDINGS_FAIL_CLOSED = (
 )
 OMARCHY_BINDINGS_EXCLUSIVE = (
     "run-test: --omarchy-bindings cannot be combined with "
-    "--session-only, --install-from, --update-from, or --udiskie-unlock"
+    "--session-only, --install-from, --update-from, --udiskie-unlock, "
+    "or --luks-hotplug"
 )
 UDISKIE_UNLOCK_FAIL_CLOSED = (
     "run-test: --udiskie-unlock is only supported for omarchy-3, omarchy-4, and arch"
 )
 UDISKIE_UNLOCK_EXCLUSIVE = (
     "run-test: --udiskie-unlock cannot be combined with "
-    "--session-only, --install-from, --omarchy-bindings, or --update-from"
+    "--session-only, --install-from, --omarchy-bindings, --update-from, "
+    "or --luks-hotplug"
 )
 UDISKIE_UNLOCK_FIXTURE_MISSING = (
     "run-test: udiskie-unlock installer fixture is missing"
+)
+LUKS_HOTPLUG_FAIL_CLOSED = (
+    "run-test: --luks-hotplug is only supported for omarchy-3, omarchy-4, and arch"
+)
+LUKS_HOTPLUG_EXCLUSIVE = (
+    "run-test: --luks-hotplug cannot be combined with "
+    "--session-only, --install-from, --omarchy-bindings, --update-from, "
+    "or --udiskie-unlock"
+)
+LUKS_HOTPLUG_MISSING_PATH = (
+    "run-test: --luks-hotplug requires a host Strata binary, archive, or checkout"
+)
+LUKS_HOTPLUG_HOOK_MISSING = (
+    "run-test: strata --install-udiskie-unlock did not write the udiskie hook"
 )
 INSTALL_SH_SHA256_PREFIX = "INSTALL_SH_SHA256="
 INSTALL_SH_URL = "https://raw.githubusercontent.com/lgse/strata/main/install.sh"
@@ -182,7 +220,8 @@ UPDATE_FROM_EMPTY_LIST = (
 )
 UPDATE_FROM_EXCLUSIVE = (
     "run-test: --update-from cannot be combined with "
-    "--session-only, --install-from, --omarchy-bindings, or --udiskie-unlock"
+    "--session-only, --install-from, --omarchy-bindings, --udiskie-unlock, "
+    "or --luks-hotplug"
 )
 UPDATE_FROM_FAIL_CLOSED = (
     "run-test: --update-from is not supported for this guest; "
@@ -258,6 +297,10 @@ def smoke_udiskie_unlock_script() -> Path:
     return guest_tests_dir() / "smoke-udiskie-unlock.sh"
 
 
+def smoke_luks_hotplug_script() -> Path:
+    return guest_tests_dir() / "smoke-luks-hotplug.sh"
+
+
 def udiskie_unlock_install_sh_fixture() -> Path:
     return (
         repo_root()
@@ -285,6 +328,11 @@ def supports_omarchy_bindings(guest: Guest | str) -> bool:
 def supports_udiskie_unlock(guest: Guest | str) -> bool:
     guest_id = guest.id if isinstance(guest, Guest) else guest
     return guest_id in UDISKIE_UNLOCK_GUESTS
+
+
+def supports_luks_hotplug(guest: Guest | str) -> bool:
+    guest_id = guest.id if isinstance(guest, Guest) else guest
+    return guest_id in LUKS_HOTPLUG_GUESTS
 
 
 def missing_golden_message(guest_id: str) -> str:
@@ -990,6 +1038,277 @@ def run_udiskie_unlock_steps(
         }
     )
     extras["screenshot"] = str(screenshot_dest)
+    return steps, extras
+
+
+def ensure_udiskie_config_dir_command(user: str) -> str:
+    """Make ``~/.config/udiskie`` writable. Arch goldens may own ``~/.config`` as root."""
+    cfg = f"/home/{user}/.config"
+    udi = f"{cfg}/udiskie"
+    return (
+        f"sudo -n mkdir -p {shlex.quote(udi)} && "
+        f"sudo -n chown -R {shlex.quote(user)}:{shlex.quote(user)} "
+        f"{shlex.quote(cfg)}"
+    )
+
+
+def ensure_udiskie_command() -> str:
+    """Install udiskie on Arch goldens that lack it; no-op when already present."""
+    return (
+        "if command -v udiskie >/dev/null 2>&1; then "
+        "printf 'UDISKIE=ok\\n'; "
+        "elif command -v pacman >/dev/null 2>&1; then "
+        "sudo -n pacman -S --needed --noconfirm udiskie && "
+        "printf 'UDISKIE=installed\\n'; "
+        "else echo 'udiskie is not on PATH' >&2; exit 1; fi"
+    )
+
+
+def install_udiskie_handler_command(env: Mapping[str, str], user: str) -> str:
+    dest = f"/home/{user}/{STRATA_BIN_REL}"
+    return f"{env_prefix(env)} {shlex.quote(dest)} --install-udiskie-unlock"
+
+
+def udiskie_hook_config_command() -> str:
+    return (
+        "cfg=\"${XDG_CONFIG_HOME:-$HOME/.config}/udiskie/config.yml\"; "
+        "test -f \"$cfg\" && grep -q -- '--udiskie-hook' \"$cfg\" && "
+        "printf 'HOOK_CONFIG=1\\n'"
+    )
+
+
+def luks_hotplug_command(
+    *,
+    case: str,
+    bin_path: str | None = None,
+    serial: str = LUKS_HOTPLUG_SERIAL,
+) -> str:
+    parts = [
+        f"SMOKE_LUKS_CASE={shlex.quote(case)}",
+        f"SMOKE_LUKS_SERIAL={shlex.quote(serial)}",
+        f"SMOKE_HOOK_LOG={shlex.quote(GUEST_HOOK_LOG)}",
+    ]
+    if bin_path:
+        parts.append(f"SMOKE_STRATA_BIN={shlex.quote(bin_path)}")
+    parts.append("bash /tmp/smoke-luks-hotplug.sh")
+    return " ".join(parts)
+
+
+def run_luks_hotplug_steps(
+    machine: Machine,
+    *,
+    guest: Guest,
+    local_path: Path | str,
+    screenshot_dest: Path,
+    qmp_dest: Path | None = None,
+    session_timeout: float = SESSION_TIMEOUT_S,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    create_luks_fn: Callable[[Path], Path] | None = None,
+    hotplug_fn: Callable[[Path], bool] | None = None,
+) -> tuple[list[dict], dict]:
+    """session → local Strata → udiskie hook → LUKS hotplug → screenshot."""
+    from strataqemu.vm_live import (
+        RUNTIME_DEPS_TIMEOUT_S,
+        _install_from_local,
+        ensure_runtime_deps_command,
+        resolve_local_strata,
+    )
+
+    if not supports_luks_hotplug(guest):
+        raise SessionSmokeError(LUKS_HOTPLUG_FAIL_CLOSED)
+    compositor = compositor_process_name(guest)
+    recorded = commands if commands is not None else []
+    steps: list[dict] = []
+    local = resolve_local_strata(local_path)
+
+    started = time.monotonic()
+    exports = run_session_step(
+        machine,
+        compositor=compositor,
+        timeout=session_timeout,
+        run=run,
+        commands=recorded,
+        sleep=sleep,
+    )
+    steps.append(
+        {
+            "name": "session",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+            "sid": exports.get("SESSION_ID"),
+        }
+    )
+    env = session_env_from_exports(exports)
+
+    install_started = time.monotonic()
+    ssh_run(
+        machine,
+        ensure_runtime_deps_command(),
+        timeout=RUNTIME_DEPS_TIMEOUT_S,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    _install_from_local(
+        machine,
+        guest=guest,
+        local=local,
+        run=run,
+        commands=recorded,
+        run_dir=machine.artifacts.root,
+    )
+    steps.append(
+        {
+            "name": "install",
+            "status": "pass",
+            "seconds": round(time.monotonic() - install_started, 1),
+            "source": str(local.path),
+        }
+    )
+
+    handler_started = time.monotonic()
+    ssh_run(
+        machine,
+        ensure_udiskie_command(),
+        timeout=INSTALL_TIMEOUT_S,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    ssh_run(
+        machine,
+        ensure_udiskie_config_dir_command(guest.user.name),
+        timeout=15,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    ssh_run(
+        machine,
+        install_udiskie_handler_command(env, guest.user.name),
+        timeout=30,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    cfg = ssh_run(
+        machine,
+        udiskie_hook_config_command(),
+        timeout=15,
+        check=False,
+        run=run,
+        commands=recorded,
+    )
+    try:
+        hook_ok = parse_smoke_kv(f"{cfg.stdout}{cfg.stderr}", "HOOK_CONFIG")
+    except SessionSmokeError:
+        hook_ok = ""
+    if hook_ok != "1":
+        raise SessionSmokeError(LUKS_HOTPLUG_HOOK_MISSING)
+    helper = smoke_luks_hotplug_script()
+    if not helper.is_file():
+        raise SessionSmokeError(f"missing luks-hotplug smoke {helper}")
+    scp_to_guest(
+        machine,
+        helper,
+        "/tmp/smoke-luks-hotplug.sh",
+        run=run,
+        commands=recorded,
+    )
+    wrap = ssh_run(
+        machine,
+        luks_hotplug_command(
+            case="wrap",
+            bin_path=f"/home/{guest.user.name}/{STRATA_BIN_REL}",
+        ),
+        timeout=15,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    try:
+        wrapped = parse_smoke_kv(f"{wrap.stdout}{wrap.stderr}", "WRAPPED")
+    except SessionSmokeError:
+        wrapped = ""
+    if wrapped != "1":
+        raise SessionSmokeError("luks-hotplug: wrap did not replace the Strata binary")
+    steps.append(
+        {
+            "name": "udiskie-handler",
+            "status": "pass",
+            "seconds": round(time.monotonic() - handler_started, 1),
+        }
+    )
+
+    plug_started = time.monotonic()
+    image = machine.artifacts.root / "luks.img"
+    maker = create_luks_fn or create_luks_image
+    try:
+        image = Path(maker(image))
+    except FileNotFoundError as exc:
+        raise SessionSmokeError(LUKS_IMAGE_TOOLS_MISSING) from exc
+    except RuntimeError as exc:
+        raise SessionSmokeError(f"run-test: LUKS image failed: {exc}") from exc
+    plugger = hotplug_fn or (
+        lambda path: qmp_hotplug_raw_disk(machine.artifacts.qmp_sock, path)
+    )
+    if not plugger(image):
+        raise SessionSmokeError(LUKS_HOTPLUG_QMP_FAILED)
+    wait = ssh_run(
+        machine,
+        luks_hotplug_command(
+            case="wait",
+            bin_path=f"/home/{guest.user.name}/{STRATA_BIN_REL}",
+        ),
+        timeout=LUKS_HOTPLUG_TIMEOUT_S + 15,
+        check=True,
+        run=run,
+        commands=recorded,
+    )
+    blob = f"{wait.stdout}{wait.stderr}"
+    if parse_smoke_kv(blob, "STRATA_CALLED") != "1":
+        raise SessionSmokeError(
+            f"luks-hotplug: Strata was not called: {blob.strip()}"
+        )
+    hook_line = parse_smoke_kv(blob, "HOOK_LINE")
+    luks_dev = parse_smoke_kv(blob, "LUKS_DEV")
+    steps.append(
+        {
+            "name": "luks-hotplug",
+            "status": "pass",
+            "seconds": round(time.monotonic() - plug_started, 1),
+            "device": luks_dev,
+            "hook": hook_line,
+        }
+    )
+
+    shot_started = time.monotonic()
+    capture_guest_screenshot(
+        machine,
+        env,
+        screenshot_dest,
+        tool=screenshot_tool_for_compositor(compositor),
+        run=run,
+        commands=recorded,
+    )
+    if qmp_dest is not None:
+        extra_qmp_screendump(machine, qmp_dest)
+    steps.append(
+        {
+            "name": "screenshot",
+            "status": "pass",
+            "seconds": round(time.monotonic() - shot_started, 1),
+            "path": str(screenshot_dest),
+        }
+    )
+    extras = {
+        "screenshot": str(screenshot_dest),
+        "luks_device": luks_dev,
+        "luks_hook": hook_line,
+        "luks_source": str(local.path),
+    }
     return steps, extras
 
 
