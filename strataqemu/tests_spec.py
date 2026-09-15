@@ -9,6 +9,8 @@ desktop-entry → window. ``--update-from VERSION`` on the same guests seeds
 that previous release, then runs current ``install.sh`` to latest.
 ``--omarchy-bindings`` is a separate Omarchy-only flow (lgse/strata#743):
 session → detect → write/check Hyprland bindings.
+``--udiskie-unlock`` is a separate Omarchy/Arch flow that sources
+``configure_udiskie_unlock`` with PATH and ``BIN_PATH`` isolated.
 """
 
 from __future__ import annotations
@@ -89,7 +91,13 @@ OMARCHY_BINDINGS_STEPS = (
     "omarchy-bindings",
     "screenshot",
 )
+UDISKIE_UNLOCK_STEPS = (
+    "session",
+    "udiskie-unlock",
+    "screenshot",
+)
 OMARCHY_BINDINGS_GUESTS = frozenset({"omarchy-4", "omarchy-3"})
+UDISKIE_UNLOCK_GUESTS = frozenset({"omarchy-4", "omarchy-3", "arch"})
 # Whole N.M token cases for omarchy_major_from (lgse/strata#743 / #652).
 OMARCHY_TOKEN_CASES: tuple[tuple[str, str], ...] = (
     ("4.0.0-1", "4"),
@@ -122,7 +130,17 @@ OMARCHY_BINDINGS_FAIL_CLOSED = (
 )
 OMARCHY_BINDINGS_EXCLUSIVE = (
     "run-test: --omarchy-bindings cannot be combined with "
-    "--session-only, --install-from, or --update-from"
+    "--session-only, --install-from, --update-from, or --udiskie-unlock"
+)
+UDISKIE_UNLOCK_FAIL_CLOSED = (
+    "run-test: --udiskie-unlock is only supported for omarchy-3, omarchy-4, and arch"
+)
+UDISKIE_UNLOCK_EXCLUSIVE = (
+    "run-test: --udiskie-unlock cannot be combined with "
+    "--session-only, --install-from, --omarchy-bindings, or --update-from"
+)
+UDISKIE_UNLOCK_FIXTURE_MISSING = (
+    "run-test: udiskie-unlock installer fixture is missing"
 )
 INSTALL_SH_SHA256_PREFIX = "INSTALL_SH_SHA256="
 INSTALL_SH_URL = "https://raw.githubusercontent.com/lgse/strata/main/install.sh"
@@ -164,7 +182,7 @@ UPDATE_FROM_EMPTY_LIST = (
 )
 UPDATE_FROM_EXCLUSIVE = (
     "run-test: --update-from cannot be combined with "
-    "--session-only, --install-from, or --omarchy-bindings"
+    "--session-only, --install-from, --omarchy-bindings, or --udiskie-unlock"
 )
 UPDATE_FROM_FAIL_CLOSED = (
     "run-test: --update-from is not supported for this guest; "
@@ -236,6 +254,20 @@ def smoke_omarchy_bindings_script() -> Path:
     return guest_tests_dir() / "smoke-omarchy-bindings.sh"
 
 
+def smoke_udiskie_unlock_script() -> Path:
+    return guest_tests_dir() / "smoke-udiskie-unlock.sh"
+
+
+def udiskie_unlock_install_sh_fixture() -> Path:
+    return (
+        repo_root()
+        / "tests"
+        / "fixtures"
+        / "udiskie-unlock"
+        / "install-with-helpers.sh"
+    )
+
+
 def omarchy_install_major(guest: Guest | str) -> int | None:
     """Installer major the guest recipe is supposed to look like, or None."""
     guest_id = guest.id if isinstance(guest, Guest) else guest
@@ -248,6 +280,11 @@ def omarchy_install_major(guest: Guest | str) -> int | None:
 
 def supports_omarchy_bindings(guest: Guest | str) -> bool:
     return omarchy_install_major(guest) is not None
+
+
+def supports_udiskie_unlock(guest: Guest | str) -> bool:
+    guest_id = guest.id if isinstance(guest, Guest) else guest
+    return guest_id in UDISKIE_UNLOCK_GUESTS
 
 
 def missing_golden_message(guest_id: str) -> str:
@@ -447,6 +484,49 @@ def omarchy_bindings_command(
         parts.append("SMOKE_WRITE_BINDINGS=1")
         parts.append(f"INSTALL_SH={shlex.quote(install_sh)}")
     parts.append("bash /tmp/smoke-omarchy-bindings.sh")
+    return " ".join(parts)
+
+
+def udiskie_unlock_command(
+    *,
+    install_sh: str = GUEST_INSTALL_SH_REMOTE,
+    case: str = "configure",
+    args: str | None = None,
+    omarchy_major: str | None = None,
+    arch_based: str = "no",
+    udiskie_stub: bool = False,
+    host_udiskie: bool = False,
+    marker: bool = False,
+    prompt: str | None = None,
+    bin_exit: str | None = None,
+    call_twice: bool = False,
+    bin_has_flag_string: bool = False,
+) -> str:
+    """Host-side SSH command that runs the uploaded udiskie-unlock smoke."""
+    parts = [
+        f"INSTALL_SH={shlex.quote(install_sh)}",
+        f"SMOKE_UDISKIE_CASE={shlex.quote(case)}",
+        f"SMOKE_ARCH_BASED={shlex.quote(arch_based)}",
+    ]
+    if args is not None:
+        parts.append(f"SMOKE_UDISKIE_ARGS={shlex.quote(args)}")
+    if omarchy_major is not None:
+        parts.append(f"SMOKE_OMARCHY_MAJOR={shlex.quote(omarchy_major)}")
+    if udiskie_stub:
+        parts.append("SMOKE_UDISKIE_STUB=1")
+    if host_udiskie:
+        parts.append("SMOKE_HOST_UDISKIE=1")
+    if marker:
+        parts.append("SMOKE_MARKER=1")
+    if prompt is not None:
+        parts.append(f"SMOKE_PROMPT={shlex.quote(prompt)}")
+    if bin_exit is not None:
+        parts.append(f"SMOKE_BIN_EXIT={shlex.quote(bin_exit)}")
+    if call_twice:
+        parts.append("SMOKE_CALL_TWICE=1")
+    if bin_has_flag_string:
+        parts.append("SMOKE_BIN_HAS_FLAG_STRING=1")
+    parts.append("bash /tmp/smoke-udiskie-unlock.sh")
     return " ".join(parts)
 
 
@@ -674,6 +754,217 @@ def run_omarchy_bindings_steps(
         major=major,
         probe_pr743=True,
         write_bindings=True,
+        run=run,
+        commands=recorded,
+    )
+    steps.extend(extra_steps)
+
+    shot_started = time.monotonic()
+    capture_guest_screenshot(
+        machine,
+        env,
+        screenshot_dest,
+        tool=screenshot_tool_for_compositor(compositor),
+        run=run,
+        commands=recorded,
+    )
+    if qmp_dest is not None:
+        extra_qmp_screendump(machine, qmp_dest)
+    steps.append(
+        {
+            "name": "screenshot",
+            "status": "pass",
+            "seconds": round(time.monotonic() - shot_started, 1),
+            "path": str(screenshot_dest),
+        }
+    )
+    extras["screenshot"] = str(screenshot_dest)
+    return steps, extras
+
+
+def udiskie_unlock_guest_cases(guest: Guest | str) -> tuple[dict, ...]:
+    """In-guest smoke cases for ``--udiskie-unlock``. Host unittests own the full matrix."""
+    major = omarchy_install_major(guest)
+    if major is not None:
+        return (
+            {
+                "name": "parse-args-with-flag",
+                "case": "parse-args",
+                "args": "--with-udiskie-unlock",
+                "expect": {"NON_INTERACTIVE": "yes", "WITH_UDISKIE_UNLOCK": "yes"},
+            },
+            {
+                "name": "eligible-prompt-yes",
+                "case": "configure",
+                "omarchy_major": str(major),
+                "arch_based": "yes",
+                "udiskie_stub": True,
+                "marker": True,
+                "prompt": "yes",
+                "expect": {"BIN_CALLS": "1"},
+            },
+            {
+                "name": "eligible-prompt-no",
+                "case": "configure",
+                "omarchy_major": str(major),
+                "arch_based": "yes",
+                "udiskie_stub": True,
+                "marker": True,
+                "prompt": "no",
+                "expect": {"BIN_CALLS": "0"},
+            },
+            {
+                "name": "omarchy-no-stub-ask",
+                "case": "configure",
+                "omarchy_major": str(major),
+                "arch_based": "yes",
+                "marker": True,
+                "expect": {"BIN_CALLS": "0"},
+            },
+        )
+    return (
+        {
+            "name": "parse-args-with-flag",
+            "case": "parse-args",
+            "args": "--with-udiskie-unlock",
+            "expect": {"NON_INTERACTIVE": "yes", "WITH_UDISKIE_UNLOCK": "yes"},
+        },
+        {
+            "name": "arch-prompt-yes",
+            "case": "configure",
+            "arch_based": "yes",
+            "udiskie_stub": True,
+            "marker": True,
+            "prompt": "yes",
+            "expect": {"BIN_CALLS": "1"},
+        },
+        {
+            "name": "arch-no-stub-ask",
+            "case": "configure",
+            "arch_based": "yes",
+            "host_udiskie": True,
+            "expect": {"BIN_CALLS": "0", "UDISKIE_ON_PATH": "0"},
+        },
+    )
+
+
+def run_udiskie_unlock_oracles(
+    machine: Machine,
+    *,
+    guest: Guest,
+    install_sh: str = GUEST_INSTALL_SH_REMOTE,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+) -> tuple[list[dict], dict]:
+    """Upload the smoke and run PATH-isolated helper cases. Does not launch Strata."""
+    recorded = commands if commands is not None else []
+    helper = smoke_udiskie_unlock_script()
+    if not helper.is_file():
+        raise SessionSmokeError(f"missing udiskie-unlock smoke {helper}")
+    scp_to_guest(
+        machine,
+        helper,
+        "/tmp/smoke-udiskie-unlock.sh",
+        run=run,
+        commands=recorded,
+    )
+    started = time.monotonic()
+    case_results: list[str] = []
+    for spec in udiskie_unlock_guest_cases(guest):
+        remote = udiskie_unlock_command(
+            install_sh=install_sh,
+            case=str(spec["case"]),
+            args=spec.get("args"),  # type: ignore[arg-type]
+            omarchy_major=spec.get("omarchy_major"),  # type: ignore[arg-type]
+            arch_based=str(spec.get("arch_based", "no")),
+            udiskie_stub=bool(spec.get("udiskie_stub")),
+            host_udiskie=bool(spec.get("host_udiskie")),
+            marker=bool(spec.get("marker")),
+            prompt=spec.get("prompt"),  # type: ignore[arg-type]
+        )
+        proc = ssh_run(
+            machine,
+            remote,
+            timeout=15,
+            check=True,
+            run=run,
+            commands=recorded,
+        )
+        blob = f"{proc.stdout}{proc.stderr}"
+        expect = spec.get("expect") or {}
+        for key, want in expect.items():  # type: ignore[union-attr]
+            got = parse_smoke_kv(blob, str(key))
+            if got != want:
+                raise SessionSmokeError(
+                    f"udiskie-unlock: {spec['name']} {key}={got!r}, expected {want!r}"
+                )
+        if expect.get("BIN_CALLS") == "1":  # type: ignore[union-attr]
+            argv = parse_smoke_kv(blob, "BIN_ARGV")
+            if argv != "--install-udiskie-unlock":
+                raise SessionSmokeError(
+                    f"udiskie-unlock: {spec['name']} BIN_ARGV={argv!r}"
+                )
+        case_results.append(str(spec["name"]))
+    steps = [
+        {
+            "name": "udiskie-unlock",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+            "cases": case_results,
+        }
+    ]
+    extras = {"udiskie_unlock_cases": case_results}
+    return steps, extras
+
+
+def run_udiskie_unlock_steps(
+    machine: Machine,
+    *,
+    guest: Guest,
+    screenshot_dest: Path,
+    qmp_dest: Path | None = None,
+    session_timeout: float = SESSION_TIMEOUT_S,
+    run: RunFn | None = None,
+    commands: list[str] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    install_sh_path: Path | str | None = None,
+) -> tuple[list[dict], dict]:
+    """session → PATH-isolated udiskie helper cases → screenshot."""
+    if not supports_udiskie_unlock(guest):
+        raise SessionSmokeError(UDISKIE_UNLOCK_FAIL_CLOSED)
+    compositor = compositor_process_name(guest)
+    recorded = commands if commands is not None else []
+    steps: list[dict] = []
+
+    started = time.monotonic()
+    exports = run_session_step(
+        machine,
+        compositor=compositor,
+        timeout=session_timeout,
+        run=run,
+        commands=recorded,
+        sleep=sleep,
+    )
+    steps.append(
+        {
+            "name": "session",
+            "status": "pass",
+            "seconds": round(time.monotonic() - started, 1),
+            "sid": exports.get("SESSION_ID"),
+        }
+    )
+    env = session_env_from_exports(exports)
+    if install_sh_path is None:
+        raise SessionSmokeError(UDISKIE_UNLOCK_FIXTURE_MISSING)
+    stage_guest_install_sh(
+        machine,
+        install_sh_path=install_sh_path,
+        run=run,
+        commands=recorded,
+    )
+    extra_steps, extras = run_udiskie_unlock_oracles(
+        machine,
+        guest=guest,
         run=run,
         commands=recorded,
     )

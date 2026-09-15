@@ -59,7 +59,7 @@ nothing builds a golden implicitly.
 | --- | --- | --- |
 | `check-host` | `check-host` | Host capability check. Generates the SSH key on first success. |
 | `image-build` | `image-build [--force] <guest>` | Build or reuse a golden. Prints the golden path. |
-| `run-test` | `run-test <guest> (--session-only \| --install-from release \| --install-from local-archive PATH \| --omarchy-bindings \| --update-from VERSION) [--keep]` | Boot an overlay and run smokes. |
+| `run-test` | `run-test <guest> (--session-only \| --install-from release \| --install-from local-archive PATH \| --omarchy-bindings \| --update-from VERSION \| --udiskie-unlock) [--keep]` | Boot an overlay and run smokes. |
 | `vm-run` | `vm-run [--graphical] [--keep] <guest>` | Interactive throwaway overlay. |
 | `vm-live` | `vm-live (--from-tag VERSION \| --from-local PATH) [--graphical] [--headless] [--keep] <guest>` | Interactive overlay with Strata installed and `~/fixtures` sample files. |
 | `image-prune` | `image-prune [--images]` | Delete run dirs; with `--images` also goldens. Never `keys/`. |
@@ -307,16 +307,21 @@ machine down and exits 130. Timeouts inside the wait loops capture
 Argument validation happens before anything touches the cache:
 
 - Exactly one of `--session-only`, `--install-from`, `--omarchy-bindings`,
-  or `--update-from VERSION` is required.
+  `--update-from VERSION`, or `--udiskie-unlock` is required.
 - `--omarchy-bindings` is Omarchy-only (`omarchy-3`, `omarchy-4`) and
   cannot be combined with the other flows.
-- `--update-from` is exclusive with the other three. VERSION is a previous
+- `--udiskie-unlock` is Omarchy/Arch (`omarchy-3`, `omarchy-4`, `arch`) and
+  cannot be combined with the other flows. It sources installer helpers
+  with PATH/`BIN_PATH` isolated; it does not spawn real udiskie.
+- `--update-from` is exclusive with the other flows. VERSION is a previous
   release tag (`0.15.0` or `v0.15.0`). The default previous-version list is
   `0.15.0,0.14.0`; override with `STRATA_QEMU_UPDATE_FROM`.
 - `--install-from local-archive` requires an existing host path;
   `--install-from release` refuses a path.
 - `--omarchy-bindings` optionally uploads `STRATA_QEMU_INSTALL_SH`
   instead of curling `lgse/strata` `main`; a missing path fails closed.
+- `--udiskie-unlock` uploads `STRATA_QEMU_INSTALL_SH` when set (missing
+  path fails closed) or the committed helper fixture otherwise.
 - A missing golden fails with `run \`mise run image-build -- <id>\` first`
   and never builds one. This check runs before `check-host`.
 
@@ -333,8 +338,9 @@ Then:
 4. Run steps (see below). Each step records `name`, `status`, `seconds`,
    and step-specific fields into `result.json`.
 5. On success print `run-test: session ok (<id>)`, `run-test: ok (<id>)`,
-   `run-test: update-from VERSION ok (<id>)`, or
-   `run-test: omarchy-bindings ok (<id>)` and the screenshot path, shut
+   `run-test: update-from VERSION ok (<id>)`,
+   `run-test: omarchy-bindings ok (<id>)`, or
+   `run-test: udiskie-unlock ok (<id>)` and the screenshot path, shut
    down, delete the overlay, vars copy, and sockets (unless `--keep`), and
    print `run dir: <path>`. Logs, `result.json`, and screenshots stay.
 6. On failure record `error` and the recorded guest commands in
@@ -448,6 +454,19 @@ the same in-guest screenshot as session-only.
 `result.json` for this flow records `omarchy_major`, `omarchy_bindings`
 (`lua` or `conf`), and `omarchy_pr743_probes`.
 
+**udiskie-unlock** (`--udiskie-unlock`): upload
+`guest-tests/smoke-udiskie-unlock.sh` and a staged `install.sh` (fixture
+or `STRATA_QEMU_INSTALL_SH`). The script sources
+`configure_udiskie_unlock` / `parse_args` under
+`STRATA_INSTALLER_TESTING=1` with PATH limited to a stub directory,
+`BIN_PATH` recording argv only, and a temp archive marker. The host
+checks a short in-guest case list (flag parse, eligible prompt yes/no,
+Omarchy without udiskie, or Arch without stub). The full decision tree
+is the host unittest matrix in `tests/test_udiskie_unlock.py`. Then the
+same in-guest screenshot as session-only.
+
+`result.json` for this flow records `udiskie_unlock_cases`.
+
 ## vm-run (`run_test.run_vm_run`)
 
 Same golden/overlay/host checks as `run-test`. QEMU inherits the
@@ -506,6 +525,9 @@ fixtures path, then waits for QEMU to exit. Run-dir lifetime matches
   (lgse/strata#743). Used only by `--omarchy-bindings`.
 - `guest-tests/smoke-omarchy-bindings.sh`: write (optional) and assert
   Hyprland file-manager bindings for major 3 vs 4.
+- `guest-tests/smoke-udiskie-unlock.sh`: source a staged `install.sh` and
+  run PATH-isolated `parse_args` / `configure_udiskie_unlock` cases
+  (lgse/strata#537). Used by `--udiskie-unlock` and host unittests.
 - `guest-tests/smoke-desktop.sh`: combined bus-name/hyprctl + screenshot
   oracle. Exercised by unit tests; the live `run-test` path uses the
   host-driven equivalents in `tests_spec.py` instead.

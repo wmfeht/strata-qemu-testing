@@ -44,6 +44,9 @@ from strataqemu.tests_spec import (
     OMARCHY_BINDINGS_FAIL_CLOSED,
     SESSION_TIMEOUT_S,
     SessionSmokeError,
+    UDISKIE_UNLOCK_EXCLUSIVE,
+    UDISKIE_UNLOCK_FAIL_CLOSED,
+    UDISKIE_UNLOCK_FIXTURE_MISSING,
     UPDATE_FROM_EXCLUSIVE,
     UPDATE_FROM_FAIL_CLOSED,
     compositor_process_name,
@@ -52,10 +55,13 @@ from strataqemu.tests_spec import (
     run_install_from_release_steps,
     run_omarchy_bindings_steps,
     run_session_only_steps,
+    run_udiskie_unlock_steps,
     run_update_from_steps,
     supports_install_from_release,
     supports_omarchy_bindings,
+    supports_udiskie_unlock,
     supports_update_from,
+    udiskie_unlock_install_sh_fixture,
 )
 
 log = logging.getLogger("strataqemu")
@@ -345,7 +351,7 @@ _USAGE_LINES = {
         "usage: python -m strataqemu run-test "
         "[--session-only | --install-from release | "
         "--install-from local-archive PATH | --omarchy-bindings | "
-        "--update-from VERSION] "
+        "--update-from VERSION | --udiskie-unlock] "
         "[--keep] <guest>"
     ),
 }
@@ -384,6 +390,7 @@ def run_run_test(
     install_sh_path: Path | str | None = None,
     omarchy_bindings: bool = False,
     update_from: str | None = None,
+    udiskie_unlock: bool = False,
 ) -> int:
     """CLI body for ``run-test``. Never calls ``image-build``."""
     loaded = _load_or_usage(guest_id, "run-test")
@@ -391,13 +398,25 @@ def run_run_test(
         return loaded
     guest = loaded
 
-    if omarchy_bindings and (session_only or install_from or update_from):
+    if udiskie_unlock and (
+        session_only or install_from or omarchy_bindings or update_from
+    ):
+        print(UDISKIE_UNLOCK_EXCLUSIVE, file=sys.stderr)
+        return 2
+    if udiskie_unlock and not supports_udiskie_unlock(guest):
+        print(UDISKIE_UNLOCK_FAIL_CLOSED, file=sys.stderr)
+        return 2
+    if omarchy_bindings and (
+        session_only or install_from or update_from or udiskie_unlock
+    ):
         print(OMARCHY_BINDINGS_EXCLUSIVE, file=sys.stderr)
         return 2
     if omarchy_bindings and not supports_omarchy_bindings(guest):
         print(OMARCHY_BINDINGS_FAIL_CLOSED, file=sys.stderr)
         return 2
-    if update_from and (session_only or install_from or omarchy_bindings):
+    if update_from and (
+        session_only or install_from or omarchy_bindings or udiskie_unlock
+    ):
         print(UPDATE_FROM_EXCLUSIVE, file=sys.stderr)
         return 2
 
@@ -418,6 +437,7 @@ def run_run_test(
         and not session_only
         and not omarchy_bindings
         and not update_from
+        and not udiskie_unlock
     )
     if install_from and not session_only and not install_ok:
         print(INSTALL_FROM_FAIL_CLOSED, file=sys.stderr)
@@ -439,7 +459,7 @@ def run_run_test(
             print(f"run-test: archive not found: {archive}", file=sys.stderr)
             return 2
     resolved_install_sh: Path | None = None
-    if omarchy_bindings:
+    if omarchy_bindings or udiskie_unlock:
         if install_sh_path is not None:
             resolved_install_sh = Path(install_sh_path)
         else:
@@ -450,15 +470,22 @@ def run_run_test(
                 file=sys.stderr,
             )
             return 2
+        if udiskie_unlock and resolved_install_sh is None:
+            resolved_install_sh = udiskie_unlock_install_sh_fixture()
+            if not resolved_install_sh.is_file():
+                print(UDISKIE_UNLOCK_FIXTURE_MISSING, file=sys.stderr)
+                return 2
     if (
         not session_only
         and not install_ok
         and not omarchy_bindings
         and not resolved_from
+        and not udiskie_unlock
     ):
         print(
             "run-test: pass --session-only, --omarchy-bindings, "
-            "--install-from release|local-archive, or --update-from VERSION",
+            "--install-from release|local-archive, --update-from VERSION, "
+            "or --udiskie-unlock",
             file=sys.stderr,
         )
         return 2
@@ -558,6 +585,17 @@ def run_run_test(
                 commands=recorded,
                 install_sh_path=resolved_install_sh,
             )
+        elif udiskie_unlock:
+            steps, extras = run_udiskie_unlock_steps(
+                machine,
+                guest=guest,
+                screenshot_dest=shot,
+                qmp_dest=qmp_path,
+                session_timeout=SESSION_TIMEOUT_S,
+                run=run,
+                commands=recorded,
+                install_sh_path=resolved_install_sh,
+            )
         else:
             steps = run_session_only_steps(
                 machine,
@@ -584,6 +622,8 @@ def run_run_test(
             print(f"run-test: update-from {resolved_from} ok ({guest.id})")
         elif omarchy_bindings:
             print(f"run-test: omarchy-bindings ok ({guest.id})")
+        elif udiskie_unlock:
+            print(f"run-test: udiskie-unlock ok ({guest.id})")
         else:
             print(f"run-test: session ok ({guest.id})")
         print(f"screenshot: {shot}")

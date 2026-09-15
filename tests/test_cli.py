@@ -235,6 +235,16 @@ class CliHelpTests(unittest.TestCase):
         text = buf.getvalue() + err.getvalue()
         self.assertIn("--omarchy-bindings", text)
 
+    def test_run_test_help_includes_udiskie_unlock(self) -> None:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            code = main(["run-test", "--help"])
+        self.assertEqual(code, 0)
+        text = buf.getvalue() + err.getvalue()
+        self.assertIn("--udiskie-unlock", text)
+        self.assertIn("STRATA_QEMU_INSTALL_SH", text)
+
     def test_run_test_help_includes_update_from(self) -> None:
         buf = io.StringIO()
         err = io.StringIO()
